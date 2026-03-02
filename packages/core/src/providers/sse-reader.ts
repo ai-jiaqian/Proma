@@ -11,7 +11,7 @@
  */
 
 import type { ProviderAdapter, ProviderRequest, StreamEventCallback, ToolCall } from './types.ts'
-
+import { extractTitleFromCommonResponse } from './title-extract.ts'
 // ===== 流式请求 =====
 
 /** streamSSE 的输入选项 */
@@ -214,9 +214,22 @@ export async function fetchTitle(
       dataPreview: JSON.stringify(data).slice(0, 500),
     })
 
-    const title = adapter.parseTitleResponse(data)
-    console.log('[fetchTitle] 解析标题结果:', { title })
-    return title
+    // 优先使用 adapter 特定解析器
+    const adapterTitle = adapter.parseTitleResponse(data)
+    if (adapterTitle?.trim()) {
+      console.log('[fetchTitle] 解析标题结果:', { source: 'adapter', title: adapterTitle })
+      return adapterTitle.trim()
+    }
+
+    // Fallback: 使用通用提取器
+    const fallbackTitle = extractTitleFromCommonResponse(data)
+    if (fallbackTitle?.trim()) {
+      console.log('[fetchTitle] 解析标题结果:', { source: 'generic-fallback', title: fallbackTitle })
+      return fallbackTitle.trim()
+    }
+
+    console.log('[fetchTitle] 解析标题结果:', { source: 'none', title: null })
+    return null
   } catch (error) {
     console.error('[fetchTitle] 异常:', error)
     return null

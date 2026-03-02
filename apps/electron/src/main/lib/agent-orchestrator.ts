@@ -38,6 +38,7 @@ import { permissionService } from './agent-permission-service'
 import { askUserService } from './agent-ask-user-service'
 import { getMemoryConfig } from './memory-service'
 import { searchMemory, addMemory, formatSearchResult } from './memos-client'
+import { deriveFallbackTitle, MAX_AGENT_TITLE_LENGTH, sanitizeTitleCandidate } from './title-utils'
 
 // ===== 类型定义 =====
 
@@ -419,12 +420,15 @@ export class AgentOrchestrator {
     const { userMessage, channelId, modelId } = input
     console.log('[Agent 标题生成] 开始生成标题:', { channelId, modelId, userMessage: userMessage.slice(0, 50) })
 
+    // 本地兜底标题（确保即使远端失败也有标题）
+    const fallbackTitle = deriveFallbackTitle(userMessage, MAX_AGENT_TITLE_LENGTH)
+
     try {
       const channels = listChannels()
       const channel = channels.find((c) => c.id === channelId)
       if (!channel) {
-        console.warn('[Agent 标题生成] 渠道不存在:', channelId)
-        return null
+        console.warn('[Agent 标题生成] 渠道不存在，使用兜底标题:', fallbackTitle)
+        return fallbackTitle
       }
 
       const apiKey = decryptApiKey(channelId)
@@ -439,19 +443,24 @@ export class AgentOrchestrator {
       const proxyUrl = await getEffectiveProxyUrl()
       const fetchFn = getFetchFn(proxyUrl)
       const title = await fetchTitle(request, providerAdapter, fetchFn)
+
       if (!title) {
-        console.warn('[Agent 标题生成] API 返回空标题')
-        return null
+        console.warn('[Agent 标题生成] API 返回空标题，使用兜底标题:', fallbackTitle)
+        return fallbackTitle
       }
 
-      const cleaned = title.trim().replace(/^["'""''「《]+|["'""''」》]+$/g, '').trim()
-      const result = cleaned.slice(0, MAX_TITLE_LENGTH) || null
+      // 使用 sanitizeTitleCandidate 清洗标题
+      const result = sanitizeTitleCandidate(title, MAX_AGENT_TITLE_LENGTH)
+      if (!result) {
+        console.warn('[Agent 标题生成] 清洗后标题无效，使用兜底标题:', fallbackTitle)
+        return fallbackTitle
+      }
 
       console.log(`[Agent 标题生成] 生成标题成功: "${result}"`)
       return result
     } catch (error) {
-      console.warn('[Agent 标题生成] 生成失败:', error)
-      return null
+      console.warn('[Agent 标题生成] 生成失败，使用兜底标题:', error, fallbackTitle)
+      return fallbackTitle
     }
   }
 

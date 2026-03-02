@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+body {
+    font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    font-size: 14px;
+    line-height: 1.8;
+    color: #333;
+    max-width: 800px;
+    margin: 0 auto;
+    padding: 20px;
+}
+h1 {
+    font-size: 28px;
+    color: #1a1a2e;
+    border-bottom: 3px solid #4361ee;
+    padding-bottom: 8px;
+}
+h2 {
+    font-size: 21px;
+    color: #4361ee;
+    border-bottom: 1px solid #ddd;
+    padding-bottom: 6px;
+    margin-top: 32px;
+}
+h3 { font-size: 17px; color: #555; margin-top: 22px; }
+blockquote {
+    border-left: 4px solid #4361ee;
+    margin: 12px 0;
+    padding: 8px 16px;
+    background: #f0f4ff;
+    color: #555;
+}
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 14px 0;
+    font-size: 13px;
+}
+th, td {
+    border: 1px solid #ddd;
+    padding: 8px 10px;
+    text-align: left;
+}
+th { background: #4361ee; color: white; }
+tr:nth-child(even) { background: #f8f9fa; }
+code {
+    background: #f0f0f0;
+    padding: 2px 5px;
+    border-radius: 3px;
+    font-size: 12px;
+    font-family: "SF Mono", "Menlo", monospace;
+}
+pre {
+    background: #1e1e2e;
+    color: #cdd6f4;
+    padding: 14px;
+    border-radius: 6px;
+    font-size: 12px;
+    line-height: 1.5;
+    overflow-x: auto;
+}
+pre code { background: none; padding: 0; color: inherit; }
+img {
+    max-width: 100%;
+    border-radius: 8px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+    margin: 12px 0;
+}
+hr { border: none; border-top: 1px solid #ddd; margin: 28px 0; }
+li { margin: 4px 0; }
+</style>
+</head>
+<body>
+<h1 id="proma">Proma 记忆功能使用教程</h1>
+<blockquote>
+<p>让 AI 助手真正"记住"你 —— 跨会话的长期记忆能力</p>
+</blockquote>
+<h2 id="_1">什么是记忆功能？</h2>
+<p>Proma 的记忆功能让 AI 助手能够跨会话记住你的偏好、决策和项目上下文。就像一个长期搭档，它会记住你们一起讨论过的问题、做过的决定、踩过的坑，而不是每次对话都从零开始。</p>
+<p>记忆功能由 <a href="https://memos-dashboard.openmem.net">MemOS Cloud</a> 提供支持，<strong>Chat 模式和 Agent 模式均可使用</strong>。</p>
+<h3 id="_2">核心能力</h3>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">能力</th>
+<th style="text-align: left;">说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">记住偏好</td>
+<td style="text-align: left;">"我习惯用 pnpm"、"缩进用 2 空格"</td>
+</tr>
+<tr>
+<td style="text-align: left;">记住决策</td>
+<td style="text-align: left;">"我们选了 JWT 方案，因为..."</td>
+</tr>
+<tr>
+<td style="text-align: left;">记住上下文</td>
+<td style="text-align: left;">"项目路径在 /xxx/yyy"</td>
+</tr>
+<tr>
+<td style="text-align: left;">自动回忆</td>
+<td style="text-align: left;">下次对话自动关联过去的经历</td>
+</tr>
+</tbody>
+</table>
+<h3 id="_3">免费额度</h3>
+<ul>
+<li>每月 <strong>5 万次</strong> 添加记忆</li>
+<li>每月 <strong>2 万次</strong> 查询记忆</li>
+<li>对绝大部分用户完全够用</li>
+</ul>
+<hr />
+<h2 id="memos-cloud">第一步：注册 MemOS Cloud 账号</h2>
+<ol>
+<li>
+<p>打开浏览器，访问 <a href="https://memos-dashboard.openmem.net">MemOS Cloud 控制台</a></p>
+</li>
+<li>
+<p>你会看到 MemOS 的登录/注册页面，输入邮箱和验证码即可完成注册</p>
+</li>
+</ol>
+<p><img alt="MemOS Cloud 登录页面" src="file:///Volumes/jiaqian/opensource/proma/docs/images/memos-login.png" /></p>
+<ol>
+<li>
+<p>登录后，进入 <strong>API Keys</strong> 页面</p>
+</li>
+<li>
+<p>点击 <strong>生成 API Key</strong>，复制生成的 Key（以 <code>mpg-</code> 开头）</p>
+</li>
+</ol>
+<blockquote>
+<p>⚠️ API Key 只会显示一次，请妥善保存！</p>
+</blockquote>
+<h3 id="_4">免费额度一览</h3>
+<p><img alt="MemOS Cloud 价格方案" src="file:///Volumes/jiaqian/opensource/proma/docs/images/memos-pricing.png" /></p>
+<hr />
+<h2 id="proma_1">第二步：在 Proma 中配置记忆</h2>
+<ol>
+<li>
+<p>打开 Proma，点击左下角 <strong>设置图标</strong> ⚙️</p>
+</li>
+<li>
+<p>在设置面板中，点击 <strong>「记忆」</strong> 标签页</p>
+</li>
+<li>
+<p>你会看到记忆设置界面，包含以下元素：</p>
+</li>
+<li>顶部：记忆功能的 <strong>启用开关</strong></li>
+<li>中间：MemOS Cloud 的说明和配置步骤引导</li>
+<li>
+<p>下方：<strong>API Key 输入框</strong>、<strong>测试连接</strong> 按钮、<strong>保存</strong> 按钮</p>
+</li>
+<li>
+<p>将复制的 API Key 粘贴到输入框中</p>
+</li>
+<li>
+<p>点击 <strong>「测试连接」</strong> 按钮，验证 Key 是否有效</p>
+</li>
+<li>成功：显示绿色提示 "连接成功，已检索到 X 条事实、X 条偏好"</li>
+<li>
+<p>失败：显示红色提示 "连接失败: Invalid API Key"</p>
+</li>
+<li>
+<p>连接成功后，点击 <strong>「保存」</strong>，然后打开右上角的 <strong>启用开关</strong> 🔘</p>
+</li>
+</ol>
+<blockquote>
+<p>💡 开关打开后，记忆功能立即生效，无需重启 Proma。</p>
+</blockquote>
+<hr />
+<h2 id="_5">第三步：开始使用记忆</h2>
+<p>记忆功能开启后，AI 助手会自动在对话中使用记忆，无需任何额外操作。</p>
+<h3 id="ai">🧠 AI 会自动"记住"什么？</h3>
+<p>AI 会在对话中判断哪些信息值得记住，包括但不限于：</p>
+<ul>
+<li><strong>你的偏好</strong>：技术栈选择、编码风格、工具习惯</li>
+<li><strong>重要决策</strong>：架构方案、技术选型及原因</li>
+<li><strong>项目上下文</strong>：项目路径、关键配置、团队约定</li>
+<li><strong>问题解决经验</strong>：踩过的坑和解决方案</li>
+</ul>
+<h3 id="ai_1">🔍 AI 会自动"回忆"什么？</h3>
+<p>当你开始新对话时，AI 会根据当前话题自动检索相关记忆：</p>
+<ul>
+<li>你提到"之前"、"上次"、"我们讨论过"</li>
+<li>当前任务和过去的经历有关联</li>
+<li>需要延续之前的讨论或决策</li>
+</ul>
+<h3 id="_6">💬 实际对话示例</h3>
+<p><strong>会话 A — 第一次交互：</strong></p>
+<pre><code>👤 你: 我的项目用 TypeScript + React，我喜欢用 function component + hooks
+
+🤖 AI: 好的，了解了！
+        ┌──────────────────────┐
+        │ 🧠 正在记住…         │  ← 记忆工具指示器
+        └──────────────────────┘
+        ┌──────────────────────┐
+        │ 🧠 ✓ 已记住          │  ← 记忆存储成功
+        └──────────────────────┘
+</code></pre>
+<blockquote>
+<p>后台自动提取并存储：
+- 事实：用户的项目用 TypeScript + React
+- 偏好：用户喜欢用 function component + hooks</p>
+</blockquote>
+<p><strong>会话 B — 一周后的新对话：</strong></p>
+<pre><code>👤 你: 帮我写一个表单组件
+
+        ┌──────────────────────┐
+        │ 🧠 正在回忆…         │  ← 自动检索相关记忆
+        └──────────────────────┘
+        ┌──────────────────────┐
+        │ 🧠 ✓ 回忆完成        │  ← 找到了之前的偏好
+        └──────────────────────┘
+
+🤖 AI: 这是一个用 TypeScript 编写的 function component 表单：
+
+        const LoginForm: React.FC = () =&gt; {
+          const [form, setForm] = useState({ ... })
+          ...
+        }
+</code></pre>
+<blockquote>
+<p>AI 自动应用了你的技术栈偏好，无需重复说明！</p>
+</blockquote>
+<h3 id="_7">📌 你也可以主动要求记住</h3>
+<pre><code>👤 你: 记住这个：以后所有组件都放在 src/components 目录下
+
+🤖 AI: 好的，记住了。
+        ┌──────────────────────┐
+        │ 🧠 ✓ 已记住          │
+        └──────────────────────┘
+</code></pre>
+<hr />
+<h2 id="_8">记忆工具指示器说明</h2>
+<p>在对话过程中，你会在 AI 回复上方看到记忆工具的状态指示器：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">状态</th>
+<th style="text-align: left;">显示</th>
+<th style="text-align: left;">含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">⏳ 🧠 正在回忆…</td>
+<td style="text-align: left;">旋转动画</td>
+<td style="text-align: left;">AI 正在检索相关记忆</td>
+</tr>
+<tr>
+<td style="text-align: left;">✅ 🧠 回忆完成</td>
+<td style="text-align: left;">绿色对勾</td>
+<td style="text-align: left;">成功找到相关记忆</td>
+</tr>
+<tr>
+<td style="text-align: left;">⏳ 🧠 正在记住…</td>
+<td style="text-align: left;">旋转动画</td>
+<td style="text-align: left;">AI 正在存储新记忆</td>
+</tr>
+<tr>
+<td style="text-align: left;">✅ 🧠 已记住</td>
+<td style="text-align: left;">绿色对勾</td>
+<td style="text-align: left;">记忆存储成功</td>
+</tr>
+<tr>
+<td style="text-align: left;">❌ 🧠 回忆完成（失败）</td>
+<td style="text-align: left;">红色叉号</td>
+<td style="text-align: left;">检索失败（不影响对话）</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>💡 即使记忆工具偶尔失败，也不会影响正常对话，AI 会继续回答你的问题。</p>
+</blockquote>
+<hr />
+<h2 id="chat-vs-agent">Chat 模式 vs Agent 模式</h2>
+<p>记忆功能在两种模式下都可用，但工作方式略有不同：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;"></th>
+<th style="text-align: left;">Chat 模式</th>
+<th style="text-align: left;">Agent 模式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">记忆工具</td>
+<td style="text-align: left;"><code>recall_memory</code> / <code>add_memory</code></td>
+<td style="text-align: left;"><code>mcp__mem__recall_memory</code> / <code>mcp__mem__add_memory</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">工具轮次</td>
+<td style="text-align: left;">最多 5 轮自动续接</td>
+<td style="text-align: left;">由 Agent SDK 自动管理</td>
+</tr>
+<tr>
+<td style="text-align: left;">适合场景</td>
+<td style="text-align: left;">日常对话、快速问答、偏好记录</td>
+<td style="text-align: left;">复杂任务、项目开发、多步骤工作流</td>
+</tr>
+</tbody>
+</table>
+<p>两种模式共享同一份记忆数据，在 Chat 中记住的内容，Agent 模式也能回忆起来，反之亦然。</p>
+<hr />
+<h2 id="_9">常见问题</h2>
+<h3 id="q">Q: 记忆存储在哪里？</h3>
+<p>记忆数据存储在 MemOS Cloud 云端，通过你的 API Key 关联。本地只保存配置信息（<code>~/.proma/memory.json</code>），不保存记忆内容。</p>
+<h3 id="q_1">Q: 记忆功能会影响对话速度吗？</h3>
+<p>影响很小。记忆检索通常在 1-2 秒内完成，存储是异步的，完全不阻塞对话。</p>
+<h3 id="q_2">Q: 我可以查看/管理已存储的记忆吗？</h3>
+<p>可以。登录 <a href="https://memos-dashboard.openmem.net">MemOS Cloud 控制台</a>，在 Memory 页面可以查看、搜索和删除已存储的记忆。</p>
+<h3 id="q_3">Q: 如何关闭记忆功能？</h3>
+<p>进入 设置 → 记忆，关闭右上角的开关即可。关闭后 AI 不会再检索或存储记忆，但已有的记忆数据不会被删除。</p>
+<h3 id="q_4">Q: 换了电脑还能用吗？</h3>
+<p>可以。只要使用同一个 API Key，记忆数据就能在任何设备上访问。</p>
+<h3 id="q_5">Q: 记忆功能支持哪些模型？</h3>
+<p>所有 Proma 支持的模型都可以使用记忆功能，包括 Claude、GPT、Gemini 等。记忆工具是在 Proma 层面注入的，与底层模型无关。</p>
+<hr />
+<h2 id="_10">快速配置清单</h2>
+<ul>
+<li>[ ] 访问 <a href="https://memos-dashboard.openmem.net">MemOS Cloud</a> 注册账号</li>
+<li>[ ] 生成并复制 API Key</li>
+<li>[ ] 打开 Proma 设置 → 记忆</li>
+<li>[ ] 粘贴 API Key</li>
+<li>[ ] 点击「测试连接」确认成功</li>
+<li>[ ] 点击「保存」</li>
+<li>[ ] 打开启用开关</li>
+<li>[ ] 开始对话，享受跨会话记忆！</li>
+</ul>
+</body>
+</html>

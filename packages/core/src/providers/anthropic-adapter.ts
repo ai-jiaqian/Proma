@@ -306,8 +306,7 @@ export class AnthropicAdapter implements ProviderAdapter {
         model: input.modelId,
         max_tokens: 50,
         messages: [{ role: 'user', content: input.prompt }],
-        // 禁用 extended thinking（MiniMax 等供应商也会遵循此设置）
-        thinking: { type: 'disabled' },
+        // 不传 thinking 参数，兼容 Anthropic 网关（部分网关会因 thinking.type=disabled 返回 422）
       }),
     }
   }
