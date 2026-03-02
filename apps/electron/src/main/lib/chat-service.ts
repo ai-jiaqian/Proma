@@ -578,7 +578,8 @@ export async function generateTitle(input: GenerateTitleInput): Promise<string |
     console.log('[标题生成] 成功生成标题:', result)
     return result
   } catch (error) {
-    console.warn('[标题生成] 请求失败，使用兜底标题:', error, fallbackTitle)
+    const errorMessage = error instanceof Error ? error.message : String(error)
+    console.warn('[标题生成] 请求失败，使用兜底标题:', { error: errorMessage, fallbackTitle })
     return fallbackTitle
   }
 }

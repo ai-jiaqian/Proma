@@ -67,8 +67,14 @@ export function extractTextFromContentLike(content: unknown): string | null {
 /**
  * 从常见 provider 响应体结构中提取标题文本。
  * adapter 的 parseTitleResponse 失败时，可作为通用兜底。
+ *
+ * @param responseBody 响应体
+ * @param depth 递归深度（防止栈溢出）
  */
-export function extractTitleFromCommonResponse(responseBody: unknown): string | null {
+export function extractTitleFromCommonResponse(responseBody: unknown, depth = 0): string | null {
+  // 限制递归深度，防止栈溢出
+  if (depth > 10) return null
+
   const direct = readString(responseBody)
   if (direct) return direct
 
@@ -123,7 +129,7 @@ export function extractTitleFromCommonResponse(responseBody: unknown): string | 
 
   // Some gateways wrap payload in `data`
   const wrappedData = root.data
-  const fromWrappedData = extractTitleFromCommonResponse(wrappedData)
+  const fromWrappedData = extractTitleFromCommonResponse(wrappedData, depth + 1)
   if (fromWrappedData) return fromWrappedData
 
   return null

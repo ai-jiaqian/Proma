@@ -459,7 +459,8 @@ export class AgentOrchestrator {
       console.log(`[Agent 标题生成] 生成标题成功: "${result}"`)
       return result
     } catch (error) {
-      console.warn('[Agent 标题生成] 生成失败，使用兜底标题:', error, fallbackTitle)
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      console.warn('[Agent 标题生成] 生成失败，使用兜底标题:', { error: errorMessage, fallbackTitle })
       return fallbackTitle
     }
   }

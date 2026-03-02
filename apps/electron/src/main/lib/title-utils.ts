@@ -27,8 +27,16 @@ export function normalizeTitleWhitespace(value: string): string {
 /**
  * 清洗并裁剪标题候选文本。
  * 返回 null 表示候选文本无效。
+ *
+ * @param raw 原始标题文本
+ * @param maxLength 最大长度（必须为正整数）
  */
 export function sanitizeTitleCandidate(raw: string, maxLength: number): string | null {
+  if (maxLength <= 0) {
+    console.warn('[sanitizeTitleCandidate] maxLength 必须为正整数:', maxLength)
+    return null
+  }
+
   const normalized = normalizeTitleWhitespace(raw)
   if (!normalized) return null
 
