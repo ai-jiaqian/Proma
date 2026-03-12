@@ -21,6 +21,7 @@ import type {
   ChatMessage,
   ChatSendInput,
   GenerateTitleInput,
+  PromptOptimizeInput,
   StreamChunkEvent,
   StreamReasoningEvent,
   StreamCompleteEvent,
@@ -187,6 +188,9 @@ export interface ElectronAPI {
 
   /** 生成对话标题 */
   generateTitle: (input: GenerateTitleInput) => Promise<string | null>
+
+  /** 优化提示词 */
+  optimizePrompt: (input: PromptOptimizeInput) => Promise<string | null>
 
   // ===== 附件管理相关 =====
 
@@ -674,6 +678,10 @@ const electronAPI: ElectronAPI = {
 
   generateTitle: (input: GenerateTitleInput) => {
     return ipcRenderer.invoke(CHAT_IPC_CHANNELS.GENERATE_TITLE, input)
+  },
+
+  optimizePrompt: (input: PromptOptimizeInput) => {
+    return ipcRenderer.invoke(CHAT_IPC_CHANNELS.OPTIMIZE_PROMPT, input)
   },
 
   // 附件管理

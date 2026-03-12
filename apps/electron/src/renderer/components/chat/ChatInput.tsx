@@ -14,7 +14,7 @@
 
 import * as React from 'react'
 import { useAtomValue, useSetAtom } from 'jotai'
-import { CornerDownLeft, Square, Lightbulb, Paperclip } from 'lucide-react'
+import { CornerDownLeft, Square, Lightbulb, Paperclip, Sparkles, X, Check, Loader2 } from 'lucide-react'
 import { ModelSelector } from './ModelSelector'
 import { ClearContextButton } from './ClearContextButton'
 import { ContextSettingsPopover } from './ContextSettingsPopover'
@@ -55,9 +55,11 @@ interface ChatInputProps {
   onStop: () => void
   /** 清除上下文回调 */
   onClearContext?: () => void
+  /** 最近的消息列表（用于提示词优化上下文） */
+  messages?: Array<{ role: string; content: string }>
 }
 
-export function ChatInput({ conversationId, streaming, pendingAttachments, onSetPendingAttachments, onSend, onStop, onClearContext }: ChatInputProps): React.ReactElement {
+export function ChatInput({ conversationId, streaming, pendingAttachments, onSetPendingAttachments, onSend, onStop, onClearContext, messages }: ChatInputProps): React.ReactElement {
   // 从 Map atom 读写草稿
   const draftsMap = useAtomValue(conversationDraftsAtom)
   const setDraftsMap = useSetAtom(conversationDraftsAtom)
@@ -78,6 +80,56 @@ export function ChatInput({ conversationId, streaming, pendingAttachments, onSet
   const [thinkingEnabled, setThinkingEnabled] = useConversationThinkingEnabled()
   const setPendingAttachments = onSetPendingAttachments
   const [isDragOver, setIsDragOver] = React.useState(false)
+
+  // 提示词优化相关状态
+  const [optimizing, setOptimizing] = React.useState(false)
+  const [optimizedText, setOptimizedText] = React.useState<string | null>(null)
+  const optimizeSnapshotRef = React.useRef<string | null>(null)
+
+  // 用户编辑内容后，如果和优化时的 snapshot 不同，自动清除过期的优化结果
+  React.useEffect(() => {
+    if (optimizedText && optimizeSnapshotRef.current && content.trim() !== optimizeSnapshotRef.current) {
+      setOptimizedText(null)
+      optimizeSnapshotRef.current = null
+    }
+  }, [content, optimizedText])
+
+  /** 调用提示词优化 */
+  const handleOptimizePrompt = React.useCallback(async (): Promise<void> => {
+    if (!content.trim() || !selectedModel || optimizing) return
+    setOptimizing(true)
+    setOptimizedText(null)
+    const snapshot = content.trim()
+    optimizeSnapshotRef.current = snapshot
+    try {
+      const result = await window.electronAPI.optimizePrompt({
+        userInput: snapshot,
+        channelId: selectedModel.channelId,
+        modelId: selectedModel.modelId,
+        recentMessages: messages?.slice(-10).map((m) => ({ role: m.role, content: m.content })) ?? [],
+      })
+      if (result) {
+        setOptimizedText(result)
+      }
+    } catch (error) {
+      console.error('[ChatInput] 提示词优化失败:', error)
+    } finally {
+      setOptimizing(false)
+    }
+  }, [content, selectedModel, optimizing, messages])
+
+  /** 接受优化结果 */
+  const handleAcceptOptimized = React.useCallback((): void => {
+    if (optimizedText) {
+      setContent(optimizedText)
+      setOptimizedText(null)
+    }
+  }, [optimizedText, setContent])
+
+  /** 拒绝优化结果 */
+  const handleRejectOptimized = React.useCallback((): void => {
+    setOptimizedText(null)
+  }, [])
 
   const canSend = (content.trim().length > 0 || pendingAttachments.length > 0)
     && selectedModel !== null
@@ -249,6 +301,39 @@ export function ChatInput({ conversationId, streaming, pendingAttachments, onSet
             </div>
           )}
 
+          {/* 提示词优化预览浮层 */}
+          {optimizedText && (
+            <div className="mx-3 mb-2 rounded-lg border border-purple-500/30 bg-purple-500/5 p-3">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs font-medium text-purple-500 flex items-center gap-1">
+                  <Sparkles className="size-3" />
+                  优化建议
+                </span>
+                <div className="flex items-center gap-1">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="size-6 rounded-full text-green-500 hover:bg-green-500/10"
+                    onClick={handleAcceptOptimized}
+                  >
+                    <Check className="size-3.5" />
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="size-6 rounded-full text-foreground/50 hover:text-foreground"
+                    onClick={handleRejectOptimized}
+                  >
+                    <X className="size-3.5" />
+                  </Button>
+                </div>
+              </div>
+              <p className="text-sm text-foreground/80 whitespace-pre-wrap leading-relaxed">{optimizedText}</p>
+            </div>
+          )}
+
           {/* TipTap 富文本编辑器 */}
           <RichTextInput
             value={content}
@@ -310,6 +395,31 @@ export function ChatInput({ conversationId, streaming, pendingAttachments, onSet
               </Tooltip>
 
               <FeishuNotifyToggle sessionId={conversationId} />
+
+              {/* 提示词优化按钮 */}
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className={cn(
+                      'size-[30px] rounded-full',
+                      optimizing
+                        ? 'text-purple-500 animate-pulse'
+                        : 'text-foreground/60 hover:text-foreground',
+                      (!content.trim() || !selectedModel) && 'opacity-40 cursor-not-allowed'
+                    )}
+                    onClick={handleOptimizePrompt}
+                    disabled={!content.trim() || !selectedModel || optimizing}
+                  >
+                    {optimizing ? <Loader2 className="size-5 animate-spin" /> : <Sparkles className="size-5" />}
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="top">
+                  <p>{optimizing ? '正在优化...' : '优化提示词'}</p>
+                </TooltipContent>
+              </Tooltip>
 
               <SpeechButton onTranscript={handleSpeechTranscript} />
 

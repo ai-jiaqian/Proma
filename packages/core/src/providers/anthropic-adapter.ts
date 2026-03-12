@@ -294,6 +294,17 @@ export class AnthropicAdapter implements ProviderAdapter {
   buildTitleRequest(input: TitleRequestInput): ProviderRequest {
     const url = normalizeAnthropicBaseUrl(input.baseUrl)
 
+    const body: Record<string, unknown> = {
+      model: input.modelId,
+      max_tokens: input.maxTokens ?? 50,
+      messages: [{ role: 'user', content: input.prompt }],
+      // 禁用 extended thinking（MiniMax 等供应商也会遵循此设置）
+      thinking: { type: 'disabled' },
+    }
+    if (input.systemPrompt) {
+      body.system = input.systemPrompt
+    }
+
     return {
       url: `${url}/messages`,
       headers: {
@@ -302,13 +313,7 @@ export class AnthropicAdapter implements ProviderAdapter {
         'anthropic-version': '2023-06-01',
         'content-type': 'application/json',
       },
-      body: JSON.stringify({
-        model: input.modelId,
-        max_tokens: 50,
-        messages: [{ role: 'user', content: input.prompt }],
-        // 禁用 extended thinking（MiniMax 等供应商也会遵循此设置）
-        thinking: { type: 'disabled' },
-      }),
+      body: JSON.stringify(body),
     }
   }
 

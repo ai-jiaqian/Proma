@@ -15,7 +15,7 @@
 import { randomUUID } from 'node:crypto'
 import type { WebContents } from 'electron'
 import { CHAT_IPC_CHANNELS } from '@proma/shared'
-import type { ChatSendInput, ChatMessage, GenerateTitleInput, FileAttachment, ChatToolActivity } from '@proma/shared'
+import type { ChatSendInput, ChatMessage, GenerateTitleInput, PromptOptimizeInput, FileAttachment, ChatToolActivity } from '@proma/shared'
 import {
   getAdapter,
   streamSSE,
@@ -570,6 +570,210 @@ export async function generateTitle(input: GenerateTitleInput): Promise<string |
     return result
   } catch (error) {
     console.warn('[标题生成] 请求失败:', error)
+    return null
+  }
+}
+
+// ===== 提示词优化 =====
+
+const OPTIMIZE_PROMPT_SYSTEM = `You are a prompt enhancement specialist. Your job is to transform the user's rough input into a well-articulated task description that an AI assistant can understand and execute precisely on the first try.
+
+## Core Principles
+- Preserve the user's original intent and domain exactly — do not add goals they didn't ask for, and do not shift the topic toward a different domain
+- Use the conversation context to resolve ambiguity and fill in implicit references (e.g. "it", "that function", "the bug", "the article")
+- Match the language of the original input (Chinese input → Chinese output, English → English)
+
+## What to Include
+Weave the following elements naturally into a coherent description — do NOT use explicit section headers like "Background:", "Task:", "Requirements:":
+
+1. **Context**: If conversation history provides relevant background (what's been discussed, what exists already, what problem occurred), open with a brief situational lead-in. Skip this if there's no meaningful context.
+2. **Objective**: Clearly state what needs to be done — this is the core of the prompt.
+3. **Specifics & constraints**: Naturally incorporate any requirements, edge cases, style preferences, or technical constraints that are implied by the user's input or conversation context. Use bullet points only when listing 3+ parallel items; otherwise keep it in prose.
+
+## Style
+- Write it as one flowing description, like a well-written ticket or brief — not a form with labeled sections
+- Keep the tone direct and professional
+- For simple inputs, keep it concise (2-3 sentences). For complex inputs, a short paragraph plus a few bullet points is fine.
+- Do not over-engineer simple asks — "写个排序函数" doesn't need three paragraphs
+
+## Output Rules
+- Return ONLY the enhanced prompt text — no explanations, no meta-commentary, no surrounding quotes
+- Never start with "Please" or "I want you to" — write it as a direct task description`
+
+/**
+ * 根据消息内容智能截断，保留完整语义
+ * - 短消息（≤300字符）：完整保留
+ * - 长消息：保留前200字符 + 省略标记
+ */
+function smartTruncate(text: string, maxLen = 300): string {
+  if (text.length <= maxLen) return text
+  // 尝试在句子边界截断
+  const cutoff = text.slice(0, maxLen)
+  const lastSentenceEnd = Math.max(
+    cutoff.lastIndexOf('。'),
+    cutoff.lastIndexOf('.'),
+    cutoff.lastIndexOf('\n'),
+    cutoff.lastIndexOf('！'),
+    cutoff.lastIndexOf('？'),
+  )
+  const breakPoint = lastSentenceEnd > maxLen * 0.5 ? lastSentenceEnd + 1 : maxLen
+  return text.slice(0, breakPoint) + '...'
+}
+
+/**
+ * 构建对话上下文，智能分配 token 预算
+ * - 最近的消息保留更多内容，较早的消息更激进地截断
+ * - user 消息比 assistant 消息更重要
+ */
+function buildConversationContext(
+  recentMessages: Array<{ role: string; content: string | unknown }>,
+): string {
+  if (recentMessages.length === 0) return ''
+
+  // 只保留 user 和 assistant 消息，过滤掉 tool/status 等内部消息
+  const meaningful = recentMessages
+    .filter((m) => m.role === 'user' || m.role === 'assistant')
+    .slice(-10)
+
+  if (meaningful.length === 0) return ''
+
+  const lines: string[] = ['<conversation_context>']
+
+  for (let i = 0; i < meaningful.length; i++) {
+    const msg = meaningful[i]!
+    const role = msg.role === 'user' ? 'User' : 'Assistant'
+    const text = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content)
+
+    // 越近的消息给越多空间；user 消息比 assistant 消息多 50%
+    const recencyFactor = (i + 1) / meaningful.length // 0.1 ~ 1.0
+    const roleFactor = msg.role === 'user' ? 1.5 : 1.0
+    const maxLen = Math.round(150 * recencyFactor * roleFactor)
+
+    lines.push(`[${role}]: ${smartTruncate(text, Math.max(maxLen, 80))}`)
+  }
+
+  lines.push('</conversation_context>')
+  return lines.join('\n')
+}
+
+/**
+ * 根据输入长度动态计算 maxTokens
+ * - 极短输入（<20字符）：512 tokens（简洁任务简报）
+ * - 中等输入（20-200字符）：768 tokens
+ * - 长输入（>200字符）：1024 tokens（完整背景+任务+需求）
+ */
+function calcMaxTokens(inputLength: number): number {
+  if (inputLength < 20) return 512
+  if (inputLength < 200) return 768
+  return 1024
+}
+
+/**
+ * 优化用户提示词
+ *
+ * 使用 system/user 角色分离，智能上下文构建，
+ * 将用户输入 + 对话上下文发送给 LLM，返回优化后的提示词。
+ */
+export async function optimizePrompt(input: PromptOptimizeInput): Promise<string | null> {
+  const { userInput, recentMessages = [], channelId, modelId } = input
+  console.log('[提示词优化] 开始:', { channelId, modelId, inputLength: userInput.length })
+
+  if (!userInput.trim()) {
+    return null
+  }
+
+  // 查找渠道
+  const channels = listChannels()
+  const channel = channels.find((c) => c.id === channelId)
+  if (!channel) {
+    console.warn('[提示词优化] 渠道不存在:', channelId)
+    return null
+  }
+
+  // 解密 API Key
+  let apiKey: string
+  try {
+    apiKey = decryptApiKey(channelId)
+  } catch {
+    console.warn('[提示词优化] 解密 API Key 失败')
+    return null
+  }
+
+  // 构建 user message：上下文 + 用户输入
+  const contextBlock = buildConversationContext(recentMessages)
+  const userPrompt = contextBlock
+    ? `${contextBlock}\n\n<user_input>\n${userInput}\n</user_input>`
+    : userInput
+
+  const maxTokens = calcMaxTokens(userInput.length)
+
+  try {
+    const adapter = getAdapter(channel.provider)
+    const request = adapter.buildTitleRequest({
+      baseUrl: channel.baseUrl,
+      apiKey,
+      modelId,
+      systemPrompt: OPTIMIZE_PROMPT_SYSTEM,
+      prompt: userPrompt,
+      maxTokens,
+    })
+
+    const proxyUrl = await getEffectiveProxyUrl()
+    const fetchFn = getFetchFn(proxyUrl)
+
+    // 带重试的请求（最多 5 次，指数退避）
+    const MAX_RETRIES = 5
+    let lastError: unknown = null
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const response = await fetchFn(request.url, {
+          method: 'POST',
+          headers: request.headers,
+          body: request.body,
+        })
+
+        if (response.status === 429) {
+          const retryAfter = response.headers.get('retry-after')
+          const delay = retryAfter
+            ? Math.min(Number(retryAfter) * 1000, 30_000)
+            : Math.min(1000 * Math.pow(2, attempt - 1), 30_000) // 1s, 2s, 4s, 8s, 16s
+          console.warn(`[提示词优化] 限流 429，第 ${attempt}/${MAX_RETRIES} 次重试，等待 ${delay}ms`)
+          await new Promise((r) => setTimeout(r, delay))
+          continue
+        }
+
+        if (!response.ok) {
+          const errorText = await response.text().catch(() => 'unknown')
+          console.warn('[提示词优化] 请求失败:', { status: response.status, error: errorText.slice(0, 500) })
+          return null
+        }
+
+        const data: unknown = await response.json()
+        const result = adapter.parseTitleResponse(data)
+
+        if (!result) {
+          console.warn('[提示词优化] API 返回空结果')
+          return null
+        }
+
+        const cleaned = result.trim().replace(/^["'""'']+|["'""'']+$/g, '').trim()
+        console.log('[提示词优化] 成功:', { resultLength: cleaned.length, attempt })
+        return cleaned || null
+      } catch (err) {
+        lastError = err
+        if (attempt < MAX_RETRIES) {
+          const delay = Math.min(1000 * Math.pow(2, attempt - 1), 30_000)
+          console.warn(`[提示词优化] 请求异常，第 ${attempt}/${MAX_RETRIES} 次重试，等待 ${delay}ms`, err)
+          await new Promise((r) => setTimeout(r, delay))
+        }
+      }
+    }
+
+    console.warn(`[提示词优化] ${MAX_RETRIES} 次重试均失败:`, lastError)
+    return null
+  } catch (error) {
+    console.warn('[提示词优化] 请求失败:', error)
     return null
   }
 }

@@ -545,6 +545,7 @@ function ChatViewInner({ conversationId }: ChatViewProps): React.ReactElement {
             onSend={handleSend}
             onStop={handleStop}
             onClearContext={handleClearContext}
+            messages={messages.map((m) => ({ role: m.role, content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content) }))}
           />
         </div>
       </div>

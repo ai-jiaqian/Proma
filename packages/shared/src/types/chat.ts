@@ -162,6 +162,22 @@ export interface ChatSendInput {
   enabledToolIds?: string[]
 }
 
+// ===== 提示词优化 =====
+
+/**
+ * 提示词优化的输入参数
+ */
+export interface PromptOptimizeInput {
+  /** 用户当前输入框内容 */
+  userInput: string
+  /** 最近几轮对话消息（用于上下文，可选） */
+  recentMessages?: Array<{ role: string; content: string }>
+  /** 渠道 ID */
+  channelId: string
+  /** 模型 ID */
+  modelId: string
+}
+
 // ===== 标题生成 =====
 
 /**
@@ -318,6 +334,8 @@ export const CHAT_IPC_CHANNELS = {
   UPDATE_CONTEXT_DIVIDERS: 'chat:update-context-dividers',
   /** 生成对话标题 */
   GENERATE_TITLE: 'chat:generate-title',
+  /** 优化提示词 */
+  OPTIMIZE_PROMPT: 'chat:optimize-prompt',
 
   // 附件管理
   /** 保存附件到本地 */

@@ -175,7 +175,7 @@ export interface StreamRequestInput {
   continuationMessages?: ContinuationMessage[]
 }
 
-/** 标题生成请求的输入参数 */
+/** 标题生成 / 提示词优化等非流式请求的输入参数 */
 export interface TitleRequestInput {
   /** 供应商 API Base URL */
   baseUrl: string
@@ -183,8 +183,12 @@ export interface TitleRequestInput {
   apiKey: string
   /** 模型 ID */
   modelId: string
-  /** 标题生成 prompt（已包含用户消息） */
+  /** 用户消息内容 */
   prompt: string
+  /** 系统提示词（可选，支持 system/user 角色分离） */
+  systemPrompt?: string
+  /** 自定义最大输出 token 数（默认由各 adapter 决定，标题生成约 50） */
+  maxTokens?: number
 }
 
 // ===== 适配器接口 =====

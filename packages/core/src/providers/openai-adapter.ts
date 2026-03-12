@@ -266,6 +266,12 @@ export class OpenAIAdapter implements ProviderAdapter {
   buildTitleRequest(input: TitleRequestInput): ProviderRequest {
     const url = normalizeBaseUrl(input.baseUrl)
 
+    const messages: Array<{ role: string; content: string }> = []
+    if (input.systemPrompt) {
+      messages.push({ role: 'system', content: input.systemPrompt })
+    }
+    messages.push({ role: 'user', content: input.prompt })
+
     return {
       url: `${url}/chat/completions`,
       headers: {
@@ -274,8 +280,8 @@ export class OpenAIAdapter implements ProviderAdapter {
       },
       body: JSON.stringify({
         model: input.modelId,
-        messages: [{ role: 'user', content: input.prompt }],
-        max_tokens: 50,
+        messages,
+        max_tokens: input.maxTokens ?? 50,
       }),
     }
   }

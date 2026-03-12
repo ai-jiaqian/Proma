@@ -285,15 +285,20 @@ export class GoogleAdapter implements ProviderAdapter {
   buildTitleRequest(input: TitleRequestInput): ProviderRequest {
     const url = normalizeBaseUrl(input.baseUrl)
 
+    const body: Record<string, unknown> = {
+      contents: [{ role: 'user', parts: [{ text: input.prompt }] }],
+      generationConfig: { maxOutputTokens: input.maxTokens ?? 50 },
+    }
+    if (input.systemPrompt) {
+      body.systemInstruction = { parts: [{ text: input.systemPrompt }] }
+    }
+
     return {
       url: `${url}/v1beta/models/${input.modelId}:generateContent?key=${input.apiKey}`,
       headers: {
         'content-type': 'application/json',
       },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: input.prompt }] }],
-        generationConfig: { maxOutputTokens: 50 },
-      }),
+      body: JSON.stringify(body),
     }
   }
 

@@ -16,7 +16,7 @@
 import * as React from 'react'
 import { useAtom, useAtomValue, useSetAtom, useStore } from 'jotai'
 import { toast } from 'sonner'
-import { Bot, CornerDownLeft, Square, Settings, Paperclip, FolderPlus, X, Copy, Check, Sparkles } from 'lucide-react'
+import { Bot, CornerDownLeft, Square, Settings, Paperclip, FolderPlus, X, Copy, Check, Sparkles, Loader2 } from 'lucide-react'
 import { AgentMessages } from './AgentMessages'
 import { AgentHeader } from './AgentHeader'
 import { ContextUsageBadge } from './ContextUsageBadge'
@@ -111,6 +111,59 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
   const [isDragOver, setIsDragOver] = React.useState(false)
   const [dragFolderWarning, setDragFolderWarning] = React.useState(false)
   const [errorCopied, setErrorCopied] = React.useState(false)
+
+  // 提示词优化相关状态
+  const [optimizing, setOptimizing] = React.useState(false)
+  const [optimizedText, setOptimizedText] = React.useState<string | null>(null)
+  const optimizeSnapshotRef = React.useRef<string | null>(null)
+
+  // 用户编辑内容后，如果和优化时的 snapshot 不同，自动清除过期的优化结果
+  React.useEffect(() => {
+    if (optimizedText && optimizeSnapshotRef.current && inputContent.trim() !== optimizeSnapshotRef.current) {
+      setOptimizedText(null)
+      optimizeSnapshotRef.current = null
+    }
+  }, [inputContent, optimizedText])
+
+  /** 调用提示词优化 */
+  const handleOptimizePrompt = React.useCallback(async (): Promise<void> => {
+    if (!inputContent.trim() || !agentChannelId || !agentModelId || optimizing) return
+    setOptimizing(true)
+    setOptimizedText(null)
+    const snapshot = inputContent.trim()
+    optimizeSnapshotRef.current = snapshot
+    try {
+      const result = await window.electronAPI.optimizePrompt({
+        userInput: snapshot,
+        channelId: agentChannelId,
+        modelId: agentModelId,
+        recentMessages: messages.slice(-10).map((m) => ({
+          role: m.role,
+          content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
+        })),
+      })
+      if (result) {
+        setOptimizedText(result)
+      }
+    } catch (error) {
+      console.error('[AgentView] 提示词优化失败:', error)
+    } finally {
+      setOptimizing(false)
+    }
+  }, [inputContent, agentChannelId, agentModelId, optimizing, messages])
+
+  /** 接受优化结果 */
+  const handleAcceptOptimized = React.useCallback((): void => {
+    if (optimizedText) {
+      setInputContent(optimizedText)
+      setOptimizedText(null)
+    }
+  }, [optimizedText, setInputContent])
+
+  /** 拒绝优化结果 */
+  const handleRejectOptimized = React.useCallback((): void => {
+    setOptimizedText(null)
+  }, [])
 
   // pendingFiles ref（供 addFilesAsAttachments 读取最新列表，避免闭包旧值）
   const pendingFilesRef = React.useRef(pendingFiles)
@@ -844,6 +897,39 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
               </div>
             )}
 
+            {/* 提示词优化预览浮层 */}
+            {optimizedText && (
+              <div className="mx-3 mb-2 rounded-lg border border-purple-500/30 bg-purple-500/5 p-3">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs font-medium text-purple-500 flex items-center gap-1">
+                    <Sparkles className="size-3" />
+                    优化建议
+                  </span>
+                  <div className="flex items-center gap-1">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      className="size-6 rounded-full text-green-500 hover:bg-green-500/10"
+                      onClick={handleAcceptOptimized}
+                    >
+                      <Check className="size-3.5" />
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      className="size-6 rounded-full text-foreground/50 hover:text-foreground"
+                      onClick={handleRejectOptimized}
+                    >
+                      <X className="size-3.5" />
+                    </Button>
+                  </div>
+                </div>
+                <p className="text-sm text-foreground/80 whitespace-pre-wrap leading-relaxed">{optimizedText}</p>
+              </div>
+            )}
+
             <RichTextInput
               value={inputContent}
               onChange={setInputContent}
@@ -912,6 +998,30 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
                       onCompact={handleCompact}
                     />
                     <FeishuNotifyToggle sessionId={sessionId} />
+                    {/* 提示词优化按钮 */}
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          className={cn(
+                            'size-[30px] rounded-full',
+                            optimizing
+                              ? 'text-purple-500 animate-pulse'
+                              : 'text-foreground/60 hover:text-foreground',
+                            (!inputContent.trim() || !agentChannelId || !agentModelId) && 'opacity-40 cursor-not-allowed'
+                          )}
+                          onClick={handleOptimizePrompt}
+                          disabled={!inputContent.trim() || !agentChannelId || !agentModelId || optimizing}
+                        >
+                          {optimizing ? <Loader2 className="size-5 animate-spin" /> : <Sparkles className="size-5" />}
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent side="top">
+                        <p>{optimizing ? '正在优化...' : '优化提示词'}</p>
+                      </TooltipContent>
+                    </Tooltip>
                   </>
                 )}
               </div>

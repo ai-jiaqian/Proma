@@ -20,6 +20,7 @@ import type {
   ChatMessage,
   ChatSendInput,
   GenerateTitleInput,
+  PromptOptimizeInput,
   AttachmentSaveInput,
   AttachmentSaveResult,
   FileDialogResult,
@@ -91,7 +92,7 @@ import {
   truncateMessagesFrom,
   updateContextDividers,
 } from './lib/conversation-manager'
-import { sendMessage, stopGeneration, generateTitle } from './lib/chat-service'
+import { sendMessage, stopGeneration, generateTitle, optimizePrompt } from './lib/chat-service'
 import {
   saveAttachment,
   readAttachmentAsBase64,
@@ -415,6 +416,14 @@ export function registerIpcHandlers(): void {
     CHAT_IPC_CHANNELS.GENERATE_TITLE,
     async (_, input: GenerateTitleInput): Promise<string | null> => {
       return generateTitle(input)
+    }
+  )
+
+  // 优化提示词
+  ipcMain.handle(
+    CHAT_IPC_CHANNELS.OPTIMIZE_PROMPT,
+    async (_, input: PromptOptimizeInput): Promise<string | null> => {
+      return optimizePrompt(input)
     }
   )
 
