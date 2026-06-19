@@ -56,4 +56,10 @@ describe('工作区项目记忆文件', () => {
     writeFileSync(join(dir, PROJECT_FILE_NAME), '  hello  \n', 'utf-8')
     expect(readProjectFileFromDir(dir)).toBe('hello')
   })
+
+  test('Given 空白文件 When 读取 Then 返回 null', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'proma-pf-'))
+    writeFileSync(join(dir, PROJECT_FILE_NAME), '   \n', 'utf-8')
+    expect(readProjectFileFromDir(dir)).toBeNull()
+  })
 })

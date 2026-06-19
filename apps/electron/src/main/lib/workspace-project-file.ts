@@ -71,7 +71,8 @@ export function readProjectFileFromDir(filesDir: string): string | null {
   try {
     const content = readFileSync(target, 'utf-8').trim()
     return content.length > 0 ? content : null
-  } catch {
+  } catch (err) {
+    console.warn(`[Agent 工作区] 读取 PROJECT.md 失败 (${target}):`, err)
     return null
   }
 }
