@@ -14,6 +14,7 @@ import { getUserProfile } from './user-profile-service'
 import { getWorkspaceMcpConfig } from './agent-workspace-manager'
 import { getConfigDirName } from './config-paths'
 import { DEEPSEEK_SUBAGENT_MODEL_ID } from './agent-model-routing'
+import { readWorkspaceProjectFile, buildProjectMemoryBlock } from './workspace-project-file'
 
 // ===== SubAgent 元数据（单一数据源） =====
 
@@ -539,6 +540,10 @@ export function buildDynamicContext(ctx: DynamicContext): string {
     if (wsLines.length > 0) {
       sections.push(`<workspace_state>\n${wsLines.join('\n')}\n</workspace_state>`)
     }
+
+    // 强制注入项目必读文件 PROJECT.md（每条消息实时读盘，保证内容变更即时生效）
+    const projectMemory = readWorkspaceProjectFile(ctx.workspaceSlug)
+    sections.push(buildProjectMemoryBlock(projectMemory))
   }
 
   // 工作目录
