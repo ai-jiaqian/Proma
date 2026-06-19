@@ -21,6 +21,7 @@ import {
   parseSkillVersion,
 } from './config-paths'
 import { findAllGitRoots, normalizeGitRoot } from './git-diff-service'
+import { seedWorkspaceProjectFile } from './workspace-project-file'
 import type { AgentWorkspace, WorkspaceMcpConfig, SkillMeta, SkillImportSource, OtherWorkspaceSkillsGroup, WorkspaceCapabilities, SkillFileNode, SkillFileContent } from '@proma/shared'
 
 interface AgentWorkspacesIndex {
@@ -197,6 +198,7 @@ export function createAgentWorkspace(name: string): AgentWorkspace {
   getAgentWorkspacePath(slug)
   ensurePluginManifest(slug, name)
   copyDefaultSkills(slug)
+  seedWorkspaceProjectFile(slug)
 
   index.workspaces.unshift(workspace)
   writeIndex(index)
@@ -393,6 +395,23 @@ export function upgradeDefaultSkillsInWorkspaces(): void {
       } catch (err) {
         console.warn(`[Agent 工作区] 注入默认 Skill 失败 (${workspace.slug}/${slug}):`, err)
       }
+    }
+  }
+}
+
+/**
+ * 对所有已存在工作区补建 PROJECT.md（仅缺失时写，绝不覆盖用户内容）。
+ * 启动期调用，让老用户工作区也获得项目必读文件。
+ */
+export function seedProjectFilesInWorkspaces(): void {
+  const index = readIndex()
+  for (const workspace of index.workspaces) {
+    try {
+      if (seedWorkspaceProjectFile(workspace.slug)) {
+        console.log(`[Agent 工作区] 已补建 PROJECT.md: ${workspace.slug}`)
+      }
+    } catch (err) {
+      console.warn(`[Agent 工作区] 补建 PROJECT.md 失败 (${workspace.slug}):`, err)
     }
   }
 }

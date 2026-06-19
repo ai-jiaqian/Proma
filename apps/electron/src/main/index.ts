@@ -85,7 +85,7 @@ import { registerIpcHandlers } from './ipc'
 import { createTray, destroyTray, getTray } from './tray'
 import { initializeRuntime } from './lib/runtime-init'
 import { seedDefaultSkills } from './lib/config-paths'
-import { upgradeDefaultSkillsInWorkspaces } from './lib/agent-workspace-manager'
+import { upgradeDefaultSkillsInWorkspaces, seedProjectFilesInWorkspaces } from './lib/agent-workspace-manager'
 import { stopAllAgents, killOrphanedClaudeSubprocesses } from './lib/agent-service'
 import { stopAllGenerations } from './lib/chat-service'
 import { initAutoUpdater, cleanupUpdater } from './lib/updater/auto-updater'
@@ -491,6 +491,9 @@ async function bootstrap(): Promise<void> {
 
   // 升级所有工作区中版本过旧的默认 Skills
   safeRun('upgradeDefaultSkillsInWorkspaces', upgradeDefaultSkillsInWorkspaces)
+
+  // 对老工作区补建 PROJECT.md（仅缺失时写）
+  safeRun('seedProjectFilesInWorkspaces', seedProjectFilesInWorkspaces)
 
   // Create application menu
   const menu = createApplicationMenu()
