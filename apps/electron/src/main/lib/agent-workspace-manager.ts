@@ -299,6 +299,7 @@ export function ensureDefaultWorkspace(): AgentWorkspace {
     getAgentWorkspacePath('default')
     ensurePluginManifest('default', '默认工作区')
     copyDefaultSkills('default')
+    seedWorkspaceProjectFile('default')
 
     index.workspaces.push(defaultWs)
     writeIndex(index)
