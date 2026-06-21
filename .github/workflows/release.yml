@@ -49,6 +49,10 @@ jobs:
           MAC_CERTS: ${{ secrets.MAC_CERTS }}
           MAC_CERTS_PASSWORD: ${{ secrets.MAC_CERTS_PASSWORD }}
         run: |
+          if [ -z "$MAC_CERTS" ]; then
+            echo "未配置 MAC_CERTS secret，跳过 macOS 签名（unsigned build）"
+            exit 0
+          fi
           # 创建临时 keychain
           KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain
           KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
@@ -77,6 +81,8 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # 无 MAC_CERTS 时关闭签名自动发现，让 electron-builder 直接出未签名包
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ secrets.MAC_CERTS != '' }}
         run: |
           for i in 1 2 3; do
             npx electron-builder --mac --arm64 --publish always && break
@@ -112,6 +118,10 @@ jobs:
           MAC_CERTS: ${{ secrets.MAC_CERTS }}
           MAC_CERTS_PASSWORD: ${{ secrets.MAC_CERTS_PASSWORD }}
         run: |
+          if [ -z "$MAC_CERTS" ]; then
+            echo "未配置 MAC_CERTS secret，跳过 macOS 签名（unsigned build）"
+            exit 0
+          fi
           # 创建临时 keychain
           KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain
           KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
@@ -140,6 +150,8 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # 无 MAC_CERTS 时关闭签名自动发现，让 electron-builder 直接出未签名包
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ secrets.MAC_CERTS != '' }}
         run: |
           for i in 1 2 3; do
             npx electron-builder --mac --x64 --publish always && break
