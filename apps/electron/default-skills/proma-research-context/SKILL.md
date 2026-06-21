@@ -2,7 +2,7 @@
 name: proma-research-context
 description: 通用「科研项目上下文 / 实验记忆」Skill，为 Proma 工作区里的科研项目初始化并维护一套清晰、可复现、结论可信的实验记忆，并随时把两条研究诚信纪律（实验运行纪律 + 主张与记忆纪律）带进上下文。触发要宽：开始或继续一个科研/实验项目、初始化或刷新科研骨架、要跑实验/冒烟测试/scale-up run、记录或检索实验结果、写实验记录(experiment_records)、整理实验结论、引用既往数字/结论、维护 exp.md 实验导航、判断某结论证据强度、想让 Agent「跑实验前知道该验证什么、引用结论前先核对原始记录」时，都应触发。任何论文/ML/Agent 实验类工作适用；与科研无关的纯软件开发用 proma-dev-context。
 group: proma
-version: "1.0.0"
+version: "1.1.0"
 ---
 
 # 科研项目上下文 / 实验记忆 (proma-research-context)
@@ -92,6 +92,7 @@ python3 <skill目录>/scripts/init_research_context.py --root <工作区根>/wor
 - 默认不往实验代码仓库写这些记忆文件。
 - 不编造实验结果/数字/结论；没证据就说没验证、指出要跑什么。
 - `PROJECT.md` / `exp.md` 不堆原始日志和完整结果表（那是导航层）。
+- **PROJECT.md 不要变成变更日志**：只放护栏/规则、持久事实、指针；某次实验/决策的*过程、机制、commit hash、"已做 X" 叙述* → `experiment_records/` 或 `devlogs/`。自检：写进 PROJECT.md 前问——"未来必须遵守的规则/必须知道的事实"还是"记录某事怎么发生的"？前者留（精简+指针），后者下沉。出现 commit hash/日期/机制步骤链基本就是该下沉的内容。
 - 不在 `env.md` 写明文密钥。
 - 不改写 `research-disciplines.md`（受管文件，要改去 Skill 的 fragment 再 `--refresh`）。
 
