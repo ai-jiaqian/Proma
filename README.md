@@ -27,9 +27,23 @@ Proma 是一个本地优先的 AI 桌面应用，把多模型 Chat、通用 Agen
 
 ## 快速开始
 
+### 一键安装 / 更新（本 fork）
+
+本 fork 未做代码签名，手动下载需绕过 Gatekeeper / SmartScreen。用下面的一行命令最省事——自动检测最新版、下载、安装并绕过拦截；重跑即更新：
+
+```bash
+# macOS（安装 + 手动更新，跑一次更一次）
+curl -fsSL https://raw.githubusercontent.com/ai-jiaqian/Proma/main/scripts/install.sh | bash
+```
+
+```powershell
+# Windows（首次安装；之后 App 每 4 小时自动检查更新）
+irm https://raw.githubusercontent.com/ai-jiaqian/Proma/main/scripts/install.ps1 | iex
+```
+
 ### 下载安装
 
-从 [GitHub Releases](https://github.com/ErlichLiu/Proma/releases) 下载开源版本。当前 release notes 以 `v0.9.12` 为准，提供 macOS Apple Silicon、macOS Intel 和 Windows 安装包。
+从 [GitHub Releases](https://github.com/ai-jiaqian/Proma/releases) 下载本 fork 的安装包，提供 macOS Apple Silicon、macOS Intel 和 Windows 安装包。
 
 如果你希望开箱即用、减少 API 配置成本，也可以使用 [Proma 商业版](https://proma.cool/download)。商业版和开源版并行运行，主要区别是商业版提供内置渠道和订阅方案。
 
