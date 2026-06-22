@@ -22,6 +22,7 @@ import {
 } from './config-paths'
 import { findAllGitRoots, normalizeGitRoot } from './git-diff-service'
 import { seedWorkspaceProjectFile } from './workspace-project-file'
+import { listBuiltinMcpServers } from './builtin-mcp/catalog'
 import type { AgentWorkspace, WorkspaceMcpConfig, SkillMeta, SkillImportSource, OtherWorkspaceSkillsGroup, WorkspaceCapabilities, SkillFileNode, SkillFileContent } from '@proma/shared'
 
 interface AgentWorkspacesIndex {
@@ -596,6 +597,7 @@ function parseSkillFrontmatter(content: string, slug: string, enabled: boolean):
 export function getWorkspaceCapabilities(workspaceSlug: string): WorkspaceCapabilities {
   const mcpConfig = getWorkspaceMcpConfig(workspaceSlug)
   const skills = getWorkspaceSkills(workspaceSlug)
+  const builtinMcpServers = listBuiltinMcpServers({ workspaceSlug })
 
   const mcpServers = Object.entries(mcpConfig.servers ?? {}).map(([name, entry]) => ({
     name,
@@ -603,7 +605,7 @@ export function getWorkspaceCapabilities(workspaceSlug: string): WorkspaceCapabi
     type: entry.type,
   }))
 
-  return { mcpServers, skills }
+  return { mcpServers, builtinMcpServers, skills }
 }
 
 export function deleteWorkspaceSkill(workspaceSlug: string, skillSlug: string): void {
