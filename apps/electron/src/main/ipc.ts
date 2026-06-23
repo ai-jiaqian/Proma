@@ -1445,8 +1445,12 @@ export function registerIpcHandlers(): void {
       }
 
       // 主题相关设置变化时，广播给所有窗口（跨窗口同步，如 Quick Task 面板）
-      if (updates.themeMode !== undefined || updates.themeStyle !== undefined) {
-        const payload = { themeMode: result.themeMode, themeStyle: result.themeStyle }
+      if (updates.themeMode !== undefined || updates.themeStyle !== undefined || updates.interfaceVariant !== undefined) {
+        const payload = {
+          themeMode: result.themeMode,
+          themeStyle: result.themeStyle,
+          interfaceVariant: result.interfaceVariant,
+        }
         BrowserWindow.getAllWindows().forEach((win) => {
           // 跳过发起者窗口，避免重复应用
           if (win.webContents.id !== event.sender.id) {
@@ -2892,7 +2896,15 @@ export function registerIpcHandlers(): void {
         console.warn('[IPC] file:resolve-path 拒绝越界路径:', result)
         return null
       }
-      return result ? { url: registerPromaFilePath(result) } : null
+      if (!result) return null
+      // registerPromaFilePath 对目录路径会抛「不是文件」。渲染端（如悬浮预览解析 markdown
+      // 链接）可能传入目录路径，此处优雅降级为 null，而不是让异常冒泡成未捕获的 handler 错误。
+      try {
+        return { url: registerPromaFilePath(result) }
+      } catch (err) {
+        console.warn('[IPC] file:resolve-path 无法注册为文件，跳过:', result, err instanceof Error ? err.message : err)
+        return null
+      }
     }
   )
 
