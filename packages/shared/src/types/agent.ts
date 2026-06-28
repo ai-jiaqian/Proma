@@ -757,8 +757,14 @@ export interface AgentGenerateTitleInput {
 
 // ===== MCP 服务器配置 =====
 
-/** MCP 传输类型 */
+/** MCP 传输类型；Proma 将 Streamable HTTP 规范化存储为 http */
 export type McpTransportType = 'stdio' | 'http' | 'sse'
+
+/** 外部配置中常见的 Streamable HTTP 别名 */
+export type McpTransportTypeAlias = 'streamableHttp' | 'streamable-http' | 'streamable_http'
+
+/** MCP 传输类型输入；保存和运行前会规范化为 McpTransportType */
+export type McpTransportTypeInput = McpTransportType | McpTransportTypeAlias
 
 /** MCP 服务器条目 */
 export interface McpServerEntry {
@@ -1042,6 +1048,8 @@ export interface AgentStreamCompletePayload {
   startedAt?: number
   /** SDK result 消息的 subtype（success / error_max_turns / error_max_budget_usd / error_during_execution 等） */
   resultSubtype?: string
+  /** SDK result 消息携带的错误详情（error_during_execution 等场景下的真实错误原因，用于展示具体错误） */
+  resultErrors?: string[]
   /** 本轮主体结束但仍有后台任务/定时任务在飞行：UI 进入"空闲可输入"态，等待任务完成自动唤醒 */
   backgroundTasksPending?: boolean
 }
