@@ -43,7 +43,7 @@ import { getFetchFn } from './proxy-fetch'
 import { getEffectiveProxyUrl } from './proxy-settings-service'
 import { appendSDKMessages, updateAgentSessionMeta, getAgentSessionMeta, getAgentSessionMessages, getAgentSessionSDKMessages, truncateSDKMessages, resolveUserUuidFromSDK, rewindFilesFromSnapshot } from './agent-session-manager'
 import { getAgentWorkspace, getWorkspaceMcpConfig, ensurePluginManifest } from './agent-workspace-manager'
-import { getAgentWorkspacePath, getAgentSessionWorkspacePath, getSdkConfigDir, getWorkspaceFilesDir, getConfigDirName } from './config-paths'
+import { getAgentWorkspacePath, getAgentSessionWorkspacePath, getSdkConfigDir, getWorkspaceFilesDir, getConfigDirName, getBundledCliPath } from './config-paths'
 import { getWorkspaceAttachedDirectories, getWorkspaceAttachedFiles } from './agent-workspace-manager'
 import { getRuntimeStatus } from './runtime-init'
 import { getSettings } from './settings-service'
@@ -409,6 +409,7 @@ function buildReferencedSessionsPrompt(
   currentSessionId: string,
   mentionedSessionIds?: string[],
   workspaceId?: string,
+  workspaceSlug?: string,
 ): string {
   const uniqueIds = [...new Set((mentionedSessionIds ?? []).filter(Boolean))]
   if (uniqueIds.length === 0) return ''
@@ -433,6 +434,17 @@ function buildReferencedSessionsPrompt(
   }
 
   if (sessionBlocks.length === 0) return ''
+
+  // 打包模式下 proma CLI 二进制随 App 分发，可用 session-cleaner skill 读取引用会话：
+  // 默认正常完整读取（export 全量）；仅当会话过大、完整读入会撑爆上下文时，才用搜索 + turn 区间省着读。
+  // 开发模式（getBundledCliPath 返回 undefined，CLI 不可用）回退到原有的 Grep 局部读指引。
+  const cliAvailable = !!getBundledCliPath()
+  if (cliAvailable) {
+    const skillName = workspaceSlug
+      ? `proma-workspace-${workspaceSlug}:session-cleaner`
+      : 'session-cleaner'
+    return `<referenced_sessions>\n用户在消息中明确引用了以下同工作区 Agent 会话。需要这些会话的上下文时，使用 session-cleaner skill（${skillName}）读取——它通过 proma CLI 把会话清洗为干净对话。默认正常完整读取整个会话；仅当某个会话过大、完整读入会撑爆上下文时，才改用 skill 的搜索 + turn 区间能力按需节省。不要假设会话内容，也不要直接 Read 原始 .jsonl 历史文件。\n${sessionBlocks.join('\n\n')}\n</referenced_sessions>`
+  }
 
   return `<referenced_sessions>\n用户在消息中明确引用了以下同工作区 Agent 会话。不要假设这些会话的内容；需要上下文时，请先读取对应的 History path，再基于读取结果继续完成任务。\n\n重要提示：会话历史文件（.jsonl）可能包含大量消息和 tool results，文件较大。请优先使用 Grep 搜索关键词定位相关消息片段，再局部读取。避免一次性 Read 整个大文件。\n${sessionBlocks.join('\n\n')}\n</referenced_sessions>`
 }
@@ -549,6 +561,10 @@ export class AgentOrchestrator {
       ...cleanEnv,
       // 提升输出 token 上限，避免 "exceeded 32000 output token maximum" 错误
       CLAUDE_CODE_MAX_OUTPUT_TOKENS: '64000',
+      // 暴露打包进 App 的 proma CLI 路径，供 session-cleaner 等 skill / Agent 调用
+      // （开发模式无编译二进制，getBundledCliPath 返回 undefined，此处不注入，
+      //   skill 回退到源码运行 bun apps/cli/src/index.ts）。
+      ...(getBundledCliPath() ? { PROMA_CLI: getBundledCliPath() } : {}),
       // 启用 Tasks 功能
       CLAUDE_CODE_ENABLE_TASKS: 'true',
       // 禁用实验性 beta 功能，使用稳定模式
@@ -1196,7 +1212,7 @@ export class AgentOrchestrator {
 
       // 11.5 注入 mention 引用指令（Skill/MCP/会话）— 仅影响 prompt，不影响持久化
       let enrichedMessage = userMessage
-      const referencedSessionsBlock = buildReferencedSessionsPrompt(sessionId, mentionedSessionIds, workspaceId)
+      const referencedSessionsBlock = buildReferencedSessionsPrompt(sessionId, mentionedSessionIds, workspaceId, workspaceSlug)
       if (referencedSessionsBlock) {
         enrichedMessage = `${referencedSessionsBlock}\n\n${enrichedMessage}`
         console.log(`[Agent 编排] 注入 referenced_sessions: ${mentionedSessionIds?.length ?? 0} sessions`)
@@ -1212,7 +1228,7 @@ export class AgentOrchestrator {
         for (const name of mentionedMcpServers ?? []) {
           toolLines.push(`- MCP 服务器: ${name}（请使用此 MCP 服务器的工具来完成任务）`)
         }
-        enrichedMessage = `<mentioned_tools>\n${toolLines.join('\n')}\n</mentioned_tools>\n\n${userMessage}`
+        enrichedMessage = `<mentioned_tools>\n${toolLines.join('\n')}\n</mentioned_tools>\n\n${enrichedMessage}`
         console.log(`[Agent 编排] 注入 mentioned_tools: ${mentionedSkills?.length ?? 0} skills, ${mentionedMcpServers?.length ?? 0} MCP`)
       }
 
@@ -2317,6 +2333,9 @@ export class AgentOrchestrator {
     _priority?: string,
     presetUuid?: string,
     opts?: { interrupt?: boolean },
+    mentionedSkills?: string[],
+    mentionedMcpServers?: string[],
+    mentionedSessionIds?: string[],
   ): Promise<string> {
     if (!this.activeSessions.has(sessionId)) {
       throw new Error(`[Agent 编排] 会话未运行，无法追加消息: ${sessionId}`)
@@ -2324,6 +2343,31 @@ export class AgentOrchestrator {
 
     if (!this.adapter.sendQueuedMessage) {
       throw new Error('[Agent 编排] 当前适配器不支持流式追加消息')
+    }
+
+    // 注入 mention 引用指令（Skill/MCP/会话）— 与 sendMessage 路径保持一致的 prompt 加工
+    const meta = getAgentSessionMeta(sessionId)
+    const workspaceSlug = meta?.workspaceId
+      ? getAgentWorkspace(meta.workspaceId)?.slug
+      : undefined
+
+    let enrichedText = text
+    const referencedSessionsBlock = buildReferencedSessionsPrompt(sessionId, mentionedSessionIds, meta?.workspaceId, workspaceSlug)
+    if (referencedSessionsBlock) {
+      enrichedText = `${referencedSessionsBlock}\n\n${enrichedText}`
+    }
+    if (mentionedSkills?.length || mentionedMcpServers?.length) {
+      const toolLines: string[] = ['用户在消息中明确引用了以下工具，请在本次回复中主动调用：']
+      for (const slug of mentionedSkills ?? []) {
+        const qualifiedName = workspaceSlug
+          ? `proma-workspace-${workspaceSlug}:${slug}`
+          : slug
+        toolLines.push(`- Skill: ${qualifiedName}（请立即调用此 Skill）`)
+      }
+      for (const name of mentionedMcpServers ?? []) {
+        toolLines.push(`- MCP 服务器: ${name}（请使用此 MCP 服务器的工具来完成任务）`)
+      }
+      enrichedText = `<mentioned_tools>\n${toolLines.join('\n')}\n</mentioned_tools>\n\n${enrichedText}`
     }
 
     const uuid = presetUuid || randomUUID()
@@ -2336,7 +2380,7 @@ export class AgentOrchestrator {
     // 构造 SDKUserMessage 并注入（强制 'now' 优先级）
     const sdkMessage = {
       type: 'user' as const,
-      message: { role: 'user' as const, content: text },
+      message: { role: 'user' as const, content: enrichedText },
       parent_tool_use_id: null,
       priority: 'now' as const,
       uuid,
@@ -2358,7 +2402,7 @@ export class AgentOrchestrator {
       await this.adapter.sendQueuedMessage(sessionId, sdkMessage)
       console.log(`[Agent 编排] 追加消息已注入: sessionId=${sessionId}, uuid=${uuid}, interrupt=${!!opts?.interrupt}`)
 
-      // 立即持久化到 JSONL
+      // 立即持久化到 JSONL — 仅存原始文本，不含 prompt 工程块（与 sendMessage 路径一致）
       const persistMsg: SDKMessage = {
         type: 'user',
         uuid,
