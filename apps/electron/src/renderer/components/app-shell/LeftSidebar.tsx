@@ -94,6 +94,8 @@ import {
 import { detectIsMac } from '@/lib/platform'
 import { getActiveAccelerator, getAcceleratorDisplay } from '@/lib/shortcut-registry'
 import {
+  collectAgentSessionTreeIds,
+  isAgentSessionVisibleInTrees,
   replaceAgentSessionInFreshnessOrder,
   sortAgentSessionsByUpdatedAtDesc,
 } from '@/lib/agent-session-list'
@@ -388,15 +390,6 @@ function treeContainsSessionId(item: AgentSessionTreeItem, sessionId: string | n
   return item.session.id === sessionId || item.childSessions.some((session) => session.id === sessionId)
 }
 
-function collectTreeSessionIds(items: AgentSessionTreeItem[]): Set<string> {
-  const ids = new Set<string>()
-  for (const item of items) {
-    ids.add(item.session.id)
-    for (const child of item.childSessions) ids.add(child.id)
-  }
-  return ids
-}
-
 function getDirectDelegatedChildren(
   sessions: AgentSessionMeta[],
   parentSessionId: string,
@@ -550,6 +543,8 @@ export function LeftSidebar({ width }: LeftSidebarProps): React.ReactElement {
   const [deletingWorkspaceId, setDeletingWorkspaceId] = React.useState<string | null>(null)
   /** 待迁移会话 ID，非空时显示迁移对话框 */
   const [moveTargetId, setMoveTargetId] = React.useState<string | null>(null)
+  /** 待迁移会话所属的工作区 ID（用于对话框排除当前分区） */
+  const [moveSourceWorkspaceId, setMoveSourceWorkspaceId] = React.useState<string | undefined>()
   /** 每个项目额外展开显示的会话数量（每次点击"显示更多" +10），未点击则为 0 或无值 */
   const [expandedExtraCountMap, setExpandedExtraCountMap] = React.useState<Map<string, number>>(new Map())
   /** 记录被用户手动折叠的工作区 ID（点击当前工作区标题时折叠/展开）。刻意不持久化：折叠被视为临时查看行为，刷新/重启后恢复默认展开 */
@@ -810,16 +805,29 @@ export function LeftSidebar({ width }: LeftSidebarProps): React.ReactElement {
     return () => window.removeEventListener('focus', handleFocus)
   }, [setConversations, setAgentSessions])
 
-  /** 打开自动任务列表 */
+  /** 打开/关闭自动任务列表 */
   const handleOpenAutomations = React.useCallback((): void => {
+    if (activeView === 'automations') {
+      // 编辑页 → 关表单回列表；列表页 → 退出到对话
+      if (store.get(automationFormAtom).open) {
+        setAutomationForm({ open: false, draft: null })
+        return
+      }
+      setActiveView('conversations')
+      return
+    }
     setAutomationForm({ open: false, draft: null })
     setActiveView('automations')
-  }, [setAutomationForm, setActiveView])
+  }, [activeView, setAutomationForm, setActiveView, store])
 
-  /** 打开 Agent 技能视图 */
+  /** 打开/关闭 Agent 技能视图 */
   const handleOpenSkills = React.useCallback((): void => {
+    if (activeView === 'agent-skills') {
+      setActiveView('conversations')
+      return
+    }
     setActiveView('agent-skills')
-  }, [setActiveView])
+  }, [activeView, setActiveView])
 
   /** 打开当前工作区的 MCP 管理页 */
   const handleOpenMcpManagement = React.useCallback((): void => {
@@ -1013,12 +1021,14 @@ export function LeftSidebar({ width }: LeftSidebarProps): React.ReactElement {
         setCurrentWorkspaceId(targetWorkspaceId)
         window.electronAPI.updateSettings({ agentWorkspaceId: targetWorkspaceId }).catch(console.error)
       }
-
       const meta = await window.electronAPI.createAgentSession(
         undefined,
         agentChannelId || undefined,
         targetWorkspaceId,
       )
+      if (targetWorkspaceId) {
+        setCollapsedWorkspaceIds((prev) => deleteSetEntry(prev, targetWorkspaceId))
+      }
       setAgentSessions((prev) => [meta, ...prev])
       // 从全局默认值初始化 per-session 渠道/模型配置
       if (agentChannelId) {
@@ -1572,7 +1582,10 @@ export function LeftSidebar({ width }: LeftSidebarProps): React.ReactElement {
   /** 请求迁移会话到其他项目（弹出迁移对话框） */
   const handleRequestMove = React.useCallback((id: string): void => {
     setMoveTargetId(id)
-  }, [])
+    // 查找被迁移会话所属的工作区——排除分区应基于此而非当前 UI 工作区
+    const session = agentSessions.find((s) => s.id === id)
+    setMoveSourceWorkspaceId(session?.workspaceId)
+  }, [agentSessions])
 
   /** 迁移会话到另一个项目后的回调 */
   const handleSessionMoved = (updatedSession: AgentSessionMeta, targetWorkspaceName: string): void => {
@@ -1843,7 +1856,7 @@ export function LeftSidebar({ width }: LeftSidebarProps): React.ReactElement {
       open={moveTargetId !== null}
       onOpenChange={(open) => { if (!open) setMoveTargetId(null) }}
       sessionId={moveTargetId ?? ''}
-      currentWorkspaceId={currentWorkspaceId ?? undefined}
+      currentWorkspaceId={moveSourceWorkspaceId ?? undefined}
       workspaces={workspaces}
       onMoved={handleSessionMoved}
     />
@@ -3407,7 +3420,7 @@ const AgentProjectGroupItem = React.memo(function AgentProjectGroupItem({
       if (delta !== 0) return delta
       return b.session.updatedAt - a.session.updatedAt
     })
-  const activeIds = collectTreeSessionIds(activeSessions)
+  const activeIds = collectAgentSessionTreeIds(activeSessions)
   // 非活跃部分按自然策略（最近 3 天窗口 + 预览上限）计算，且不依赖当前选中态，
   // 保持 group.sessions 的 updatedAt 倒序——这样点击已可见会话时顺序保持稳定，
   // 不会因为它变成 activeSessionId 而被提到顶部。
@@ -3425,8 +3438,7 @@ const AgentProjectGroupItem = React.memo(function AgentProjectGroupItem({
   const sessionsWithoutPinned = [...collapsedSessions, ...extraSessions]
   // 仅当选中会话不在当前可见列表中时才置顶（如搜索结果打开旧会话），
   // 若会话已在可见区域则保持原位不跳
-  const sessionIds = new Set(sessionsWithoutPinned.map((item) => item.session.id))
-  const currentSession = activeSessionId && !sessionIds.has(activeSessionId)
+  const currentSession = activeSessionId && !isAgentSessionVisibleInTrees(sessionsWithoutPinned, activeSessionId)
     ? treeItems.find((item) => treeContainsSessionId(item, activeSessionId)) ?? null
     : null
   const pinnedCurrent = currentSession ? [currentSession] : []
