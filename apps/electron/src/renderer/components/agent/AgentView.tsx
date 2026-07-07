@@ -58,6 +58,7 @@ import { cn } from '@/lib/utils'
 import { getActiveAccelerator, getAcceleratorDisplay } from '@/lib/shortcut-registry'
 import { registerShortcut } from '@/lib/shortcut-registry'
 import { previewPanelOpenMapAtom, quotedSelectionMapAtom, currentQuotedSelectionAtom } from '@/atoms/preview-atoms'
+import type { QuotedSelection } from '@/atoms/preview-atoms'
 import {
   agentStreamingStatesAtom,
   agentSessionStreamingStateAtomFamily,
@@ -112,8 +113,10 @@ import { useOpenPreview } from '@/components/diff/preview-opener'
 import type { AgentSendInput, AgentPendingFile, FileDialogLargeFile, ModelOption, SDKMessage, SDKUserMessage } from '@proma/shared'
 import { inferContextWindow, MAX_ATTACHMENT_SIZE } from '@proma/shared'
 import { fileToBase64, formatFileNames, getFileParentPath } from '@/lib/file-utils'
+import { buildQuotedSelectionBlock } from '@/lib/quoted-selection'
 import { createClipboardPendingFile, createClipboardTextDraft, makeUniqueAttachmentName } from '@/lib/clipboard-text-attachment'
 import {
+  buildQueuedMessageSendPayload,
   createAgentQueuedMessage,
   moveQueuedMessage,
   parseQueuedMessageMentions,
@@ -441,6 +444,21 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
     })
   }, [sessionId, setQuotedSelectionMap])
 
+  /** 消费当前引用选区，用于把引用快照固定到本次发送/队列消息中 */
+  const consumeQuotedSelection = React.useCallback((): QuotedSelection | null => {
+    const quotedSelection = store.get(quotedSelectionMapAtom).get(sessionId) ?? null
+    if (!quotedSelection) return null
+
+    const capturedAt = quotedSelection.capturedAt
+    store.set(quotedSelectionMapAtom, (prev) => {
+      const m = new Map(prev)
+      const current = m.get(sessionId)
+      if (current && current.capturedAt === capturedAt) m.delete(sessionId)
+      return m
+    })
+    return quotedSelection
+  }, [sessionId, store])
+
   const suggestionsMap = useAtomValue(agentPromptSuggestionsAtom)
   const suggestion = suggestionsMap.get(sessionId) ?? null
   const setPromptSuggestions = useSetAtom(agentPromptSuggestionsAtom)
@@ -708,20 +726,21 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
 
   const queueMessageIntoActiveAgent = React.useCallback(async (
     message: AgentQueuedMessage,
-    text: string,
+    rawText: string,
+    sdkText: string,
     mentions: ReturnType<typeof parseQueuedMessageMentions>,
     interruptCurrentTurn: boolean,
   ): Promise<void> => {
     // 气泡显示用原文 text（保留 /skill: #mcp: &session: 语法），
     // 让 message.tsx 的 remarkMentions 立即渲染出引用芯片；
-    // 剥离后的 cleanedText 仅用于传给 SDK，不作为展示文本。
-    appendLiveUserMessage(createUserSDKMessage(text, message.id, Date.now()))
+    // 剥离后的 sdkText 仅用于传给 SDK，不作为展示文本。
+    appendLiveUserMessage(createUserSDKMessage(rawText, message.id, Date.now()))
 
     try {
       await window.electronAPI.queueAgentMessage({
         sessionId,
-        userMessage: mentions.cleanedText,
-        rawUserMessage: text,
+        userMessage: sdkText,
+        rawUserMessage: rawText,
         uuid: message.id,
         interrupt: interruptCurrentTurn,
         ...(mentions.mentionedSkills.length > 0 && { mentionedSkills: mentions.mentionedSkills }),
@@ -797,10 +816,12 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
   const sendPlainTextAgentMessage = React.useCallback(async (
     message: AgentQueuedMessage,
   ): Promise<void> => {
-    const text = message.text.trim()
-    if (!text || !agentChannelId || !hasAvailableModel) return
+    const quotedSelectionBlock = message.quotedSelection
+      ? buildQuotedSelectionBlock(message.quotedSelection)
+      : ''
+    const payload = buildQueuedMessageSendPayload(message, quotedSelectionBlock)
+    if (!payload.rawText || !agentChannelId || !hasAvailableModel) return
 
-    const mentions = parseQueuedMessageMentions(text)
     clearStoppedByUser()
 
     // interrupt 由本函数读到的实时 streaming 决定，而非调用方传入的快照：
@@ -808,11 +829,11 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
     // - backgroundWaiting（软空闲，无活跃 turn）：直接注入，无需中断
     // 避免"外层判定 streaming、内层已结束"两个快照不一致导致的竞态。
     if (streaming || backgroundWaiting) {
-      await queueMessageIntoActiveAgent(message, text, mentions, streaming)
+      await queueMessageIntoActiveAgent(message, payload.rawText, payload.sdkText, payload.mentions, streaming)
       return
     }
 
-    await startQueuedMessageRun(text, mentions, agentChannelId)
+    await startQueuedMessageRun(payload.rawText, payload.mentions, agentChannelId)
   }, [
     agentChannelId,
     backgroundWaiting,
@@ -1481,9 +1502,10 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
         return
       }
 
+      const quotedSelection = consumeQuotedSelection()
       setQueuedMessages((prev) => [
         ...prev,
-        createAgentQueuedMessage(effectiveText, crypto.randomUUID(), Date.now()),
+        createAgentQueuedMessage(effectiveText, crypto.randomUUID(), Date.now(), quotedSelection),
       ])
       if (overrideText === undefined) {
         setInputContent('')
@@ -1508,7 +1530,8 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
         return
       }
 
-      const message = createAgentQueuedMessage(effectiveText, crypto.randomUUID(), Date.now())
+      const quotedSelection = consumeQuotedSelection()
+      const message = createAgentQueuedMessage(effectiveText, crypto.randomUUID(), Date.now(), quotedSelection)
       if (overrideText === undefined) {
         setInputContent('')
         setInputHtmlContent('')
@@ -1534,6 +1557,14 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
           }
           return map
         })
+        const failedQuotedSelection = message.quotedSelection
+        if (failedQuotedSelection) {
+          setQuotedSelectionMap((prev) => {
+            const map = new Map(prev)
+            map.set(sessionId, failedQuotedSelection)
+            return map
+          })
+        }
       })
       return
     }
@@ -1663,25 +1694,9 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
     }
 
     // 构建引用选中文本：内联 XML 拼入 prompt，对话框不展示（parseAttachedFiles 剥离）
-    const quotedSelection = store.get(quotedSelectionMapAtom).get(sessionId)
+    const quotedSelection = consumeQuotedSelection()
     if (quotedSelection) {
-      const capturedAt = quotedSelection.capturedAt
-      // XML 转义：path 走完整实体编码（&, <, >, "），text 仅需防误闭合外层标签
-      const safePath = quotedSelection.filePath
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-      const safeText = quotedSelection.text.replace(/<\/quoted_file>/gi, '</quoted_file_>')
-      const quotedBlock = `<quoted_file path="${safePath}">\n${safeText}\n</quoted_file>\n\n`
-      fileReferences = fileReferences + quotedBlock
-
-      store.set(quotedSelectionMapAtom, (prev) => {
-        const m = new Map(prev)
-        const current = m.get(sessionId)
-        if (current && current.capturedAt === capturedAt) m.delete(sessionId)
-        return m
-      })
+      fileReferences = fileReferences + buildQuotedSelectionBlock(quotedSelection)
     }
 
     // 2. 构建最终消息
@@ -1764,7 +1779,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
         return map
       })
     })
-  }, [inputContent, createBaseAdditionalDirectories, sessionId, agentChannelId, agentModelId, currentWorkspaceId, workspaces, streaming, backgroundWaiting, suggestion, hasAvailableModel, store, setStreamingStates, setPendingFiles, setAgentStreamErrors, setPromptSuggestions, setInputContent, setLiveMessagesMap, permissionMode, messagesLoaded, setQueuedMessages, sendPlainTextAgentMessage])
+  }, [inputContent, createBaseAdditionalDirectories, sessionId, agentChannelId, agentModelId, currentWorkspaceId, workspaces, streaming, backgroundWaiting, suggestion, hasAvailableModel, store, consumeQuotedSelection, setStreamingStates, setPendingFiles, setAgentStreamErrors, setPromptSuggestions, setInputContent, setLiveMessagesMap, permissionMode, messagesLoaded, setQueuedMessages, setQuotedSelectionMap, sendPlainTextAgentMessage])
 
   /** 停止生成 */
   const handleStop = React.useCallback((): void => {
@@ -2108,6 +2123,14 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
     if (!message) return
 
     setQueuedMessages((prev) => removeQueuedMessage(prev, messageId))
+    const recalledQuotedSelection = message.quotedSelection
+    if (recalledQuotedSelection) {
+      setQuotedSelectionMap((prev) => {
+        const map = new Map(prev)
+        map.set(sessionId, recalledQuotedSelection)
+        return map
+      })
+    }
 
     const hasDraft = inputContent.trim().length > 0
     const nextDraft = hasDraft
@@ -2125,7 +2148,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
     } else {
       setInputHtmlContent('')
     }
-  }, [inputContent, inputHtmlContent, queuedMessages, setInputContent, setInputHtmlContent, setQueuedMessages])
+  }, [inputContent, inputHtmlContent, queuedMessages, sessionId, setInputContent, setInputHtmlContent, setQueuedMessages, setQuotedSelectionMap])
 
   const handleRemoveQueuedMessage = React.useCallback((messageId: string): void => {
     setQueuedMessages((prev) => removeQueuedMessage(prev, messageId))
@@ -2341,7 +2364,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
   return (
     <>
     <AgentSessionProvider sessionId={sessionId}>
-      <div className="flex flex-col h-full flex-1 min-w-0 max-w-[min(72rem,100%)] mx-auto">
+      <div className="flex h-full min-h-0 flex-1 min-w-0 max-w-[min(72rem,100%)] flex-col overflow-hidden mx-auto">
         {/* Agent Header */}
         <AgentHeader sessionId={sessionId} />
 
@@ -2421,6 +2444,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
                   <QuotedSelectionChip
                     text={currentQuotedSelection.text}
                     filePath={currentQuotedSelection.filePath}
+                    sourceLabel={currentQuotedSelection.sourceLabel}
                     onRemove={handleRemoveQuotedSelection}
                   />
                 )}

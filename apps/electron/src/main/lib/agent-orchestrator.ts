@@ -389,7 +389,12 @@ export class AgentOrchestrator {
       // 暴露打包进 App 的 proma CLI 路径，供 session-cleaner 等 skill / Agent 调用
       // （开发模式无编译二进制，getBundledCliPath 返回 undefined，此处不注入，
       //   skill 回退到源码运行 bun apps/cli/src/index.ts）。
-      ...(getBundledCliPath() ? { PROMA_CLI: getBundledCliPath() } : {}),
+      ...(getBundledCliPath()
+        ? {
+            PROMA_CLI: getBundledCliPath(),
+            PATH: `${dirname(getBundledCliPath()!)}${process.platform === 'win32' ? ';' : ':'}${cleanEnv.PATH ?? ''}`,
+          }
+        : {}),
       // 启用 Tasks 功能
       CLAUDE_CODE_ENABLE_TASKS: 'true',
       // 禁用 SDK 内置 Workflows，避免每轮注入 workflow 相关提示词。
@@ -424,6 +429,12 @@ export class AgentOrchestrator {
       sdkEnv.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'
     } else {
       sdkEnv.ANTHROPIC_API_KEY = apiKey
+    }
+
+    // 全局 API 超时保护：防止网络环境变化（代理断开/WiFi 切换等）导致 SDK 子进程的
+    // HTTP 请求无限挂起。MiniMax 有自己的超时值，不覆盖。
+    if (!sdkEnv.API_TIMEOUT_MS) {
+      sdkEnv.API_TIMEOUT_MS = '300000' // 5 分钟
     }
 
     // 显式控制 ANTHROPIC_BASE_URL：仅在用户配置了自定义 Base URL 时注入
