@@ -15,6 +15,7 @@ import type {
   ChannelCreateInput,
   ChannelUpdateInput,
   ChannelTestResult,
+  ChannelDirectTestInput,
   FetchModelsInput,
   FetchModelsResult,
   ConversationMeta,
@@ -210,7 +211,7 @@ export interface ElectronAPI {
   testChannel: (channelId: string) => Promise<ChannelTestResult>
 
   /** 直接测试连接（无需已保存渠道，传入明文凭证） */
-  testChannelDirect: (input: FetchModelsInput) => Promise<ChannelTestResult>
+  testChannelDirect: (input: ChannelDirectTestInput) => Promise<ChannelTestResult>
 
   /** 从供应商拉取可用模型列表（直接传入凭证，无需已保存渠道） */
   fetchModels: (input: FetchModelsInput) => Promise<FetchModelsResult>
@@ -712,7 +713,7 @@ export interface ElectronAPI {
   showInFolder: (filePath: string) => Promise<void>
 
   /** 在系统文件管理器中显示文件（无工作区限制，支持候选基础目录） */
-  showItemInFolder: (filePath: string, candidateBasePaths?: string[]) => Promise<void>
+  showItemInFolder: (filePath: string, candidateBasePaths?: string[]) => Promise<boolean>
 
   /** 解析文件路径并读取内容（供内联预览使用） */
   resolveAndReadFile: (filePath: string, access?: import('@proma/shared').FileAccessOptions) => Promise<{ resolvedPath: string; content: string } | null>
@@ -1151,7 +1152,7 @@ const electronAPI: ElectronAPI = {
     return ipcRenderer.invoke(CHANNEL_IPC_CHANNELS.TEST, channelId)
   },
 
-  testChannelDirect: (input: FetchModelsInput) => {
+  testChannelDirect: (input: ChannelDirectTestInput) => {
     return ipcRenderer.invoke(CHANNEL_IPC_CHANNELS.TEST_DIRECT, input)
   },
 
@@ -1844,7 +1845,7 @@ const electronAPI: ElectronAPI = {
   },
 
   /** 在系统文件管理器中显示文件（无工作区限制，支持候选基础目录） */
-  showItemInFolder: (filePath: string, candidateBasePaths?: string[]) => {
+  showItemInFolder: (filePath: string, candidateBasePaths?: string[]): Promise<boolean> => {
     return ipcRenderer.invoke(IPC_CHANNELS.SHOW_ITEM_IN_FOLDER, filePath, candidateBasePaths)
   },
 

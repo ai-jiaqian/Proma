@@ -29,6 +29,7 @@ import {
   THINKING_SIGNATURE_ERROR_TITLE,
   isPersistableSDKSystemMessage,
   normalizeMcpTransportType,
+  resolveAgentSdkModelId,
 } from '@proma/shared'
 import type { PromaPermissionMode, AskUserRequest, ExitPlanModeRequest, SDKSystemMessage } from '@proma/shared'
 import type { ClaudeAgentQueryOptions } from './adapters/claude-agent-adapter'
@@ -56,6 +57,7 @@ import { applyAgentModelRoutingToEnv, resolveAgentModelRouting } from './agent-m
 import { validateToolInput } from './agent-tool-input-validator'
 import { estimateTokenCount, WRITE_CONTENT_TOKEN_THRESHOLD } from './agent-tool-token-estimator'
 import { injectBuiltinMcpServers } from './builtin-mcp/registry'
+import { isVisibleRunMessage } from './agent-run-message-visibility'
 
 // ===== 类型定义 =====
 
@@ -80,6 +82,16 @@ export interface SessionCallbacks {
 
 function sdkPermissionModeForPromaMode(mode: PromaPermissionMode): PromaPermissionMode {
   return PROMA_PERMISSION_MODE_CONFIG[mode].sdkMode
+}
+
+const EMPTY_RESPONSE_RESULT_SUBTYPE = 'empty_response'
+
+function errorMessageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+function isMissingActiveQueueChannelError(error: unknown): boolean {
+  return errorMessageOf(error).includes('无活跃消息通道可注入队列消息')
 }
 
 /**
@@ -722,6 +734,51 @@ export class AgentOrchestrator {
     appendSDKMessages(sessionId, withTimestamps)
   }
 
+  private persistUserMessage(sessionId: string, userMessage: string, createdAt = Date.now()): void {
+    const userSDKMsg: SDKMessage = {
+      type: 'user',
+      message: {
+        content: [{ type: 'text', text: userMessage }],
+      },
+      parent_tool_use_id: null,
+      _createdAt: createdAt,
+    } as unknown as SDKMessage
+    appendSDKMessages(sessionId, [userSDKMsg])
+  }
+
+  private persistEmptyResponseError(
+    sessionId: string,
+    resultSubtype: string | undefined,
+    resultErrors: string[] | undefined,
+  ): string {
+    const detail = resultErrors?.find((error) => error.trim().length > 0)?.trim()
+    const subtype = resultSubtype ?? 'unknown'
+    const errorContent = detail
+      ? `Agent 本轮结束了，但没有返回任何可展示内容。错误详情：${detail}`
+      : resultSubtype === 'success'
+        ? 'Agent 本轮结束了，但没有返回任何可展示内容。你的消息已保留，可以直接重试或切换模型。'
+        : `Agent 本轮异常结束（${subtype}），但没有返回任何可展示内容。你的消息已保留，可以直接重试或切换模型。`
+    const errorSDKMsg: SDKMessage = {
+      type: 'assistant',
+      message: {
+        content: [{ type: 'text', text: errorContent }],
+      },
+      parent_tool_use_id: null,
+      error: { message: errorContent, errorType: EMPTY_RESPONSE_RESULT_SUBTYPE },
+      _createdAt: Date.now(),
+      _errorCode: 'unknown_error',
+      _errorTitle: '没有收到模型回复',
+      _errorCanRetry: true,
+      _errorActions: [
+        { key: 'r', label: '重试', action: 'retry' },
+        { key: 'm', label: '重新选择模型', action: 'select_model' },
+      ],
+    } as unknown as SDKMessage
+    appendSDKMessages(sessionId, [errorSDKMsg])
+    console.warn(`[Agent 编排] 本轮没有收到可展示内容: sessionId=${sessionId}, resultSubtype=${subtype}`)
+    return errorContent
+  }
+
   /**
    * 发送消息并流式推送事件
    *
@@ -731,12 +788,36 @@ export class AgentOrchestrator {
   async sendMessage(input: AgentSendInput, callbacks: SessionCallbacks): Promise<void> {
     const { sessionId, userMessage, channelId, modelId, workspaceId, additionalDirectories, customMcpServers, permissionModeOverride, mentionedSkills, mentionedMcpServers, mentionedSessionIds, automationContext } = input
     const stderrChunks: string[] = []
+    const streamStartedAt = input.startedAt ?? Date.now()
+    let userMessagePersisted = false
+
+    const persistInitialUserMessage = (): void => {
+      if (userMessagePersisted) return
+      this.persistUserMessage(sessionId, userMessage)
+      userMessagePersisted = true
+      callbacks.onRunStarted?.({ startedAt: streamStartedAt })
+    }
 
     // 0. 并发保护
     if (this.activeSessions.has(sessionId)) {
       console.warn(`[Agent 编排] 会话 ${sessionId} 正在处理中，拒绝新请求`)
+      try {
+        persistInitialUserMessage()
+      } catch (error) {
+        console.error('[Agent 编排] 持久化被拒绝的用户消息失败:', error)
+      }
       callbacks.onError('上一条消息仍在处理中，请稍候再试')
-      callbacks.onComplete([], { startedAt: input.startedAt })
+      callbacks.onComplete([], { startedAt: streamStartedAt })
+      return
+    }
+
+    try {
+      persistInitialUserMessage()
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      console.error('[Agent 编排] 持久化用户消息失败:', error)
+      callbacks.onError(`消息保存失败：${message}`)
+      callbacks.onComplete([], { startedAt: streamStartedAt })
       return
     }
 
@@ -766,7 +847,7 @@ export class AgentOrchestrator {
         console.error('[Agent 编排] 持久化 preflight error 失败:', e)
       }
       callbacks.onError(errorContent)
-      callbacks.onComplete([], { startedAt: input.startedAt })
+      callbacks.onComplete([], { startedAt: streamStartedAt })
     }
 
     // 1. Windows 平台：检查 Shell 环境可用性
@@ -829,9 +910,6 @@ export class AgentOrchestrator {
     // 防止 buildSdkEnv 等 await 期间并发调用绕过上方的检查，导致多条重复消息写入 JSONL
     // finally 块会通过 generation 匹配来安全清理，不影响正常流程
     const runGeneration = Date.now()
-    // 优先使用渲染进程传来的 startedAt（确保 STREAM_COMPLETE 竞态保护比较的是同一个值），
-    // 否则用本地 runGeneration 作为回退（headless 模式等无渲染进程场景）
-    const streamStartedAt = input.startedAt ?? runGeneration
     this.activeSessions.set(sessionId, runGeneration)
 
     const releaseActiveRun = (): void => {
@@ -914,19 +992,7 @@ export class AgentOrchestrator {
 
     console.log(`[Agent 编排] Resume 状态: sdkSessionId=${existingSdkSessionId || '无'}, proma sessionId=${sessionId}`)
 
-    // 5. 持久化用户消息（SDKMessage 格式）
-    const userSDKMsg: SDKMessage = {
-      type: 'user',
-      message: {
-        content: [{ type: 'text', text: userMessage }],
-      },
-      parent_tool_use_id: null,
-      _createdAt: Date.now(),
-    } as unknown as SDKMessage
-    appendSDKMessages(sessionId, [userSDKMsg])
-    callbacks.onRunStarted?.({ startedAt: streamStartedAt })
-
-    // 6. 状态初始化
+    // 5. 状态初始化
     const accumulatedMessages: SDKMessage[] = []
     let resolvedModel = modelId || DEFAULT_MODEL_ID
     let titleGenerationStarted = false
@@ -1323,14 +1389,16 @@ export class AgentOrchestrator {
 
       // 13. 构建 Adapter 查询选项
       // 检测用户选用的模型是否为 Claude 系列，决定 SubAgent 是否使用独立模型分层
-      const claudeAvailable = (modelId || DEFAULT_MODEL_ID).toLowerCase().includes('claude')
+      const selectedModelId = modelId || DEFAULT_MODEL_ID
+      const claudeAvailable = selectedModelId.toLowerCase().includes('claude')
       const maxTurns = appSettings.agentMaxTurns && appSettings.agentMaxTurns > 0
         ? appSettings.agentMaxTurns
         : undefined
       const queryOptions: ClaudeAgentQueryOptions = {
         sessionId,
         prompt: finalPrompt,
-        model: modelId || DEFAULT_MODEL_ID,
+        // SDK 需要 `[1m]` 显式选择扩展上下文；发送给提供商前会自动剥离后缀。
+        model: resolveAgentSdkModelId(selectedModelId),
         cwd: agentCwd,
         sdkCliPath: cliPath,
         env: sdkEnv,
@@ -1414,10 +1482,11 @@ export class AgentOrchestrator {
           }
         },
         onModelResolved: (model: string) => {
-          resolvedModel = model
+          // `[1m]` 是 SDK 内部上下文变体，不应泄漏到标题生成或用户可见的模型名。
+          resolvedModel = model.replace(/\[1m\]$/i, '')
           console.log(`[Agent 编排] SDK 确认模型: ${resolvedModel}`)
           // 通知渲染进程更新流式状态中的模型信息
-          this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'model_resolved', model } })
+          this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'model_resolved', model: resolvedModel } })
         },
         onContextWindow: (cw: number) => {
           console.log(`[Agent 编排] 缓存 contextWindow: ${cw}`)
@@ -1531,6 +1600,7 @@ export class AgentOrchestrator {
           // 后台任务等待态：result 走轻量完成后置 true，下一轮真正开始（收到 assistant/user/task 消息）时
           // 置回 false 并发 run_resumed，让 UI 从空闲态恢复运行态。
           let awaitingBackgroundWake = false
+          let visibleRunMessageCount = 0
 
           while (true) {
             if (!pendingNext) {
@@ -1560,6 +1630,9 @@ export class AgentOrchestrator {
 
             pendingNext = null
             const msg = iterResult.value
+            if (isVisibleRunMessage(msg)) {
+              visibleRunMessageCount += 1
+            }
 
             // 后台任务唤醒：轻量完成后处于等待态，收到新一轮的首条实质消息时
             // 发 run_resumed，让 UI 从"空闲可输入"恢复到"运行中"。
@@ -1862,6 +1935,16 @@ export class AgentOrchestrator {
           this.persistSDKMessages(sessionId, accumulatedMessages, Date.now() - queryStartedAt)
 
           try { updateAgentSessionMeta(sessionId, wasStoppedByUser ? { stoppedByUser: true } : {}) } catch { /* 忽略 */ }
+
+          if (!wasStoppedByUser && visibleRunMessageCount === 0) {
+            const errorContent = this.persistEmptyResponseError(sessionId, capturedResultSubtype, capturedResultErrors)
+            failRun(errorContent, getAgentSessionMessages(sessionId), {
+              startedAt: streamStartedAt,
+              resultSubtype: EMPTY_RESPONSE_RESULT_SUBTYPE,
+              resultErrors: [errorContent],
+            })
+            return
+          }
 
           // Plan 模式：Agent 完成规划后注入"接受计划"建议
           if (initialPermissionMode === 'plan' && planModeEntered && this.activeSessions.has(sessionId)) {
@@ -2358,6 +2441,12 @@ export class AgentOrchestrator {
       appendSDKMessages(sessionId, [persistMsg])
     } catch (error) {
       uuids.delete(uuid)
+      if (isMissingActiveQueueChannelError(error)) {
+        console.warn(`[Agent 编排] 队列注入失败且消息通道已失效，释放陈旧运行状态: sessionId=${sessionId}`)
+        this.activeSessions.delete(sessionId)
+        this.sessionPermissionModes.delete(sessionId)
+        this.queuedMessageUuids.delete(sessionId)
+      }
       throw error
     }
 

@@ -149,6 +149,12 @@ describe('normalizeAnthropicProviderUrl', () => {
     )
   })
 
+  test('ark-coding-plan 补全 /v1', () => {
+    expect(normalizeAnthropicProviderUrl('https://ark.cn-beijing.volces.com/api/plan', 'ark-coding-plan')).toBe(
+      'https://ark.cn-beijing.volces.com/api/plan/v1',
+    )
+  })
+
   test('原生 anthropic 纯域名补全 /v1', () => {
     expect(normalizeAnthropicProviderUrl('https://api.anthropic.com', 'anthropic')).toBe('https://api.anthropic.com/v1')
   })
@@ -231,6 +237,24 @@ describe('resolveAnthropicMessagesUrl', () => {
     )
   })
 
+  test('火山方舟 Coding Plan 协议根地址补全 /v1/messages', () => {
+    expect(resolveAnthropicMessagesUrl('https://ark.cn-beijing.volces.com/api/plan', 'ark-coding-plan')).toBe(
+      'https://ark.cn-beijing.volces.com/api/plan/v1/messages',
+    )
+  })
+
+  test('小米 Token Plan 从 OpenAI Base URL 纠正到 Anthropic messages 端点', () => {
+    expect(resolveAnthropicMessagesUrl('https://token-plan-cn.xiaomimimo.com/v1', 'xiaomi-token-plan')).toBe(
+      'https://token-plan-cn.xiaomimimo.com/anthropic/v1/messages',
+    )
+  })
+
+  test('小米 API 从 OpenAI Base URL 纠正到 Anthropic messages 端点', () => {
+    expect(resolveAnthropicMessagesUrl('https://api.xiaomimimo.com/v1', 'xiaomi')).toBe(
+      'https://api.xiaomimimo.com/anthropic/v1/messages',
+    )
+  })
+
   test('内置 anthropic 已是完整端点不重复追加', () => {
     expect(resolveAnthropicMessagesUrl('https://api.anthropic.com/v1/messages', 'anthropic')).toBe(
       'https://api.anthropic.com/v1/messages',
@@ -266,6 +290,12 @@ describe('resolveAnthropicModelsUrl', () => {
   test('内置协议根地址推导 /models', () => {
     expect(resolveAnthropicModelsUrl('https://api.minimaxi.com/anthropic', 'minimax')).toBe(
       'https://api.minimaxi.com/anthropic/v1/models',
+    )
+  })
+
+  test('火山方舟 Coding Plan 协议根地址推导 /v1/models', () => {
+    expect(resolveAnthropicModelsUrl('https://ark.cn-beijing.volces.com/api/plan', 'ark-coding-plan')).toBe(
+      'https://ark.cn-beijing.volces.com/api/plan/v1/models',
     )
   })
 })
