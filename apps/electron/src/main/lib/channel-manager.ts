@@ -18,11 +18,23 @@ import type {
   ChannelTestResult,
   ChannelDirectTestInput,
   ChannelModel,
+  ChannelPlanQuotaResult,
+  ChannelPlanQuotaWindow,
   FetchModelsInput,
   FetchModelsResult,
   ProviderType,
 } from '@proma/shared'
-import { PROVIDER_DEFAULT_URLS } from '@proma/shared'
+import {
+  extractZhipuCodingTeamApiToken,
+  parseZhipuTeamCredentials,
+  PROVIDER_DEFAULT_URLS,
+  parseCodexCredentials,
+  serializeCodexCredentials,
+  isCodexCredentialExpired,
+} from '@proma/shared'
+import { refreshCodexOAuth } from './codex-oauth-service'
+import { parseCodexPlanQuotaResponse } from './codex-plan-quota'
+import { listCodexModels } from './adapters/pi-model-registry'
 import { getFetchFn } from './proxy-fetch'
 import { getEffectiveProxyUrl } from './proxy-settings-service'
 import {
@@ -40,12 +52,15 @@ import pkg from '../../../package.json' with { type: 'json' }
 const CONFIG_VERSION = 2
 /** 连接测试 / 模型拉取的统一超时时间 */
 const CHANNEL_TEST_TIMEOUT_MS = 15_000
+// ChatGPT backend 首次经代理 / Cloudflare 建连可能超过普通模型探测的 15 秒。
+const CODEX_PLAN_QUOTA_TIMEOUT_MS = 30_000
 const ARK_CODING_PLAN_TEST_MODEL = 'doubao-seed-2.0-code'
 const DEEPSEEK_PRESET_MODELS: ChannelModel[] = [
   { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', enabled: true },
   { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', enabled: true },
 ]
 const KIMI_PRESET_MODELS: ChannelModel[] = [
+  { id: 'k3', name: 'Kimi K3', enabled: true },
   { id: 'kimi-k2.6', name: 'Kimi K2.6', enabled: true },
 ]
 const XIAOMI_PRESET_MODELS: ChannelModel[] = [
@@ -60,6 +75,7 @@ const ARK_CODING_PLAN_MODELS: ChannelModel[] = [
   { id: 'doubao-seed-2.0-pro', name: 'Doubao Seed 2.0 Pro', enabled: true },
   { id: 'doubao-seed-2.0-lite', name: 'Doubao Seed 2.0 Lite', enabled: true },
   { id: 'glm-5.2', name: 'GLM-5.2', enabled: true },
+  { id: 'k3', name: 'Kimi K3', enabled: true },
   { id: 'kimi-k2.7-code', name: 'Kimi K2.7 Code', enabled: true },
   { id: 'minimax-m3', name: 'MiniMax M3', enabled: true },
   { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', enabled: true },
@@ -70,8 +86,8 @@ const ARK_CODING_PLAN_MODELS: ChannelModel[] = [
  * 为连接测试 / 模型拉取请求统一附加超时信号。
  * 避免供应商不响应时请求无限挂起。
  */
-function withTimeout(init: RequestInit): RequestInit {
-  return { ...init, signal: AbortSignal.timeout(CHANNEL_TEST_TIMEOUT_MS) }
+function withTimeout(init: RequestInit, timeoutMs = CHANNEL_TEST_TIMEOUT_MS): RequestInit {
+  return { ...init, signal: AbortSignal.timeout(timeoutMs) }
 }
 
 function cloneModels(models: ChannelModel[]): ChannelModel[] {
@@ -394,6 +410,82 @@ export function decryptApiKey(channelId: string): string {
 }
 
 /**
+ * 进行中的 codex token 刷新（按 channelId 去重）。
+ *
+ * 多个 Agent 会话可能并发触发同一渠道的 token 刷新；若不去重会造成对
+ * OpenAI token 端点的重复请求，且后写覆盖先写。此 Map 保证同一渠道同一时刻
+ * 只有一次刷新在飞行，其余调用复用同一 Promise。对应 memory 里记过的
+ * 「OAuth 刷新需并发锁」经验。
+ */
+const inflightCodexRefresh = new Map<string, Promise<string>>()
+
+/**
+ * 解析渠道存储的 ChatGPT (Codex) OAuth 凭据，按需刷新并回写，返回可用的 access token。
+ *
+ * - 渠道 apiKey 字段存的是加密后的凭据 JSON（access/refresh/expires）。
+ * - access token 未过期：直接返回。
+ * - 已过期或即将过期：用 refresh token 换新，加密回写渠道，返回新的 access token。
+ *
+ * 仅用于 provider === 'openai-codex' 的渠道。刷新失败时抛错，交由上层映射为
+ * expired_oauth_token 并引导用户重新登录。
+ */
+export async function resolveCodexAccessToken(channelId: string): Promise<string> {
+  const config = readConfig()
+  const channel = config.channels.find((c) => c.id === channelId)
+  if (!channel) {
+    throw new Error(`渠道不存在: ${channelId}`)
+  }
+
+  const credentials = parseCodexCredentials(decryptKey(channel.apiKey))
+  if (!credentials) {
+    throw new Error('ChatGPT 登录凭据无效或缺失，请重新登录')
+  }
+
+  if (!isCodexCredentialExpired(credentials)) {
+    return credentials.access
+  }
+
+  // 过期：去重刷新。同一渠道并发调用复用同一个刷新 Promise。
+  const existing = inflightCodexRefresh.get(channelId)
+  if (existing) return existing
+
+  const refreshPromise = (async (): Promise<string> => {
+    try {
+      const refreshed = await refreshCodexOAuth(credentials.refresh)
+      // 回写加密凭据（保留刚拿到的 accountId，缺省沿用旧值）。
+      const merged = {
+        ...refreshed,
+        accountId: refreshed.accountId ?? credentials.accountId,
+      }
+      updateChannel(channelId, { apiKey: serializeCodexCredentials(merged) })
+      return refreshed.access
+    } finally {
+      inflightCodexRefresh.delete(channelId)
+    }
+  })()
+
+  inflightCodexRefresh.set(channelId, refreshPromise)
+  return refreshPromise
+}
+
+/**
+ * 解析渠道运行时实际使用的认证 token。
+ *
+ * 普通渠道直接解密 API Key；ChatGPT (Codex) OAuth 渠道的 apiKey 字段存储的是
+ * OAuth 凭据 JSON，运行时必须取出 access token 并按需刷新。
+ */
+export async function resolveChannelRuntimeApiKey(channelId: string): Promise<string> {
+  const channel = getChannelById(channelId)
+  if (!channel) {
+    throw new Error(`渠道不存在: ${channelId}`)
+  }
+
+  return channel.provider === 'openai-codex'
+    ? resolveCodexAccessToken(channelId)
+    : decryptApiKey(channelId)
+}
+
+/**
  * 测试渠道连接
  *
  * 向供应商的 API 发送简单请求，验证 API Key 和连接是否有效。
@@ -418,6 +510,7 @@ export async function testChannel(channelId: string): Promise<ChannelTestResult>
       case 'kimi-api':
       case 'kimi-coding':
       case 'zhipu-coding':
+      case 'zhipu-coding-team':
       case 'ark-coding-plan':
       case 'minimax':
       case 'xiaomi':
@@ -460,8 +553,12 @@ export async function testChannel(channelId: string): Promise<ChannelTestResult>
         if (provider === 'ark-coding-plan') {
           return await testArkCodingPlan(channel.baseUrl, apiKey, proxyUrl)
         }
+        if (provider === 'zhipu-coding-team') {
+          return await testZhipuCodingTeam(apiKey, channel.baseUrl, proxyUrl)
+        }
         return await testAnthropicCompatible(channel.baseUrl, apiKey, proxyUrl, provider)
       case 'openai':
+      case 'openai-responses':
       case 'zhipu':
       case 'doubao':
       case 'qwen':
@@ -482,7 +579,7 @@ export async function testChannel(channelId: string): Promise<ChannelTestResult>
  *
  * DeepSeek / Kimi 等内置供应商会按协议根路径补全端点。
  * Anthropic 兼容格式使用用户填写的完整请求地址。
- * Kimi Coding Plan 必须发送 Proma User-Agent，否则返回 403。
+ * Coding Plan 渠道必须发送 Proma User-Agent，否则返回 403。
  */
 async function testAnthropicCompatible(
   baseUrl: string,
@@ -496,8 +593,9 @@ async function testAnthropicCompatible(
   const headers: Record<string, string> = {
     'anthropic-version': '2023-06-01',
   }
-  if (provider === 'kimi-coding' || provider === 'zhipu-coding') {
-    headers.Authorization = `Bearer ${apiKey}`
+  if (provider === 'kimi-coding' || provider === 'zhipu-coding' || provider === 'zhipu-coding-team') {
+    const authToken = provider === 'zhipu-coding-team' ? extractZhipuCodingTeamApiToken(apiKey) : apiKey
+    headers.Authorization = `Bearer ${authToken}`
     headers['User-Agent'] = getPromaUserAgent(pkg.version)
   } else if (provider === 'xiaomi-token-plan') {
     headers.Authorization = `Bearer ${apiKey}`
@@ -594,7 +692,12 @@ async function testXiaomiMessages(
   const headers: Record<string, string> = {
     'anthropic-version': '2023-06-01',
     'content-type': 'application/json',
-    'api-key': apiKey,
+  }
+  if (provider === 'xiaomi-token-plan') {
+    headers.Authorization = `Bearer ${apiKey}`
+    headers['User-Agent'] = getPromaUserAgent(pkg.version)
+  } else {
+    headers['api-key'] = apiKey
   }
 
   const response = await fetchFn(url, withTimeout({
@@ -675,6 +778,653 @@ async function testGoogle(baseUrl: string, apiKey: string, proxyUrl?: string): P
   return normalizeHttpResponse(response)
 }
 
+function clampPercent(value: number): number {
+  if (!Number.isFinite(value)) return 0
+  return Math.max(0, Math.min(100, Math.round(value)))
+}
+
+function normalizePlanQuotaTimestamp(value?: number | string): number | undefined {
+  if (value == null || value === '') return undefined
+  const timestamp = typeof value === 'number' ? value : new Date(value).getTime()
+  if (!Number.isFinite(timestamp)) return undefined
+  return timestamp > 0 && timestamp < 10_000_000_000 ? timestamp * 1000 : timestamp
+}
+
+function planQuotaResetAt(value?: number | string): Pick<ChannelPlanQuotaWindow, 'resetAt'> {
+  const resetAt = normalizePlanQuotaTimestamp(value)
+  return resetAt ? { resetAt } : {}
+}
+
+function createUnsupportedPlanQuota(provider: ProviderType, message: string): ChannelPlanQuotaResult {
+  return {
+    supported: false,
+    provider,
+    windows: [],
+    updatedAt: Date.now(),
+    message,
+  }
+}
+
+/**
+ * 查询 ChatGPT (Codex) OAuth 订阅的滚动额度。
+ *
+ * `wham/usage` 是 Codex CLI 使用的 ChatGPT backend 接口；除 bearer token 外，
+ * 团队/企业账号还需要 `ChatGPT-Account-Id` 以定位当前订阅。
+ */
+async function queryCodexPlanQuota(
+  channelId: string,
+  serializedCredentials: string,
+  proxyUrl?: string,
+): Promise<ChannelPlanQuotaResult> {
+  const credentials = parseCodexCredentials(serializedCredentials)
+  if (!credentials) {
+    return createUnsupportedPlanQuota('openai-codex', 'ChatGPT 登录凭据无效或缺失，请重新登录')
+  }
+
+  const accessToken = await resolveCodexAccessToken(channelId)
+  // token 刷新时会把新凭据回写到 Channel，重新读取以取得可能更新的 accountId。
+  const activeCredentials = parseCodexCredentials(decryptApiKey(channelId)) ?? credentials
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${accessToken}`,
+    Accept: 'application/json',
+    'User-Agent': getPromaUserAgent(pkg.version),
+  }
+  if (activeCredentials.accountId) {
+    headers['ChatGPT-Account-Id'] = activeCredentials.accountId
+  }
+
+  try {
+    const response = await getFetchFn(proxyUrl)(
+      'https://chatgpt.com/backend-api/wham/usage',
+      withTimeout({ method: 'GET', headers }, CODEX_PLAN_QUOTA_TIMEOUT_MS),
+    )
+    const responseText = await response.text()
+    if (!response.ok) {
+      return createUnsupportedPlanQuota('openai-codex', `ChatGPT Codex 额度查询失败: HTTP ${response.status}`)
+    }
+
+    try {
+      return parseCodexPlanQuotaResponse(JSON.parse(responseText))
+    } catch {
+      return createUnsupportedPlanQuota('openai-codex', 'ChatGPT Codex 额度响应格式错误')
+    }
+  } catch (error) {
+    if (error instanceof Error && error.name === 'TimeoutError') {
+      return createUnsupportedPlanQuota('openai-codex', 'ChatGPT Codex 额度查询超时，请检查网络或代理后重试')
+    }
+    throw error
+  }
+}
+
+async function queryKimiPlanQuota(apiKey: string, proxyUrl?: string): Promise<ChannelPlanQuotaResult> {
+  const fetchFn = getFetchFn(proxyUrl)
+  const response = await fetchFn('https://api.kimi.com/coding/v1/usages', withTimeout({
+    method: 'GET',
+    headers: {
+      'Content-Type': 'application/json',
+      'User-Agent': getPromaUserAgent(pkg.version),
+      Authorization: `Bearer ${apiKey}`,
+    },
+  }))
+  const responseText = await response.text()
+  if (!response.ok) {
+    return createUnsupportedPlanQuota('kimi-coding', `Kimi 额度查询失败: HTTP ${response.status}`)
+  }
+
+  let data: {
+    usage?: { remaining?: string | number; used?: string | number; resetTime?: string }
+    limits?: Array<{
+      window: { duration: number; timeUnit: string }
+      detail: { remaining?: string | number; used?: string | number; resetTime?: string }
+    }>
+    code?: string
+  }
+  try {
+    data = JSON.parse(responseText)
+  } catch {
+    return createUnsupportedPlanQuota('kimi-coding', 'Kimi 额度响应格式错误')
+  }
+
+  if (data.code) {
+    return createUnsupportedPlanQuota('kimi-coding', `Kimi 额度查询失败: ${data.code}`)
+  }
+  if (!data.usage) {
+    return createUnsupportedPlanQuota('kimi-coding', 'Kimi 未返回订阅额度数据')
+  }
+
+  const windows: ChannelPlanQuotaWindow[] = []
+  const summaryRemaining = clampPercent(Number(data.usage.remaining ?? 0))
+  const summaryUsed = clampPercent(Number(data.usage.used ?? (100 - summaryRemaining)))
+  windows.push({
+    type: 'weekly',
+    label: '每周额度',
+    remainingPercent: summaryRemaining,
+    usedPercent: summaryUsed,
+    ...planQuotaResetAt(data.usage.resetTime),
+  })
+
+  for (const item of data.limits ?? []) {
+    const remaining = clampPercent(Number(item.detail.remaining ?? 0))
+    const used = clampPercent(Number(item.detail.used ?? (100 - remaining)))
+    const duration = item.window.duration
+    const isFiveHourWindow = (duration === 5 && item.window.timeUnit === 'TIME_UNIT_HOUR')
+      || (duration === 300 && item.window.timeUnit === 'TIME_UNIT_MINUTE')
+    const unitLabel = item.window.timeUnit === 'TIME_UNIT_HOUR'
+      ? '小时'
+      : item.window.timeUnit === 'TIME_UNIT_MINUTE'
+        ? '分钟'
+        : item.window.timeUnit === 'TIME_UNIT_DAY'
+          ? '天'
+          : item.window.timeUnit === 'TIME_UNIT_MONTH'
+            ? '月'
+            : item.window.timeUnit
+    windows.push({
+      type: isFiveHourWindow ? '5h' : 'custom',
+      label: isFiveHourWindow ? '每 5 小时' : `${duration} ${unitLabel}`,
+      remainingPercent: remaining,
+      usedPercent: used,
+      ...planQuotaResetAt(item.detail.resetTime),
+    })
+  }
+
+  return {
+    supported: true,
+    provider: 'kimi-coding',
+    planName: 'Kimi For Coding',
+    windows,
+    updatedAt: Date.now(),
+  }
+}
+
+async function queryMiniMaxPlanQuota(apiKey: string, baseUrl: string, proxyUrl?: string): Promise<ChannelPlanQuotaResult> {
+  const fetchFn = getFetchFn(proxyUrl)
+  let requestUrl = 'https://www.minimaxi.com/v1/token_plan/remains'
+  try {
+    if (new URL(baseUrl).hostname.includes('minimax.io')) {
+      requestUrl = requestUrl.replace('.minimaxi.com', '.minimax.io')
+    }
+  } catch {
+    // 保持默认查询地址
+  }
+
+  const response = await fetchFn(requestUrl, withTimeout({
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      'User-Agent': getPromaUserAgent(pkg.version),
+    },
+  }))
+  const responseText = await response.text()
+  if (!response.ok) {
+    return createUnsupportedPlanQuota('minimax', `MiniMax Token Plan 额度查询失败: HTTP ${response.status}`)
+  }
+
+  let data: {
+    model_remains?: Array<{
+      model_name: string
+      current_interval_remaining_percent?: number
+      current_weekly_total_count?: number
+      current_weekly_remaining_percent?: number
+      end_time?: number
+      weekly_end_time?: number
+    }>
+    base_resp?: { status_code: number; status_msg: string }
+  }
+  try {
+    data = JSON.parse(responseText)
+  } catch {
+    return createUnsupportedPlanQuota('minimax', 'MiniMax Token Plan 额度响应格式错误')
+  }
+
+  if (data.base_resp && data.base_resp.status_code !== 0) {
+    return createUnsupportedPlanQuota('minimax', data.base_resp.status_msg || 'MiniMax Token Plan 额度查询失败')
+  }
+
+  const general = (data.model_remains ?? []).filter((item) => item.model_name === 'general')
+  if (general.length === 0) {
+    return createUnsupportedPlanQuota('minimax', 'MiniMax Token Plan 未返回通用额度数据')
+  }
+
+  const windows: ChannelPlanQuotaWindow[] = []
+  for (const item of general) {
+    const intervalRemaining = clampPercent(item.current_interval_remaining_percent ?? 100)
+    windows.push({
+      type: '5h',
+      label: '每 5 小时',
+      remainingPercent: intervalRemaining,
+      usedPercent: clampPercent(100 - intervalRemaining),
+      ...planQuotaResetAt(item.end_time),
+    })
+    if (item.current_weekly_total_count) {
+      const weeklyRemaining = clampPercent(item.current_weekly_remaining_percent ?? 100)
+      windows.push({
+        type: 'weekly',
+        label: '每周额度',
+        remainingPercent: weeklyRemaining,
+        usedPercent: clampPercent(100 - weeklyRemaining),
+        ...planQuotaResetAt(item.weekly_end_time),
+      })
+    }
+  }
+
+  return {
+    supported: true,
+    provider: 'minimax',
+    planName: 'MiniMax Token Plan',
+    windows,
+    updatedAt: Date.now(),
+  }
+}
+
+function formatDeepSeekBalanceAmount(currency: string | undefined, value: string | number | undefined): string {
+  const raw = value == null ? 0 : Number(value)
+  const amount = Number.isFinite(raw) ? raw : 0
+  const normalizedCurrency = (currency ?? '').trim().toUpperCase()
+  if (normalizedCurrency === 'CNY' || normalizedCurrency === 'RMB') {
+    return `¥${amount.toFixed(2)}`
+  }
+  if (normalizedCurrency === 'USD') {
+    return `$${amount.toFixed(2)}`
+  }
+  if (normalizedCurrency) {
+    return `${normalizedCurrency} ${amount.toFixed(2)}`
+  }
+  return amount.toFixed(2)
+}
+
+async function queryDeepSeekBalance(apiKey: string, baseUrl: string, proxyUrl?: string): Promise<ChannelPlanQuotaResult> {
+  const fetchFn = getFetchFn(proxyUrl)
+  let requestUrl = 'https://api.deepseek.com/user/balance'
+  try {
+    requestUrl = `${new URL(baseUrl).origin}/user/balance`
+  } catch {
+    // 保持官方默认查询地址
+  }
+
+  const response = await fetchFn(requestUrl, withTimeout({
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      Accept: 'application/json',
+      'User-Agent': getPromaUserAgent(pkg.version),
+    },
+  }))
+  const responseText = await response.text()
+  if (!response.ok) {
+    return createUnsupportedPlanQuota('deepseek', `DeepSeek 余额查询失败: HTTP ${response.status}`)
+  }
+
+  let data: {
+    is_available?: boolean
+    balance_infos?: Array<{
+      currency?: string
+      total_balance?: string
+      granted_balance?: string
+      topped_up_balance?: string
+    }>
+    error?: { message?: string }
+  }
+  try {
+    data = JSON.parse(responseText)
+  } catch {
+    return createUnsupportedPlanQuota('deepseek', 'DeepSeek 余额响应格式错误')
+  }
+
+  if (data.error?.message) {
+    return createUnsupportedPlanQuota('deepseek', data.error.message)
+  }
+
+  const balances = data.balance_infos ?? []
+  if (balances.length === 0) {
+    return createUnsupportedPlanQuota('deepseek', 'DeepSeek 未返回余额数据')
+  }
+
+  const preferred = balances.find((item) => (item.currency ?? '').toUpperCase() === 'CNY')
+    ?? balances.find((item) => Number(item.total_balance ?? 0) > 0)
+    ?? balances[0]!
+  const amountLabel = formatDeepSeekBalanceAmount(preferred.currency, preferred.total_balance)
+  const granted = Number(preferred.granted_balance ?? 0)
+  const toppedUp = Number(preferred.topped_up_balance ?? 0)
+  const total = Number(preferred.total_balance ?? 0)
+  const denominator = granted + toppedUp
+  const remainingPercent = denominator > 0
+    ? clampPercent((total / denominator) * 100)
+    : data.is_available === false
+      ? 0
+      : 100
+
+  return {
+    supported: true,
+    provider: 'deepseek',
+    planName: 'DeepSeek 账户余额',
+    windows: [{
+      type: 'custom',
+      label: '账户余额',
+      remainingPercent,
+      usedPercent: clampPercent(100 - remainingPercent),
+      remainingLabel: amountLabel,
+      showProgress: denominator > 0,
+    }],
+    updatedAt: Date.now(),
+    message: data.is_available === false ? 'DeepSeek 账户余额不可用' : undefined,
+  }
+}
+
+interface ZhipuQuotaLimitItem {
+  type: 'TIME_LIMIT' | 'TOKENS_LIMIT'
+  unit?: number
+  number?: number
+  percentage?: number
+  remaining?: number
+  usage?: number
+  currentValue?: number
+  nextResetTime?: number
+  usageDetails?: Array<{
+    modelCode: string
+    usage: number
+  }>
+}
+
+interface ZhipuQuotaResponse {
+  code?: number
+  msg?: string
+  success?: boolean
+  data?: {
+    limits?: ZhipuQuotaLimitItem[]
+    level?: string
+  }
+}
+
+function createZhipuQuotaUrl(baseUrl: string, query?: Record<string, string>): string {
+  let requestUrl = 'https://bigmodel.cn/api/monitor/usage/quota/limit'
+  try {
+    const hostname = new URL(baseUrl).hostname
+    if (hostname === 'api.z.ai') {
+      requestUrl = 'https://api.z.ai/api/monitor/usage/quota/limit'
+    } else if (hostname === 'open.bigmodel.cn') {
+      requestUrl = 'https://open.bigmodel.cn/api/monitor/usage/quota/limit'
+    }
+  } catch {
+    // 保持默认查询地址
+  }
+
+  const url = new URL(requestUrl)
+  for (const [key, value] of Object.entries(query ?? {})) {
+    url.searchParams.set(key, value)
+  }
+  return url.toString()
+}
+
+function createZhipuInternationalQuotaUrl(query?: Record<string, string>): string {
+  const url = new URL('https://api.z.ai/api/monitor/usage/quota/limit')
+  for (const [key, value] of Object.entries(query ?? {})) {
+    url.searchParams.set(key, value)
+  }
+  return url.toString()
+}
+
+function createZhipuTeamQuotaUrl(): string {
+  const url = new URL('https://bigmodel.cn/api/monitor/usage/quota/limit')
+  url.searchParams.set('type', '2')
+  return url.toString()
+}
+
+async function fetchZhipuQuota(
+  apiKey: string,
+  requestUrl: string,
+  proxyUrl?: string,
+): Promise<ZhipuQuotaResponse | { error: string }> {
+  const fetchFn = getFetchFn(proxyUrl)
+  const response = await fetchFn(requestUrl, withTimeout({
+    method: 'GET',
+    headers: {
+      Authorization: apiKey,
+      'Content-Type': 'application/json',
+      'User-Agent': getPromaUserAgent(pkg.version),
+    },
+  }))
+  const responseText = await response.text()
+  if (!response.ok) {
+    return { error: `智谱 Coding Plan 额度查询失败: HTTP ${response.status}` }
+  }
+
+  try {
+    return JSON.parse(responseText) as ZhipuQuotaResponse
+  } catch {
+    return { error: '智谱 Coding Plan 额度响应格式错误' }
+  }
+}
+
+async function fetchZhipuTeamQuota(
+  credentials: import('@proma/shared').ZhipuTeamCredentials,
+  proxyUrl?: string,
+): Promise<ZhipuQuotaResponse | { error: string }> {
+  const fetchFn = getFetchFn(proxyUrl)
+  const headers: Record<string, string> = {
+    Authorization: credentials.apiKey,
+    Accept: 'application/json, text/plain, */*',
+    'Content-Type': 'application/json',
+    'set-language': 'zh',
+    Referer: 'https://bigmodel.cn/coding-plan/team/usage-stats',
+    'User-Agent': getPromaUserAgent(pkg.version),
+  }
+  if (credentials.organization) {
+    headers['bigmodel-organization'] = credentials.organization
+  }
+  if (credentials.project) {
+    headers['bigmodel-project'] = credentials.project
+  }
+
+  const response = await fetchFn(createZhipuTeamQuotaUrl(), withTimeout({
+    method: 'GET',
+    headers,
+  }))
+  const responseText = await response.text()
+  if (!response.ok) {
+    return { error: `智谱 Coding Plan 团队版额度查询失败: HTTP ${response.status}` }
+  }
+
+  try {
+    return JSON.parse(responseText) as ZhipuQuotaResponse
+  } catch {
+    return { error: '智谱 Coding Plan 团队版额度响应格式错误' }
+  }
+}
+
+async function testZhipuCodingTeam(
+  apiKey: string,
+  baseUrl: string,
+  proxyUrl?: string,
+): Promise<ChannelTestResult> {
+  const teamCredentials = parseZhipuTeamCredentials(apiKey)
+  if (teamCredentials) {
+    const response = await fetchZhipuTeamQuota(teamCredentials, proxyUrl)
+    if ('error' in response) {
+      return { success: false, message: response.error }
+    }
+    const quotaResult = parseZhipuQuotaData(response, 'GLM Coding Plan 团队版', 'zhipu-coding-team')
+    if (!quotaResult.supported || quotaResult.windows.length === 0) {
+      return {
+        success: false,
+        message: quotaResult.message || '智谱 Coding Plan 团队版未返回窗口额度数据',
+      }
+    }
+    return { success: true, message: '智谱 Coding Plan 团队版额度查询成功' }
+  }
+
+  const authToken = extractZhipuCodingTeamApiToken(apiKey)
+  if (!authToken) {
+    return {
+      success: false,
+      message: '请填写 API Token；组织 ID 和项目 ID 可选',
+    }
+  }
+
+  return await testAnthropicCompatible(baseUrl, apiKey, proxyUrl, 'zhipu-coding-team')
+}
+
+function parseZhipuQuotaData(
+  data: ZhipuQuotaResponse,
+  planName: string,
+  provider: ProviderType = 'zhipu-coding',
+): ChannelPlanQuotaResult {
+  if (!data.success || data.code !== 200) {
+    return createUnsupportedPlanQuota(provider, data.msg || '智谱 Coding Plan 额度查询失败')
+  }
+
+  const limits = data.data?.limits ?? []
+  const windows: ChannelPlanQuotaWindow[] = []
+  const tokenLimits = limits
+    .filter((item) => item.type === 'TOKENS_LIMIT')
+    .map((item, index) => ({ item, index }))
+    .sort((left, right) => {
+      const leftReset = normalizePlanQuotaTimestamp(left.item.nextResetTime)
+      const rightReset = normalizePlanQuotaTimestamp(right.item.nextResetTime)
+      if (leftReset && rightReset && leftReset !== rightReset) {
+        return leftReset - rightReset
+      }
+      return left.index - right.index
+    })
+
+  for (const { item, index } of tokenLimits) {
+    const used = clampPercent(item.percentage ?? 0)
+    const type = item.unit === 3
+      ? '5h'
+      : item.unit === 6
+        ? 'weekly'
+        : item.unit == null && index === 0
+          ? '5h'
+          : item.unit == null && index === 1
+            ? 'weekly'
+            : undefined
+    if (!type) continue
+    windows.push({
+      type,
+      label: type === '5h' ? '每 5 小时' : '每周额度',
+      remainingPercent: clampPercent(100 - used),
+      usedPercent: used,
+      ...planQuotaResetAt(item.nextResetTime),
+    })
+  }
+
+  const timeLimit = limits.find((item) => item.type === 'TIME_LIMIT')
+  if (timeLimit) {
+    const remainingCount = Number(timeLimit.remaining ?? 0)
+    const totalCount = Number(timeLimit.usage ?? 0)
+    const usedCount = Number(timeLimit.currentValue ?? (totalCount > 0 ? totalCount - remainingCount : 0))
+    const total = totalCount > 0 ? totalCount : remainingCount + usedCount
+    const remainingPercent = total > 0 ? (remainingCount / total) * 100 : 0
+    windows.push({
+      type: 'custom',
+      label: 'MCP 每月',
+      remainingPercent: clampPercent(remainingPercent),
+      usedPercent: clampPercent(100 - remainingPercent),
+    })
+  }
+
+  if (windows.length === 0) {
+    return createUnsupportedPlanQuota(provider, '智谱 Coding Plan 未返回窗口额度数据')
+  }
+
+  return {
+    supported: true,
+    provider,
+    planName,
+    windows,
+    updatedAt: Date.now(),
+  }
+}
+
+async function queryZhipuPlanQuota(
+  apiKey: string,
+  baseUrl: string,
+  proxyUrl?: string,
+  provider: ProviderType = 'zhipu-coding',
+): Promise<ChannelPlanQuotaResult> {
+  if (provider === 'zhipu-coding-team') {
+    const teamCredentials = parseZhipuTeamCredentials(apiKey)
+    if (!teamCredentials) {
+      return createUnsupportedPlanQuota(
+        'zhipu-coding-team',
+        '请填写 API Token；组织 ID 和项目 ID 可选',
+      )
+    }
+    const teamResponse = await fetchZhipuTeamQuota(teamCredentials, proxyUrl)
+    if ('error' in teamResponse) {
+      return createUnsupportedPlanQuota('zhipu-coding-team', teamResponse.error)
+    }
+    return parseZhipuQuotaData(teamResponse, 'GLM Coding Plan 团队版', 'zhipu-coding-team')
+  }
+
+  const requestUrls = Array.from(new Set([
+    createZhipuQuotaUrl(baseUrl),
+    createZhipuQuotaUrl(baseUrl, { type: '1' }),
+    createZhipuInternationalQuotaUrl(),
+    createZhipuInternationalQuotaUrl({ type: '1' }),
+  ]))
+
+  let lastUnsupported: ChannelPlanQuotaResult | undefined
+  for (const requestUrl of requestUrls) {
+    const response = await fetchZhipuQuota(apiKey, requestUrl, proxyUrl)
+    if ('error' in response) {
+      lastUnsupported = createUnsupportedPlanQuota(provider, response.error)
+      continue
+    }
+
+    const result = parseZhipuQuotaData(response, 'GLM Coding Plan', provider)
+    if (result.supported && result.windows.length > 0) {
+      return result
+    }
+    lastUnsupported = result
+  }
+
+  return lastUnsupported ?? createUnsupportedPlanQuota(provider, '智谱 Coding Plan 未返回窗口额度数据')
+}
+
+export async function getChannelPlanQuota(channelId: string): Promise<ChannelPlanQuotaResult> {
+  const channel = getChannelById(channelId)
+  if (!channel) {
+    return createUnsupportedPlanQuota('custom', '渠道不存在')
+  }
+
+  let provider: ProviderType
+  try {
+    provider = inferProviderFromBaseUrl(channel.provider, channel.baseUrl)
+  } catch {
+    provider = channel.provider
+  }
+  const proxyUrl = await getEffectiveProxyUrl()
+  let apiKey: string
+  try {
+    apiKey = decryptKey(channel.apiKey)
+  } catch {
+    return createUnsupportedPlanQuota(provider, '无法读取渠道 API Key')
+  }
+
+  try {
+    if (provider === 'openai-codex') {
+      return await queryCodexPlanQuota(channelId, apiKey, proxyUrl)
+    }
+    if (provider === 'deepseek') {
+      return await queryDeepSeekBalance(apiKey, channel.baseUrl, proxyUrl)
+    }
+    if (provider === 'kimi-coding' || channel.baseUrl.includes('api.kimi.com/coding')) {
+      return await queryKimiPlanQuota(apiKey, proxyUrl)
+    }
+    if (provider === 'minimax') {
+      return await queryMiniMaxPlanQuota(apiKey, channel.baseUrl, proxyUrl)
+    }
+    if (provider === 'zhipu' || provider === 'zhipu-coding' || provider === 'zhipu-coding-team') {
+      return await queryZhipuPlanQuota(apiKey, channel.baseUrl, proxyUrl, provider)
+    }
+    return createUnsupportedPlanQuota(provider, '当前渠道不支持订阅 Plan 额度查询')
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '订阅额度查询失败'
+    return createUnsupportedPlanQuota(provider, message)
+  }
+}
+
 // ===== 直接测试连接 =====
 
 /**
@@ -695,6 +1445,7 @@ export async function testChannelDirect(input: ChannelDirectTestInput): Promise<
       case 'kimi-api':
       case 'kimi-coding':
       case 'zhipu-coding':
+      case 'zhipu-coding-team':
       case 'ark-coding-plan':
       case 'minimax':
       case 'xiaomi':
@@ -737,8 +1488,12 @@ export async function testChannelDirect(input: ChannelDirectTestInput): Promise<
         if (provider === 'ark-coding-plan') {
           return await testArkCodingPlan(input.baseUrl, input.apiKey, proxyUrl)
         }
+        if (provider === 'zhipu-coding-team') {
+          return await testZhipuCodingTeam(input.apiKey, input.baseUrl, proxyUrl)
+        }
         return await testAnthropicCompatible(input.baseUrl, input.apiKey, proxyUrl, provider)
       case 'openai':
+      case 'openai-responses':
       case 'zhipu':
       case 'doubao':
       case 'qwen':
@@ -774,11 +1529,22 @@ export async function fetchModels(input: FetchModelsInput): Promise<FetchModelsR
       case 'kimi-api':
       case 'kimi-coding':
       case 'zhipu-coding':
+      case 'zhipu-coding-team':
       case 'ark-coding-plan':
       case 'minimax':
       case 'xiaomi':
       case 'xiaomi-token-plan':
       case 'qwen-anthropic':
+      case 'openai-codex':
+        if (provider === 'openai-codex') {
+          // ChatGPT (Codex) 走 Pi SDK 内置模型目录，不依赖 baseUrl/apiKey。
+          const codexModels = await listCodexModels()
+          return {
+            success: true,
+            message: `已加载 ${codexModels.length} 个 ChatGPT (Codex) 模型`,
+            models: codexModels.map((m) => ({ id: m.id, name: m.name, enabled: true, source: 'fetched' as const })),
+          }
+        }
         if (provider === 'deepseek') {
           return await fetchDeepSeekModels(input.baseUrl, input.apiKey, proxyUrl)
         }
@@ -800,6 +1566,7 @@ export async function fetchModels(input: FetchModelsInput): Promise<FetchModelsR
         }
         return await fetchAnthropicCompatibleModels(input.baseUrl, input.apiKey, proxyUrl, provider)
       case 'openai':
+      case 'openai-responses':
       case 'zhipu':
       case 'doubao':
       case 'qwen':
@@ -919,7 +1686,7 @@ interface AnthropicModelItem {
  *
  * DeepSeek / Kimi 等内置供应商会按协议根路径补全模型端点。
  * Anthropic 兼容格式使用完整请求地址，不再推导模型端点。
- * Kimi Coding Plan 必须发送 Proma User-Agent。
+ * Coding Plan 渠道必须发送 Proma User-Agent。
  * 文档: https://docs.anthropic.com/en/api/models-list
  */
 async function fetchAnthropicCompatibleModels(
@@ -934,8 +1701,9 @@ async function fetchAnthropicCompatibleModels(
   const headers: Record<string, string> = {
     'anthropic-version': '2023-06-01',
   }
-  if (provider === 'kimi-coding' || provider === 'zhipu-coding') {
-    headers.Authorization = `Bearer ${apiKey}`
+  if (provider === 'kimi-coding' || provider === 'zhipu-coding' || provider === 'zhipu-coding-team') {
+    const authToken = provider === 'zhipu-coding-team' ? extractZhipuCodingTeamApiToken(apiKey) : apiKey
+    headers.Authorization = `Bearer ${authToken}`
     headers['User-Agent'] = getPromaUserAgent(pkg.version)
   } else if (provider === 'xiaomi-token-plan') {
     headers.Authorization = `Bearer ${apiKey}`

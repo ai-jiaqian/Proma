@@ -7,6 +7,7 @@
  */
 
 import { readFileSync, writeFileSync, existsSync, readdirSync, cpSync, mkdirSync, statSync, openSync, readSync, closeSync, realpathSync } from 'node:fs'
+import type { Dirent } from 'node:fs'
 import { rmSyncWithRetry, renameWithRetry } from './fs-retry'
 import { writeJsonFileAtomic, readJsonFileSafe } from './safe-file'
 import { randomUUID } from 'node:crypto'
@@ -34,6 +35,30 @@ interface AgentWorkspacesIndex {
 }
 
 const INDEX_VERSION = 2
+const WINDOWS_RESERVED_SLUGS = new Set([
+  'con',
+  'prn',
+  'aux',
+  'nul',
+  'com1',
+  'com2',
+  'com3',
+  'com4',
+  'com5',
+  'com6',
+  'com7',
+  'com8',
+  'com9',
+  'lpt1',
+  'lpt2',
+  'lpt3',
+  'lpt4',
+  'lpt5',
+  'lpt6',
+  'lpt7',
+  'lpt8',
+  'lpt9',
+])
 
 /** 读取工作区索引文件，自动执行版本迁移 */
 function readIndex(): AgentWorkspacesIndex {
@@ -108,6 +133,9 @@ function slugify(name: string, existingSlugs: Set<string>): string {
   if (!base) {
     base = `workspace-${Date.now()}`
   }
+  if (WINDOWS_RESERVED_SLUGS.has(base)) {
+    base = `workspace-${base}`
+  }
 
   let slug = base
   let counter = 1
@@ -156,7 +184,7 @@ export function getAgentWorkspace(id: string): AgentWorkspace | undefined {
 }
 
 /** 将 ~/.proma/default-skills/ 的内容逐个复制到工作区 skills/ 目录 */
-function copyDefaultSkills(workspaceSlug: string): void {
+function copyDefaultSkills(workspaceSlug: string, options: { throwOnError?: boolean } = {}): void {
   const defaultDir = getDefaultSkillsDir()
   const targetDir = getWorkspaceSkillsDir(workspaceSlug)
 
@@ -171,11 +199,17 @@ function copyDefaultSkills(workspaceSlug: string): void {
       if (!entry.isDirectory()) continue
       const source = join(defaultDir, entry.name)
       const target = join(targetDir, entry.name)
-      cpSync(source, target, { recursive: true })
+      try {
+        cpSync(source, target, { recursive: true, filter: skillCopyFilter })
+      } catch (err) {
+        console.warn(`[Agent 工作区] 复制默认 Skill 失败 (${workspaceSlug}/${entry.name}):`, err)
+        if (options.throwOnError) throw err
+      }
     }
     console.log(`[Agent 工作区] 已复制默认 Skills 到: ${workspaceSlug}`)
   } catch (err) {
     console.error(`[Agent 工作区] 复制默认 Skills 失败 (${workspaceSlug}):`, err)
+    if (options.throwOnError) throw err
   }
 }
 
@@ -199,10 +233,25 @@ export function createAgentWorkspace(name: string): AgentWorkspace {
     updatedAt: now,
   }
 
-  getAgentWorkspacePath(slug)
-  ensurePluginManifest(slug, name)
-  copyDefaultSkills(slug)
-  seedWorkspaceProjectFile(slug)
+  try {
+    getAgentWorkspacePath(slug)
+    ensurePluginManifest(slug, name)
+    copyDefaultSkills(slug, { throwOnError: true })
+    seedWorkspaceProjectFile(slug)
+  } catch (error) {
+    const workspacesRoot = resolve(getAgentWorkspacesDir())
+    const workspaceDir = resolve(join(workspacesRoot, slug))
+    const relativePath = relative(workspacesRoot, workspaceDir)
+    if (relativePath && !relativePath.startsWith('..') && !isAbsolute(relativePath) && existsSync(workspaceDir)) {
+      try {
+        rmSyncWithRetry(workspaceDir, { recursive: true, force: true })
+      } catch (cleanupError) {
+        console.warn(`[Agent 工作区] 创建失败后清理目录失败 (${slug}):`, cleanupError)
+      }
+    }
+    console.error(`[Agent 工作区] 创建工作区失败 (${name}, slug: ${slug}):`, error)
+    throw new Error(`创建项目失败: ${(error as Error)?.message ?? '初始化项目目录失败'}`)
+  }
 
   index.workspaces.unshift(workspace)
   writeIndex(index)
@@ -649,6 +698,17 @@ export function deleteWorkspaceSkill(workspaceSlug: string, skillSlug: string): 
 }
 
 /** 扫描指定目录下的 Skills，供 getWorkspaceSkills 和 getAllWorkspaceSkills 复用 */
+function isSkillDirectoryEntry(dir: string, entry: Dirent): boolean {
+  if (entry.isDirectory()) return true
+  if (!entry.isSymbolicLink()) return false
+
+  try {
+    return statSync(join(dir, entry.name)).isDirectory()
+  } catch {
+    return false
+  }
+}
+
 function scanSkillsInDir(dir: string, enabled: boolean): SkillMeta[] {
   const skills: SkillMeta[] = []
 
@@ -656,8 +716,7 @@ function scanSkillsInDir(dir: string, enabled: boolean): SkillMeta[] {
     const entries = readdirSync(dir, { withFileTypes: true })
 
     for (const entry of entries) {
-      const isDir = entry.isDirectory() || (entry.isSymbolicLink() && statSync(join(dir, entry.name)).isDirectory())
-      if (!isDir) continue
+      if (!isSkillDirectoryEntry(dir, entry)) continue
 
       const skillMdPath = join(dir, entry.name, 'SKILL.md')
       if (!existsSync(skillMdPath)) continue

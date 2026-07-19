@@ -1,3 +1,5 @@
+import type { ProviderType } from './channel'
+
 /**
  * Agent 相关类型定义
  *
@@ -45,6 +47,23 @@ export type ThinkingConfig =
  * - max: 最大深度（仅 Opus 4.6）
  */
 export type AgentEffort = 'low' | 'medium' | 'high' | 'max'
+
+/** Agent 思考等级（用于 Pi runtime；Claude runtime 继续使用 ThinkingConfig/AgentEffort） */
+export type AgentThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
+
+/** 支持 ChatGPT Codex Fast Mode（priority service tier）的模型。 */
+export const CODEX_FAST_MODE_MODEL_IDS = [
+  'gpt-5.4',
+  'gpt-5.5',
+  'gpt-5.6-sol',
+  'gpt-5.6-terra',
+  'gpt-5.6-luna',
+] as const
+
+/** 模型 ID 是否可通过 ChatGPT Codex OAuth 使用 Fast Mode。 */
+export function isCodexFastModeSupportedModel(modelId: string | undefined): boolean {
+  return modelId !== undefined && (CODEX_FAST_MODE_MODEL_IDS as readonly string[]).includes(modelId.toLowerCase())
+}
 
 /**
  * 自定义子代理定义
@@ -182,6 +201,8 @@ export interface SDKAssistantMessage {
   isReplay?: boolean
   /** 渠道配置的模型 ID，持久化/流式期间注入，用于正确匹配模型显示名 */
   _channelModelId?: string
+  /** 渠道 provider，用于按 Agent SDK 实际运行窗口计算压缩阈值 */
+  _channelProvider?: ProviderType
 }
 
 /** SDK user 消息 */
@@ -217,6 +238,10 @@ export interface SDKResultMessage {
   background_tasks?: SDKBackgroundTaskSummary[]
   session_crons?: SDKSessionCronSummary[]
   session_id?: string
+  /** 渠道配置的模型 ID，用于缺失 modelUsage.contextWindow 时按 Agent SDK 运行窗口兜底 */
+  _channelModelId?: string
+  /** 渠道 provider，用于按 Agent SDK 实际运行窗口计算压缩阈值 */
+  _channelProvider?: ProviderType
 }
 
 /** SDK system 消息（init / compact_boundary / permission_denied / task_started / task_progress / task_notification） */
@@ -345,8 +370,12 @@ export type ErrorCode =
   // 环境 / 配置类错误（本地可修复）
   | 'windows_shell_missing'
   | 'channel_not_found'
+  | 'channel_disabled'
+  | 'agent_provider_not_supported'
+  | 'agent_model_unavailable'
   | 'api_key_decrypt_failed'
   | 'claude_binary_not_found'
+  | 'agent_runtime_not_found'
   | 'session_busy'
   | 'unknown_error'
 
@@ -567,6 +596,10 @@ export interface AgentSessionMeta {
   modelId?: string
   /** SDK 内部会话 ID（用于 resume 衔接上下文） */
   sdkSessionId?: string
+  /** 当前会话使用的 Agent runtime；历史会话缺省为 claude */
+  agentRuntime?: import('./agent-provider').AgentRuntime
+  /** ChatGPT Codex Fast Mode 开关；仅 Pi + ChatGPT OAuth 的受支持模型实际生效。 */
+  codexFastMode?: boolean
   /** 所属工作区 ID */
   workspaceId?: string
   /** 是否置顶 */
@@ -772,7 +805,7 @@ export interface McpToolSummary {
 }
 
 /** Proma 内置 MCP 分类 */
-export type BuiltinMcpCategory = 'system' | 'automation' | 'collaboration' | 'memory' | 'media'
+export type BuiltinMcpCategory = 'system' | 'automation' | 'collaboration' | 'memory' | 'media' | 'browser'
 
 /** Proma 内置 MCP 摘要，不写入工作区 mcp.json */
 export interface BuiltinMcpServerSummary {
@@ -905,6 +938,8 @@ export interface AgentSendInput {
   channelId: string
   /** 模型 ID */
   modelId?: string
+  /** 本轮请求使用的 Agent runtime（用于输入区快速切换后的兜底同步） */
+  agentRuntime?: import('./agent-provider').AgentRuntime
   /** 工作区 ID（用于确定 cwd） */
   workspaceId?: string
   /** 附加的外部目录（绝对路径，传递给 SDK additionalDirectories） */
@@ -1364,6 +1399,8 @@ export const AGENT_IPC_CHANNELS = {
   GET_SDK_MESSAGES: 'agent:get-sdk-messages',
   /** 更新会话标题 */
   UPDATE_TITLE: 'agent:update-title',
+  /** 更新会话模型选择 */
+  UPDATE_SESSION_MODEL: 'agent:update-session-model',
   /** 删除会话 */
   DELETE_SESSION: 'agent:delete-session',
   /** 迁移 Chat 对话记录到 Agent 会话 */
@@ -1560,6 +1597,10 @@ export const AGENT_IPC_CHANNELS = {
   PERMISSION_RESPOND: 'agent:permission:respond',
   /** 热切换指定会话的权限模式（运行中生效，不广播到其他会话） */
   UPDATE_SESSION_PERMISSION_MODE: 'agent:update-session-permission-mode',
+  /** 切换指定会话的 Agent runtime（下一轮生效，跨 runtime 时清空 SDK resume ID） */
+  UPDATE_SESSION_AGENT_RUNTIME: 'agent:update-session-agent-runtime',
+  /** 切换指定会话的 ChatGPT Codex Fast Mode（下一轮 Pi 请求生效） */
+  UPDATE_SESSION_CODEX_FAST_MODE: 'agent:update-session-codex-fast-mode',
 
   // AskUserQuestion 交互式问答
   /** AskUser 响应（渲染进程 → 主进程） */

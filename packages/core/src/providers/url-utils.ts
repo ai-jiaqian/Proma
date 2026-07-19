@@ -46,6 +46,25 @@ function replacePathSuffix(rawUrl: string, suffix: string, replacement: string):
   }
 }
 
+function removePathSuffixForSdkBaseUrl(rawUrl: string, suffix: string): string {
+  const trimmed = rawUrl.trim()
+  try {
+    const parsed = new URL(trimmed)
+    const pathname = parsed.pathname.replace(/\/+$/, '')
+    if (!pathname.endsWith(suffix)) return normalizeBaseUrl(trimmed)
+
+    parsed.pathname = pathname.slice(0, -suffix.length) || '/'
+    parsed.search = ''
+    parsed.hash = ''
+    return trimTrailingUrlPathSlash(parsed.toString())
+  } catch {
+    const pathPart = trimmed.split(/[?#]/, 1)[0] ?? trimmed
+    const normalizedPath = pathPart.replace(/\/+$/, '')
+    if (!normalizedPath.endsWith(suffix)) return normalizeBaseUrl(trimmed)
+    return normalizedPath.slice(0, -suffix.length)
+  }
+}
+
 /**
  * 规范化 Anthropic Base URL（用于 Proma Chat 直接调用 API）
  *
@@ -128,6 +147,22 @@ export function normalizeBaseUrl(baseUrl: string): string {
 }
 
 /**
+ * 规范化 OpenAI 兼容 Base URL（用于 Pi Agent runtime）。
+ *
+ * Pi / OpenAI client 会自行拼接 /chat/completions 或 /responses；custom / OpenAI Responses
+ * 渠道若保存的是完整端点，这里需要还原成协议根地址，避免重复拼接。
+ */
+export function normalizeOpenAIBaseUrlForSdk(baseUrl: string): string {
+  if (hasPathSuffix(baseUrl, '/chat/completions')) {
+    return removePathSuffixForSdkBaseUrl(baseUrl, '/chat/completions')
+  }
+  if (hasPathSuffix(baseUrl, '/responses')) {
+    return removePathSuffixForSdkBaseUrl(baseUrl, '/responses')
+  }
+  return normalizeBaseUrl(baseUrl)
+}
+
+/**
  * 解析 OpenAI Chat Completions 请求地址。
  *
  * OpenAI 兼容格式（custom）要求用户直接填写完整请求端点。
@@ -146,13 +181,28 @@ export function resolveOpenAIChatCompletionsUrl(baseUrl: string, provider: Provi
 }
 
 /**
+ * 解析 OpenAI Responses 请求地址。
+ *
+ * 内置 OpenAI Responses 渠道允许填写协议根地址或完整 /responses 端点。
+ */
+export function resolveOpenAIResponsesUrl(baseUrl: string, _provider: ProviderType = 'openai-responses'): string {
+  if (hasPathSuffix(baseUrl, '/responses')) {
+    return trimTrailingUrlPathSlash(baseUrl)
+  }
+  return `${normalizeBaseUrl(baseUrl)}/responses`
+}
+
+/**
  * 解析 OpenAI Models 地址。
  *
- * 当用户把兼容格式配置为完整 /chat/completions 端点时，模型列表需要回到同级 /models。
+ * 当用户把兼容格式配置为完整 /chat/completions 或 /responses 端点时，模型列表需要回到同级 /models。
  */
 export function resolveOpenAIModelsUrl(baseUrl: string): string {
   if (hasPathSuffix(baseUrl, '/chat/completions')) {
     return replacePathSuffix(baseUrl, '/chat/completions', '/models')
+  }
+  if (hasPathSuffix(baseUrl, '/responses')) {
+    return replacePathSuffix(baseUrl, '/responses', '/models')
   }
   return `${normalizeBaseUrl(baseUrl)}/models`
 }
@@ -174,6 +224,7 @@ export function normalizeAnthropicProviderUrl(baseUrl: string, provider: Provide
     || provider === 'xiaomi-token-plan'
     || provider === 'qwen-anthropic'
     || provider === 'zhipu-coding'
+    || provider === 'zhipu-coding-team'
     || provider === 'ark-coding-plan'
     || provider === 'deepseek'
     || provider === 'kimi-api'

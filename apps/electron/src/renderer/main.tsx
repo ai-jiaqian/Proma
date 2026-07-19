@@ -27,6 +27,7 @@ import {
   agentChannelIdAtom,
   agentModelIdAtom,
   agentChannelIdsAtom,
+  agentRuntimeAtom,
   agentWorkspacesAtom,
   agentSessionsAtom,
   currentAgentWorkspaceIdAtom,
@@ -78,6 +79,7 @@ import { showCapabilityChangeToasts } from './lib/capabilities-toast'
 import { GlobalShortcuts } from './components/shortcuts/GlobalShortcuts'
 import { TabSwitcher } from './components/tabs/TabSwitcher'
 import { htmlToMarkdown, markdownToHtml } from './lib/markdown-rich-text'
+import { nextAgentChannelIdsAfterModelSelect } from './lib/agent-channel-selection'
 import './styles/globals.css'
 import 'katex/dist/katex.min.css'
 
@@ -85,6 +87,12 @@ import 'katex/dist/katex.min.css'
 const isQuickTaskWindow = new URLSearchParams(window.location.search).get('window') === 'quick-task'
 const isVoiceDictationWindow = new URLSearchParams(window.location.search).get('window') === 'voice-dictation'
 const isDetachedPreviewWindow = new URLSearchParams(window.location.search).get('window') === 'detached-preview'
+const isMainWindow = !isQuickTaskWindow && !isVoiceDictationWindow && !isDetachedPreviewWindow
+
+// 仅主窗口禁用页面级滚动；独立浮窗各自管理自己的内容高度和滚动。
+if (isMainWindow) {
+  document.documentElement.classList.add('proma-main-window')
+}
 
 /**
  * 主题初始化组件
@@ -157,6 +165,7 @@ function AgentSettingsInitializer(): null {
   const setAgentChannelId = useSetAtom(agentChannelIdAtom)
   const setAgentModelId = useSetAtom(agentModelIdAtom)
   const setAgentChannelIds = useSetAtom(agentChannelIdsAtom)
+  const setAgentRuntime = useSetAtom(agentRuntimeAtom)
   const setAgentWorkspaces = useSetAtom(agentWorkspacesAtom)
   const setCurrentWorkspaceId = useSetAtom(currentAgentWorkspaceIdAtom)
   const bumpCapabilities = useSetAtom(workspaceCapabilitiesVersionAtom)
@@ -211,6 +220,8 @@ function AgentSettingsInitializer(): null {
       if (settings.agentModelId && (!settings.agentChannelId || channelIds.has(settings.agentChannelId))) {
         setAgentModelId(settings.agentModelId)
       }
+      const defaultAgentRuntime = settings.agentRuntime ?? 'claude'
+      setAgentRuntime(defaultAgentRuntime)
 
       // 加载 Agent 启用渠道列表，过滤已删除的渠道
       if (settings.agentChannelIds && settings.agentChannelIds.length > 0) {
@@ -223,16 +234,18 @@ function AgentSettingsInitializer(): null {
         }
       } else if (settings.agentChannelId && channelIds.has(settings.agentChannelId)) {
         // 迁移：旧版本只有 agentChannelId，自动转为数组
-        const migrated = [settings.agentChannelId]
-        setAgentChannelIds(migrated)
-        window.electronAPI.updateSettings({ agentChannelIds: migrated }).catch(console.error)
+        const migrated = nextAgentChannelIdsAfterModelSelect([], settings.agentChannelId, defaultAgentRuntime)
+        if (migrated.length > 0) {
+          setAgentChannelIds(migrated)
+          window.electronAPI.updateSettings({ agentChannelIds: migrated }).catch(console.error)
+        }
       }
 
       // 兜底：agentChannelId 存在但不在 agentChannelIds 白名单中，自动修复不一致
       if (settings.agentChannelId && channelIds.has(settings.agentChannelId)) {
         const currentIds = settings.agentChannelIds?.filter((id) => channelIds.has(id)) ?? []
-        if (!currentIds.includes(settings.agentChannelId)) {
-          const fixedIds = [...currentIds, settings.agentChannelId]
+        const fixedIds = nextAgentChannelIdsAfterModelSelect(currentIds, settings.agentChannelId, defaultAgentRuntime)
+        if (fixedIds !== currentIds) {
           setAgentChannelIds(fixedIds)
           window.electronAPI.updateSettings({ agentChannelIds: fixedIds }).catch(console.error)
         }
@@ -273,7 +286,7 @@ function AgentSettingsInitializer(): null {
       console.error(err)
       setAgentSettingsReady(true) // 即使出错也标记就绪，避免永远阻塞
     })
-  }, [setAgentChannelId, setAgentModelId, setAgentChannelIds, setAgentWorkspaces, setCurrentWorkspaceId, setThinking, setEffort, setMaxBudget, setMaxTurns, setAutomationGroupOrder, setChannels, setChannelsLoaded, setAgentSettingsReady])
+  }, [setAgentChannelId, setAgentModelId, setAgentChannelIds, setAgentRuntime, setAgentWorkspaces, setCurrentWorkspaceId, setThinking, setEffort, setMaxBudget, setMaxTurns, setAutomationGroupOrder, setChannels, setChannelsLoaded, setAgentSettingsReady])
 
   // 工作区切换时重置能力缓存，预加载基线
   useEffect(() => {
