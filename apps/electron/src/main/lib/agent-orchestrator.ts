@@ -20,7 +20,7 @@ import { join, dirname } from 'node:path'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { app } from 'electron'
-import type { AgentRuntime, AgentSendInput, AgentMessage, AgentGenerateTitleInput, AgentProviderAdapter, AgentSessionMeta, TypedError, RetryAttempt, SDKMessage, SDKAssistantMessage, AgentStreamPayload, RewindSessionResult, ProviderType, AgentThinkingLevel } from '@proma/shared'
+import type { AgentRuntime, AgentSendInput, AgentMessage, AgentGenerateTitleInput, AgentProviderAdapter, AgentSessionMeta, TypedError, RetryAttempt, SDKMessage, SDKAssistantMessage, AgentStreamPayload, RewindSessionResult, ProviderType } from '@proma/shared'
 import {
   PROMA_DEFAULT_PERMISSION_MODE,
   PROMA_PERMISSION_MODE_CONFIG,
@@ -30,6 +30,7 @@ import {
   isPersistableSDKSystemMessage,
   normalizeMcpTransportType,
   inferAgentSdkContextWindow,
+  isOpenAIReasoningSupportedModel,
 } from '@proma/shared'
 import type { PromaPermissionMode, AskUserRequest, ExitPlanModeRequest, SDKSystemMessage } from '@proma/shared'
 import type { ClaudeAgentQueryOptions } from './adapters/claude-agent-adapter'
@@ -42,7 +43,7 @@ import { getAdapter, fetchTitle, normalizeAnthropicBaseUrlForSdk, getPromaUserAg
 import pkg from '../../../package.json' with { type: 'json' }
 import { getFetchFn } from './proxy-fetch'
 import { getEffectiveProxyUrl } from './proxy-settings-service'
-import { appendSDKMessages, updateAgentSessionMeta, getAgentSessionMeta, getAgentSessionMessages, truncateSDKMessages, resolveUserUuidFromSDK, rewindFilesFromSnapshot } from './agent-session-manager'
+import { appendSDKMessages, updateAgentSessionMeta, getAgentSessionMeta, getAgentSessionMessages, truncateSDKMessages, resolveUserUuidFromSDK, rewindFilesFromSnapshot, rewindPiAgentSession } from './agent-session-manager'
 import { getAgentWorkspace, getWorkspaceMcpConfig, ensurePluginManifest, getWorkspaceAutoMemoryDir, getWorkspaceAttachedDirectories, getWorkspaceAttachedFiles } from './agent-workspace-manager'
 import { getAgentWorkspacePath, getAgentSessionWorkspacePath, getSdkConfigDir, getWorkspaceFilesDir, getBundledCliPath, getWorkspaceSkillsDir } from './config-paths'
 import { getRuntimeStatus } from './runtime-init'
@@ -65,6 +66,7 @@ import type { AgentRuntimeEnv } from './agent-runtime-env'
 import { isVisibleRunMessage } from './agent-run-message-visibility'
 import { applyAgentSdkAuthEnv } from './agent-sdk-auth-env'
 import { getAgentSdkMaxOutputTokens } from './agent-sdk-output-limits'
+import { resolvePiThinkingLevel } from './agent-thinking-level'
 import { createFallbackTitle, sanitizeGeneratedTitle, TITLE_PROMPT } from './title-generation'
 
 // ===== 类型定义 =====
@@ -108,12 +110,6 @@ function buildPiRuntimeEnv(env: Record<string, string | undefined>): AgentRuntim
     if (value !== undefined) cleanEnv[key] = value
   }
   return { env: cleanEnv }
-}
-
-function resolvePiThinkingLevel(settings: ReturnType<typeof getSettings>): AgentThinkingLevel {
-  if (settings.agentThinking?.type === 'disabled') return 'off'
-  if (settings.agentEffort === 'max') return 'xhigh'
-  return settings.agentEffort ?? (settings.agentThinking ? 'high' : 'off')
 }
 
 const EMPTY_RESPONSE_RESULT_SUBTYPE = 'empty_response'
@@ -1525,14 +1521,18 @@ export class AgentOrchestrator {
         permissionMode: initialPermissionMode,
         collaborationAvailable,
       }) + (automationContext ? `\n\n## 定时任务执行上下文\n\n${automationContext}` : '')
-      const handleSessionId = (sdkSessionId: string): void => {
+      const handleSessionId = (sdkSessionId: string, piSessionFile?: string): void => {
         // 仅在 session_id 真正变化时才持久化。SDK v2 几乎每条消息都会回调 onSessionId，
         // capturedSdkSessionId 已初始化为 existingSdkSessionId，并在 recovery 时同步重置。
         const isNewSessionId = sdkSessionId !== capturedSdkSessionId
+        const needsPiSessionFile = agentRuntime === 'pi' && !!piSessionFile && sessionMeta?.piSessionFile !== piSessionFile
         capturedSdkSessionId = sdkSessionId
-        if (isNewSessionId) {
+        if (isNewSessionId || needsPiSessionFile) {
           try {
-            updateAgentSessionMeta(sessionId, { sdkSessionId })
+            updateAgentSessionMeta(sessionId, {
+              sdkSessionId,
+              ...(agentRuntime === 'pi' && piSessionFile ? { piSessionFile } : {}),
+            })
             console.log(`[Agent 编排] 已保存 SDK session_id: ${sdkSessionId}`)
           } catch (err) {
             console.error(`[Agent 编排] 保存 SDK session_id 失败:`, err)
@@ -1590,12 +1590,22 @@ export class AgentOrchestrator {
         ...(mentionedSkills?.length ? { skillMentions: mentionedSkills } : {}),
         ...(isCompactCommand ? { compactRequest: true } : {}),
         ...(sessionMeta?.codexFastMode && channel.provider === 'openai-codex' ? { codexFastMode: true } : {}),
-        thinkingLevel: resolvePiThinkingLevel(appSettings),
+        ...((channel.provider === 'openai-codex' || channel.provider === 'openai-responses')
+          && isOpenAIReasoningSupportedModel(selectedModelId) && {
+            openAIThinkingLevel: resolvePiThinkingLevel(appSettings, sessionMeta, channel.provider),
+          }),
+        thinkingLevel: resolvePiThinkingLevel(appSettings, sessionMeta, channel.provider),
         ...(appSettings.agentMaxBudgetUsd != null && appSettings.agentMaxBudgetUsd > 0 && {
           maxBudgetUsd: appSettings.agentMaxBudgetUsd,
         }),
         ...(piCustomTools.length > 0 && { customTools: piCustomTools as PiAgentQueryOptions['customTools'] }),
         onSessionId: handleSessionId,
+        onPiEntryBindings: (bindings) => {
+          const latest = getAgentSessionMeta(sessionId)
+          updateAgentSessionMeta(sessionId, {
+            piEntryBindings: { ...(latest?.piEntryBindings ?? {}), ...bindings },
+          })
+        },
         onModelResolved: handleModelResolved,
         onContextWindow: handleContextWindow,
       } : {
@@ -2442,6 +2452,20 @@ export class AgentOrchestrator {
     const sessionMeta = getAgentSessionMeta(sessionId)
     if (!sessionMeta?.sdkSessionId) {
       throw new Error('会话没有 SDK session ID，无法回退')
+    }
+
+    // Pi 使用原生树状 session 导出一个持久 artifact；不能复用 Claude snapshot
+    // 或仅截断 renderer JSONL，否则下一轮 resume 会重新加载被舍弃的上下文。
+    if (sessionMeta.agentRuntime === 'pi') {
+      await rewindPiAgentSession(sessionId, assistantMessageUuid)
+      const kept = truncateSDKMessages(sessionId, assistantMessageUuid)
+      return {
+        remainingMessages: kept.length,
+        fileRewind: {
+          canRewind: false,
+          error: '已回退 Pi 对话；Pi 文件回退尚未启用，当前未修改任何文件。',
+        },
+      }
     }
 
     // 0.5 从 SDK session JSONL 解析对应的 user message UUID（rewindFiles 需要）

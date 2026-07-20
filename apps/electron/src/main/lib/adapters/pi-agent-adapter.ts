@@ -7,6 +7,7 @@
 
 import { randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
+import type { Dispatcher } from 'undici'
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import type {
@@ -23,7 +24,7 @@ import type {
   SDKUserMessageInput,
   TypedError,
 } from '@proma/shared'
-import { isCodexFastModeSupportedModel } from '@proma/shared'
+import { isCodexFastModeSupportedModel, isOpenAIReasoningSupportedModel } from '@proma/shared'
 import {
   THINKING_SIGNATURE_ERROR_MESSAGE,
   THINKING_SIGNATURE_ERROR_TITLE,
@@ -49,7 +50,7 @@ import {
   type AgentRuntimeGuard,
 } from '../agent-runtime-guards'
 import { createPromaAgentsFilesOverride } from './pi-resource-loader-overrides'
-import { createCodexFastModeExtension, withCodexFastModeServiceTier } from './pi-codex-fast-mode'
+import { createCodexRequestSettingsExtension, withCodexFastModeServiceTier } from './pi-codex-request-settings'
 import { mergeRuntimeEnv, type AgentRuntimeEnv } from '../agent-runtime-env'
 import {
   convertPiMessage,
@@ -64,6 +65,12 @@ import {
 } from './pi-message-adapter'
 import { DEFAULT_CONTEXT_WINDOW, buildModel } from './pi-model-registry'
 import { createPartialMessageCoalescer, type PartialMessageCoalescer } from './pi-streaming-control'
+import {
+  closePiRequestProxyDispatcher,
+  createPiRequestProxyDispatcher,
+  installPiRequestProxyFetch,
+  runWithPiRequestProxy,
+} from './pi-request-proxy'
 
 type PiSdk = typeof import('@earendil-works/pi-coding-agent')
 type BashOperations = import('@earendil-works/pi-coding-agent').BashOperations
@@ -88,7 +95,9 @@ export interface PiAgentQueryOptions extends AgentQueryInput {
   piAgentDir: string
   piSessionDir: string
   customTools?: ToolDefinition[]
-  onSessionId?: (sdkSessionId: string) => void
+  onSessionId?: (sdkSessionId: string, sessionFile?: string) => void
+  /** Pi final assistant UI UUID → 持久树状 session entry ID。 */
+  onPiEntryBindings?: (bindings: Record<string, string>) => void
   onModelResolved?: (model: string) => void
   onContextWindow?: (contextWindow: number) => void
   thinkingLevel?: AgentThinkingLevel
@@ -111,6 +120,8 @@ export interface PiAgentQueryOptions extends AgentQueryInput {
   compactRequest?: boolean
   /** ChatGPT Codex Fast Mode；仅 openai-codex 的受支持模型实际注入 priority service tier。 */
   codexFastMode?: boolean
+  /** 会话级 OpenAI（Codex OAuth / Responses API）思考深度。 */
+  openAIThinkingLevel?: AgentThinkingLevel
 }
 
 interface ActivePiSession {
@@ -154,15 +165,6 @@ export interface PiRemoteConnectionSettings {
   websocketConnectTimeoutMs?: number
 }
 
-interface PiProxySettingsModule {
-  applyHttpProxySettings?: (httpProxy: string | undefined) => void
-}
-
-interface ScopedProxyEnvEntry {
-  id: symbol
-  proxyUrl: string
-}
-
 interface AsyncQueue<T> {
   push: (value: T) => void
   fail: (error: unknown) => void
@@ -172,18 +174,6 @@ interface AsyncQueue<T> {
 
 /** Pi 原生每个 delta 都携带累计消息；20fps 足够流畅，同时避免 IPC/React 事件风暴。 */
 const PI_PARTIAL_UPDATE_INTERVAL_MS = 50
-
-const PI_PROXY_ENV_KEYS = [
-  'HTTP_PROXY',
-  'HTTPS_PROXY',
-  'ALL_PROXY',
-  'http_proxy',
-  'https_proxy',
-  'all_proxy',
-] as const
-
-const scopedProxyEnvStack: ScopedProxyEnvEntry[] = []
-let scopedProxyEnvOriginal: Map<string, string | undefined> | undefined
 
 function getCaseInsensitiveRuntimeEnvValue(env: Record<string, string> | undefined, key: string): string | undefined {
   if (!env) return undefined
@@ -213,87 +203,21 @@ function isNonNegativeFiniteNumber(value: number | undefined): value is number {
 export function buildPiRemoteConnectionSettings(
   input: Pick<
     PiAgentQueryOptions,
-    'proxyUrl' | 'runtimeEnv' | 'transport' | 'httpIdleTimeoutMs' | 'websocketConnectTimeoutMs'
+    'provider' | 'proxyUrl' | 'runtimeEnv' | 'transport' | 'httpIdleTimeoutMs' | 'websocketConnectTimeoutMs'
   >,
 ): PiRemoteConnectionSettings {
   const httpProxy = resolvePiHttpProxy(input)
+  // Node/Electron 的 WebSocket 不支持请求级 HTTP 代理注入；有代理的 Codex
+  // 默认改走可由 undici dispatcher 承载的 SSE。用户显式选择 transport 时保留其意图。
+  const transport = input.transport ?? (httpProxy && input.provider === 'openai-codex' ? 'sse' : undefined)
   return {
     ...(httpProxy ? { httpProxy } : {}),
-    ...(input.transport ? { transport: input.transport } : {}),
+    ...(transport ? { transport } : {}),
     ...(isNonNegativeFiniteNumber(input.httpIdleTimeoutMs) ? { httpIdleTimeoutMs: input.httpIdleTimeoutMs } : {}),
     ...(isNonNegativeFiniteNumber(input.websocketConnectTimeoutMs)
       ? { websocketConnectTimeoutMs: input.websocketConnectTimeoutMs }
       : {}),
   }
-}
-
-function setScopedProxyEnv(proxyUrl: string): void {
-  for (const key of PI_PROXY_ENV_KEYS) {
-    process.env[key] = proxyUrl
-  }
-}
-
-function restoreOriginalProxyEnv(): void {
-  if (!scopedProxyEnvOriginal) return
-  for (const key of PI_PROXY_ENV_KEYS) {
-    const originalValue = scopedProxyEnvOriginal.get(key)
-    if (originalValue === undefined) {
-      delete process.env[key]
-    } else {
-      process.env[key] = originalValue
-    }
-  }
-  scopedProxyEnvOriginal = undefined
-}
-
-function enterScopedProxyEnv(proxyUrl: string): () => void {
-  if (!scopedProxyEnvOriginal) {
-    scopedProxyEnvOriginal = new Map(PI_PROXY_ENV_KEYS.map((key) => [key, process.env[key]]))
-  }
-
-  const entry: ScopedProxyEnvEntry = { id: Symbol('pi-proxy-env'), proxyUrl }
-  scopedProxyEnvStack.push(entry)
-  setScopedProxyEnv(proxyUrl)
-
-  let restored = false
-  return () => {
-    if (restored) return
-    restored = true
-    const index = scopedProxyEnvStack.findIndex((item) => item.id === entry.id)
-    if (index >= 0) scopedProxyEnvStack.splice(index, 1)
-
-    const current = scopedProxyEnvStack.at(-1)
-    if (current) {
-      setScopedProxyEnv(current.proxyUrl)
-    } else {
-      restoreOriginalProxyEnv()
-    }
-  }
-}
-
-function getApplyHttpProxySettings(sdk: unknown): PiProxySettingsModule['applyHttpProxySettings'] {
-  if (!sdk || typeof sdk !== 'object') return undefined
-  const candidate = (sdk as { applyHttpProxySettings?: unknown }).applyHttpProxySettings
-  return typeof candidate === 'function'
-    ? (candidate as PiProxySettingsModule['applyHttpProxySettings'])
-    : undefined
-}
-
-export function applyPiProxySettingsForQuery(
-  sdk: unknown,
-  input: Pick<PiAgentQueryOptions, 'proxyUrl' | 'runtimeEnv'>,
-): () => void {
-  const proxyUrl = resolvePiHttpProxy(input)
-  if (!proxyUrl) return () => {}
-
-  const restoreProxyEnv = enterScopedProxyEnv(proxyUrl)
-  try {
-    getApplyHttpProxySettings(sdk)?.(proxyUrl)
-  } catch (error) {
-    console.warn('[Pi SDK] 应用 Pi proxy helper 失败，已回退到 scoped proxy env:', error)
-  }
-  setScopedProxyEnv(proxyUrl)
-  return restoreProxyEnv
 }
 
 function createAsyncQueue<T>(): AsyncQueue<T> {
@@ -1270,7 +1194,7 @@ export class PiAgentAdapter implements AgentProviderAdapter {
     const runtimeGuard = createAgentRuntimeGuard(input)
     active.runtimeGuard = runtimeGuard
     let unsubscribe: (() => void) | undefined
-    let restorePiProxyEnv: (() => void) | undefined
+    let requestProxyDispatcher: Dispatcher | undefined
     let partialAssistantCoalescer: PartialMessageCoalescer<{ message: AssistantMessage; uuid: string }> | undefined
 
     const cleanupActiveSession = (): void => {
@@ -1288,17 +1212,22 @@ export class PiAgentAdapter implements AgentProviderAdapter {
           this.activeSessions.delete(input.sessionId)
         }
       } finally {
-        restorePiProxyEnv?.()
-        restorePiProxyEnv = undefined
+        void closePiRequestProxyDispatcher(requestProxyDispatcher)
+        requestProxyDispatcher = undefined
       }
     }
 
     try {
+      installPiRequestProxyFetch()
+      requestProxyDispatcher = createPiRequestProxyDispatcher({
+        proxyUrl: resolvePiHttpProxy(input),
+        noProxy: getCaseInsensitiveRuntimeEnvValue(input.runtimeEnv?.env, 'NO_PROXY'),
+        httpIdleTimeoutMs: input.httpIdleTimeoutMs,
+      })
       const sdk = await import('@earendil-works/pi-coding-agent')
       const piAi = input.codexFastMode && input.provider === 'openai-codex'
         ? await import('@earendil-works/pi-ai/compat')
         : undefined
-      restorePiProxyEnv = applyPiProxySettingsForQuery(sdk, input)
       if (active.abortRequested) throw createAbortError()
 
       if (!existsSync(input.piSessionDir)) mkdirSync(input.piSessionDir, { recursive: true })
@@ -1310,7 +1239,7 @@ export class PiAgentAdapter implements AgentProviderAdapter {
       const sessionManager = sessionFile
         ? sdk.SessionManager.open(sessionFile, input.piSessionDir, cwd)
         : sdk.SessionManager.create(cwd, input.piSessionDir)
-      const { authStorage, registry, model } = await buildModel(sdk, input)
+      const { modelRuntime, model } = await buildModel(sdk, input)
       const customTools = [
         ...buildBuiltinToolDefinitions(
           sdk,
@@ -1338,8 +1267,13 @@ export class PiAgentAdapter implements AgentProviderAdapter {
         additionalSkillPaths: input.additionalSkillPaths ?? [],
         skillsOverride: createPromaSkillsOverride(input.additionalSkillPaths),
         agentsFilesOverride: createPromaAgentsFilesOverride(),
-        ...(input.codexFastMode && input.provider === 'openai-codex' && {
-          extensionFactories: [createCodexFastModeExtension()],
+        ...((input.provider === 'openai-codex' || input.provider === 'openai-responses')
+          && model.reasoning
+          && isOpenAIReasoningSupportedModel(input.model) && {
+            extensionFactories: [createCodexRequestSettingsExtension({
+            fastMode: input.codexFastMode,
+            thinkingLevel: input.openAIThinkingLevel,
+          })],
         }),
         systemPromptOverride: () => input.systemPrompt,
       })
@@ -1355,8 +1289,7 @@ export class PiAgentAdapter implements AgentProviderAdapter {
       const { session } = await sdk.createAgentSession({
         cwd,
         agentDir: input.piAgentDir,
-        authStorage,
-        modelRegistry: registry,
+        modelRuntime,
         settingsManager,
         resourceLoader,
         sessionManager,
@@ -1370,10 +1303,11 @@ export class PiAgentAdapter implements AgentProviderAdapter {
         // Pi 的通用 streamSimple 会丢弃 provider 专属 serviceTier；这里直接走
         // provider stream，确保 request body 与 usage.cost 都使用 priority tier。
         session.agent.streamFn = async (requestModel, context, options) => {
-          const auth = await registry.getApiKeyAndHeaders(requestModel)
-          if (!auth.ok) throw new Error(auth.error)
+          const authResult = await modelRuntime.getAuth(requestModel)
+          if (!authResult?.auth.apiKey) throw new Error('无法获取 ChatGPT (Codex) OAuth access token')
+          const auth = authResult.auth
 
-          const env = auth.env || options?.env ? { ...(auth.env ?? {}), ...(options?.env ?? {}) } : undefined
+          const env = authResult.env || options?.env ? { ...(authResult.env ?? {}), ...(options?.env ?? {}) } : undefined
           const retrySettings = settingsManager.getProviderRetrySettings()
           const configuredTimeoutMs = settingsManager.getHttpIdleTimeoutMs()
           const timeoutMs = options?.timeoutMs ?? retrySettings.timeoutMs ?? (configuredTimeoutMs === 0 ? 2_147_483_647 : configuredTimeoutMs)
@@ -1391,6 +1325,13 @@ export class PiAgentAdapter implements AgentProviderAdapter {
           }))
         }
       }
+      // 代理作用域必须只覆盖模型 provider stream：在整个 session.prompt() 链上设
+      // AsyncLocalStorage 会把 MCP/产品工具等同一 Agent loop 中的 fetch 也错误地送进 Codex 代理。
+      const providerStreamFn = session.agent.streamFn
+      session.agent.streamFn = (requestModel, context, options) => runWithPiRequestProxy(
+        requestProxyDispatcher,
+        () => providerStreamFn(requestModel, context, options),
+      )
       installRuntimeGuardHooks(session, runtimeGuard)
       active.session = session
       resolveActiveReady(active, session)
@@ -1400,7 +1341,7 @@ export class PiAgentAdapter implements AgentProviderAdapter {
         throw createAbortError()
       }
 
-      input.onSessionId?.(session.sessionId)
+      input.onSessionId?.(session.sessionId, session.sessionFile)
       input.onModelResolved?.(session.model?.id ?? input.model ?? 'default')
       input.onContextWindow?.(model.contextWindow ?? DEFAULT_CONTEXT_WINDOW)
 
@@ -1413,6 +1354,19 @@ export class PiAgentAdapter implements AgentProviderAdapter {
 
       let activeAssistant: AssistantMessageState = {}
       let lastPartialAssistant: AssistantMessage | undefined
+      // message_end 发生在 Pi 落盘前；保留对象身份，待 prompt 完成后从
+      // SessionManager entries 精确取得 Pi entry ID，绝不按文本猜测。
+      const finalAssistantUuids = new Map<AssistantMessage, string>()
+
+      const persistPiEntryBindings = (): void => {
+        const bindings: Record<string, string> = {}
+        for (const entry of sessionManager.getEntries()) {
+          if (entry.type !== 'message' || entry.message.role !== 'assistant') continue
+          const uuid = finalAssistantUuids.get(entry.message as AssistantMessage)
+          if (uuid) bindings[uuid] = entry.id
+        }
+        if (Object.keys(bindings).length > 0) input.onPiEntryBindings?.(bindings)
+      }
 
       const assistantUuidFor = (): string => {
         if (!activeAssistant.uuid) {
@@ -1463,6 +1417,7 @@ export class PiAgentAdapter implements AgentProviderAdapter {
                 ...(isAssistant && { uuid: assistantUuidFor() }),
               })
               if (converted && (converted.type !== 'user' || hasToolResult(converted))) queue.push(converted)
+              if (isAssistant) finalAssistantUuids.set(event.message as AssistantMessage, assistantUuidFor())
               if (isAssistant) {
                 activeAssistant = {}
                 lastPartialAssistant = undefined
@@ -1585,6 +1540,7 @@ export class PiAgentAdapter implements AgentProviderAdapter {
               }
               currentInterrupt?.resolveAccepted()
               await session.prompt(prompt, { source: 'rpc' })
+              persistPiEntryBindings()
             } finally {
               if (active.interrupting) {
                 session.agent.state.messages = dropTrailingAbortedAssistant(session.agent.state.messages)
