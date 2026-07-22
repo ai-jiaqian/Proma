@@ -180,8 +180,8 @@ export type InterfaceVariant = 'classic' | 'modern'
 /** 默认界面风格 */
 export const DEFAULT_INTERFACE_VARIANT: InterfaceVariant = 'modern'
 
-/** 默认 Agent runtime；历史配置缺省继续使用 Claude */
-export const DEFAULT_AGENT_RUNTIME: AgentRuntime = 'claude'
+/** 新建 Agent 会话与自动任务的默认 runtime。历史持久化记录缺失 runtime 时仍按 Claude 兼容。 */
+export const DEFAULT_AGENT_RUNTIME: AgentRuntime = 'pi'
 
 /** Markdown 预览字号档位 */
 export type MarkdownFontSize = 'small' | 'medium' | 'large'
@@ -197,15 +197,15 @@ export interface AppSettings {
   themeStyle?: ThemeStyle
   /** 界面风格 */
   interfaceVariant?: InterfaceVariant
-  /** Agent 默认渠道 ID（仅限 Anthropic 渠道） — 当前选中的渠道 */
+  /** Agent 默认渠道 ID（由当前 Agent Core 解释） — 当前选中的渠道 */
   agentChannelId?: string
   /** Agent 默认模型 ID */
   agentModelId?: string
-  /** Agent 启用的渠道 ID 列表（多选，Switch 开关） */
+  /** Claude Agent 可用渠道 ID 列表（由渠道启用状态与协议兼容性派生） */
   agentChannelIds?: string[]
   /** Agent 当前工作区 ID */
   agentWorkspaceId?: string
-  /** 新 Agent 会话默认使用的 runtime；历史会话缺省为 claude */
+  /** 新 Agent 会话默认使用的 runtime；历史会话缺省仍按 claude 兼容。 */
   agentRuntime?: AgentRuntime
   /** 侧栏「自动任务」合成项目组在项目列表中的位置索引（默认 0 = 最靠前；可拖拽调整） */
   agentAutomationGroupOrder?: number

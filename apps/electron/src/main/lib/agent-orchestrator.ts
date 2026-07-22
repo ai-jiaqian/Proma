@@ -20,7 +20,7 @@ import { join, dirname } from 'node:path'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { app } from 'electron'
-import type { AgentRuntime, AgentSendInput, AgentMessage, AgentGenerateTitleInput, AgentProviderAdapter, AgentSessionMeta, TypedError, RetryAttempt, SDKMessage, SDKAssistantMessage, AgentStreamPayload, RewindSessionResult, ProviderType } from '@proma/shared'
+import type { AgentRuntime, AgentSendInput, AgentMessage, AgentGenerateTitleInput, AgentProviderAdapter, AgentSessionMeta, CodexOAuthCredentials, TypedError, RetryAttempt, SDKMessage, SDKAssistantMessage, AgentStreamPayload, RewindSessionResult, ProviderType } from '@proma/shared'
 import {
   PROMA_DEFAULT_PERMISSION_MODE,
   PROMA_PERMISSION_MODE_CONFIG,
@@ -31,6 +31,7 @@ import {
   normalizeMcpTransportType,
   inferAgentSdkContextWindow,
   isOpenAIReasoningSupportedModel,
+  isAgentCompatibleProvider,
 } from '@proma/shared'
 import type { PromaPermissionMode, AskUserRequest, ExitPlanModeRequest, SDKSystemMessage } from '@proma/shared'
 import type { ClaudeAgentQueryOptions } from './adapters/claude-agent-adapter'
@@ -38,12 +39,12 @@ import { isPromptTooLongError, isThinkingSignatureError, friendlyErrorMessage, m
 import type { PiAgentQueryOptions } from './adapters/pi-agent-adapter'
 import { isTransientNetworkError, isMalformedResponseError, isSessionNotFoundError } from './error-patterns'
 import { AgentEventBus } from './agent-event-bus'
-import { decryptApiKey, getChannelById, listChannels, resolveChannelRuntimeApiKey, resolveCodexAccessToken } from './channel-manager'
+import { decryptApiKey, getChannelById, listChannels, persistCodexOAuthCredentials, resolveChannelRuntimeApiKey, resolveCodexOAuthCredentials } from './channel-manager'
 import { getAdapter, fetchTitle, normalizeAnthropicBaseUrlForSdk, getPromaUserAgent } from '@proma/core'
 import pkg from '../../../package.json' with { type: 'json' }
 import { getFetchFn } from './proxy-fetch'
 import { getEffectiveProxyUrl } from './proxy-settings-service'
-import { appendSDKMessages, updateAgentSessionMeta, getAgentSessionMeta, getAgentSessionMessages, truncateSDKMessages, resolveUserUuidFromSDK, rewindFilesFromSnapshot, rewindPiAgentSession } from './agent-session-manager'
+import { appendSDKMessages, updateAgentSessionMeta, getAgentSessionMeta, getAgentSessionMessages, truncateSDKMessages, removeSDKErrorMessage, resolveUserUuidFromSDK, rewindFilesFromSnapshot, rewindPiAgentSession } from './agent-session-manager'
 import { getAgentWorkspace, getWorkspaceMcpConfig, ensurePluginManifest, getWorkspaceAutoMemoryDir, getWorkspaceAttachedDirectories, getWorkspaceAttachedFiles } from './agent-workspace-manager'
 import { getAgentWorkspacePath, getAgentSessionWorkspacePath, getSdkConfigDir, getWorkspaceFilesDir, getBundledCliPath, getWorkspaceSkillsDir } from './config-paths'
 import { getRuntimeStatus } from './runtime-init'
@@ -815,6 +816,7 @@ export class AgentOrchestrator {
         content: [{ type: 'text', text: errorContent }],
       },
       parent_tool_use_id: null,
+      uuid: randomUUID(),
       error: { message: errorContent, errorType: EMPTY_RESPONSE_RESULT_SUBTYPE },
       _createdAt: Date.now(),
       _errorCode: 'unknown_error',
@@ -837,7 +839,7 @@ export class AgentOrchestrator {
    * 通过 EventBus 分发 AgentEvent，通过 callbacks 发送控制信号。
    */
   async sendMessage(input: AgentSendInput, callbacks: SessionCallbacks): Promise<void> {
-    const { sessionId, userMessage, channelId, modelId, agentRuntime: inputAgentRuntime, workspaceId, additionalDirectories, customMcpServers, permissionModeOverride, mentionedSkills, mentionedMcpServers, mentionedSessionIds, automationContext } = input
+    const { sessionId, userMessage, channelId, modelId, agentRuntime: inputAgentRuntime, workspaceId, additionalDirectories, customMcpServers, permissionModeOverride, mentionedSkills, mentionedMcpServers, mentionedSessionIds, automationContext, retryOfErrorUuid } = input
     const stderrChunks: string[] = []
     const streamStartedAt = input.startedAt ?? Date.now()
     let userMessagePersisted = false
@@ -860,6 +862,16 @@ export class AgentOrchestrator {
       callbacks.onError('上一条消息仍在处理中，请稍候再试')
       callbacks.onComplete([], { startedAt: streamStartedAt })
       return
+    }
+
+    // 手动重试直接删除原错误，避免它在下一轮完成后仍被历史回放。
+    // 删除失败不阻断重试（例如旧版本遗留的无 UUID 错误）。
+    if (retryOfErrorUuid) {
+      try {
+        removeSDKErrorMessage(sessionId, retryOfErrorUuid)
+      } catch (error) {
+        console.warn(`[Agent 编排] 删除重试前错误失败: ${retryOfErrorUuid}`, error)
+      }
     }
 
     try {
@@ -886,6 +898,7 @@ export class AgentOrchestrator {
           content: [{ type: 'text', text: errorContent }],
         },
         parent_tool_use_id: null,
+        uuid: randomUUID(),
         error: { message: typedError.message, errorType: typedError.code },
         _createdAt: Date.now(),
         _errorCode: typedError.code,
@@ -942,12 +955,16 @@ export class AgentOrchestrator {
     }
 
     let apiKey: string
+    let codexOAuthCredentials: CodexOAuthCredentials | undefined
     try {
-      // ChatGPT (Codex) OAuth 渠道：apiKey 字段存的是加密凭据 JSON，需解析并按需刷新，
-      // 取出可用的 access token 传给 pi runtime；其余渠道直接解密 API Key。
-      apiKey = channel.provider === 'openai-codex'
-        ? await resolveCodexAccessToken(channelId)
-        : decryptApiKey(channelId)
+      // ChatGPT (Codex) OAuth 渠道必须保留完整凭据给 Pi runtime，才能按真实
+      // expires 刷新；其余渠道只需解密 API Key。
+      if (channel.provider === 'openai-codex') {
+        codexOAuthCredentials = await resolveCodexOAuthCredentials(channelId)
+        apiKey = codexOAuthCredentials.access
+      } else {
+        apiKey = decryptApiKey(channelId)
+      }
     } catch (err) {
       if (channel.provider === 'openai-codex') {
         reportPreflightError({
@@ -989,6 +1006,32 @@ export class AgentOrchestrator {
       }
     }
     console.log(`[Agent 编排] Agent runtime: ${agentRuntime}`)
+
+    if (!channel.enabled) {
+      reportPreflightError({
+        code: 'channel_disabled',
+        title: '渠道已禁用',
+        message: '当前会话引用的渠道已被禁用，请在设置中启用渠道或重新选择模型。',
+        actions: [
+          { key: 's', label: '打开渠道设置', action: 'open_channel_settings' },
+        ],
+        canRetry: false,
+      })
+      return
+    }
+
+    if (agentRuntime === 'claude' && !isAgentCompatibleProvider(channel.provider)) {
+      reportPreflightError({
+        code: 'agent_provider_not_supported',
+        title: '渠道不兼容 Claude Core',
+        message: '此渠道使用的不是 Anthropic Messages 协议。请切换到 Pi Core，或在设置中配置 Anthropic 兼容渠道。',
+        actions: [
+          { key: 's', label: '打开渠道设置', action: 'open_channel_settings' },
+        ],
+        canRetry: false,
+      })
+      return
+    }
 
     // 2.1 立即抢占会话槽位（在所有同步检查通过后、第一个 await 之前）
     // 防止 buildSdkEnv 等 await 期间并发调用绕过上方的检查，导致多条重复消息写入 JSONL
@@ -1590,6 +1633,12 @@ export class AgentOrchestrator {
         ...(mentionedSkills?.length ? { skillMentions: mentionedSkills } : {}),
         ...(isCompactCommand ? { compactRequest: true } : {}),
         ...(sessionMeta?.codexFastMode && channel.provider === 'openai-codex' ? { codexFastMode: true } : {}),
+        ...(codexOAuthCredentials && {
+          codexOAuthCredentials,
+          onCodexOAuthCredentialsRefreshed: (credentials: CodexOAuthCredentials) => {
+            persistCodexOAuthCredentials(channelId, credentials)
+          },
+        }),
         ...((channel.provider === 'openai-codex' || channel.provider === 'openai-responses')
           && isOpenAIReasoningSupportedModel(selectedModelId) && {
             openAIThinkingLevel: resolvePiThinkingLevel(appSettings, sessionMeta, channel.provider),
@@ -1608,6 +1657,9 @@ export class AgentOrchestrator {
         },
         onModelResolved: handleModelResolved,
         onContextWindow: handleContextWindow,
+        onRetry: (retry) => {
+          this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'retry', ...retry } })
+        },
       } : {
         agentRuntime: 'claude',
         sessionId,
@@ -1676,6 +1728,10 @@ export class AgentOrchestrator {
       let invisibleRecoveryAttempts = 0
       const canAutoRetry = (attempt: number): boolean =>
         attempt <= MAX_AUTO_RETRIES && retryDelayElapsedMs < MAX_AUTO_RETRY_WAIT_MS
+      // Pi runtime 使用其 session 内的 native retry（agent.continue），能保留已完成的
+      // tool_result；禁止外层以原 prompt 重开 query，但保留 session-not-found 等显式恢复。
+      const canReplayPromptForRetry = (attempt: number): boolean =>
+        agentRuntime !== 'pi' && canAutoRetry(attempt)
 
       const canTryThinkingSignatureRecovery = (attempt: number): boolean =>
         !thinkingSignatureRecoveryAttempted &&
@@ -1903,7 +1959,7 @@ export class AgentOrchestrator {
                 }
 
                 // 判断是否可自动重试
-                if (isAutoRetryableTypedError(typedError) && canAutoRetry(attempt)) {
+                if (isAutoRetryableTypedError(typedError) && canReplayPromptForRetry(attempt)) {
                   lastRetryableError = typedError.title
                     ? `${typedError.title}: ${typedError.message}`
                     : typedError.message
@@ -1932,6 +1988,7 @@ export class AgentOrchestrator {
                     content: [{ type: 'text', text: errorContent }],
                   },
                   parent_tool_use_id: null,
+                  uuid: randomUUID(),
                   _channelModelId: modelId,
                   _channelProvider: channel.provider,
                   error: { message: typedError.message, errorType: typedError.code },
@@ -2051,7 +2108,7 @@ export class AgentOrchestrator {
                 capturedResultSubtype === 'error_during_execution' &&
                 capturedResultErrors?.length &&
                 isAutoRetryableCatchError(null, capturedResultErrors.join('\n')) &&
-                canAutoRetry(attempt)
+                canReplayPromptForRetry(attempt)
               ) {
                 lastRetryableError = capturedResultErrors[0]
                 console.log(`[Agent 编排] 可重试错误 (result error_during_execution, attempt ${attempt}/${MAX_AUTO_RETRIES}): ${lastRetryableError}`)
@@ -2229,7 +2286,7 @@ export class AgentOrchestrator {
           }
 
           // 判断是否可重试
-          if (isAutoRetryableCatchError(apiError, rawErrorMessage, stderrOutput) && canAutoRetry(attempt)) {
+          if (isAutoRetryableCatchError(apiError, rawErrorMessage, stderrOutput) && canReplayPromptForRetry(attempt)) {
             lastRetryableError = apiError
               ? `API Error ${apiError.statusCode}: ${apiError.message}`
               : (error instanceof Error ? error.message : '未知错误')
@@ -2309,6 +2366,7 @@ export class AgentOrchestrator {
                 content: [{ type: 'text', text: errorContent }],
               },
               parent_tool_use_id: null,
+              uuid: randomUUID(),
               error: { message: errorContent, errorType: errorCode },
               _createdAt: Date.now(),
               _errorCode: errorCode,
@@ -2368,6 +2426,7 @@ export class AgentOrchestrator {
             content: [{ type: 'text', text: retryErrorContent }],
           },
           parent_tool_use_id: null,
+          uuid: randomUUID(),
           error: { message: retryErrorContent, errorType: 'unknown_error' },
           _createdAt: Date.now(),
           _errorCode: 'unknown_error',

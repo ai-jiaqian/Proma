@@ -17,7 +17,7 @@ import * as React from 'react'
 import { unstable_batchedUpdates } from 'react-dom'
 import { useAtom, useAtomValue, useSetAtom, useStore } from 'jotai'
 import { toast } from 'sonner'
-import { Box, CornerDownLeft, Square, Settings, Paperclip, FolderPlus, X, Copy, Check, Brain, Sparkles, Eye, ChevronDown } from 'lucide-react'
+import { Box, CornerDownLeft, Square, Settings, Paperclip, FolderPlus, X, Copy, Check, Brain, Sparkles, ChevronDown } from 'lucide-react'
 import { AgentMessages } from './AgentMessages'
 import { AgentHeader } from './AgentHeader'
 import { AgentMessageQueue } from './AgentMessageQueue'
@@ -56,7 +56,6 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { cn } from '@/lib/utils'
-import { nextAgentChannelIdsAfterModelSelect } from '@/lib/agent-channel-selection'
 import { getActiveAccelerator, getAcceleratorDisplay } from '@/lib/shortcut-registry'
 import { registerShortcut } from '@/lib/shortcut-registry'
 import { supportsChannelPlanQuota } from '@/lib/channel-plan-quota'
@@ -104,7 +103,6 @@ import {
   allPendingPermissionRequestsAtom,
   allPendingExitPlanRequestsAtom,
   finalizeStreamingActivities,
-  agentProcessGroupsKeepExpandedAtom,
 } from '@/atoms/agent-atoms'
 import type { AgentContextStatus } from '@/atoms/agent-atoms'
 import { settingsOpenAtom } from '@/atoms/settings-tab'
@@ -170,8 +168,10 @@ function resolveRunContextWindow(
 
 interface SDKMessageRecord {
   type?: string
+  uuid?: string
   parent_tool_use_id?: string | null
   isSynthetic?: boolean
+  error?: unknown
   message?: {
     content?: unknown
   }
@@ -196,6 +196,15 @@ function getUserTextFromSDKMessage(message: SDKMessage): string | null {
     .map((block) => (block as { text: string }).text)
 
   return texts.length > 0 ? texts.join('\n') : null
+}
+
+function removeRetriedErrorSDKMessage(messages: SDKMessage[], errorUuid: string | undefined): SDKMessage[] {
+  if (!errorUuid) return messages
+  const next = messages.filter((message) => {
+    const record = message as unknown as SDKMessageRecord
+    return !(record.type === 'assistant' && record.uuid === errorUuid && record.error !== undefined && record.error !== null)
+  })
+  return next.length === messages.length ? messages : next
 }
 
 function getErrorMessage(error: unknown): string {
@@ -437,75 +446,6 @@ function AgentRuntimeSelector({ runtime, disabled = false, onChange }: AgentRunt
   )
 }
 
-interface DisplayOptionsPopoverProps {
-  processGroupsKeepExpanded: boolean
-  onProcessGroupsKeepExpandedChange: (expanded: boolean) => void
-}
-
-function DisplayOptionsPopover({
-  processGroupsKeepExpanded,
-  onProcessGroupsKeepExpandedChange,
-}: DisplayOptionsPopoverProps): React.ReactElement {
-  const [open, setOpen] = React.useState(false)
-  const hoverTimeout = React.useRef<ReturnType<typeof setTimeout> | null>(null)
-
-  const handleMouseEnter = React.useCallback(() => {
-    if (hoverTimeout.current) clearTimeout(hoverTimeout.current)
-    setOpen(true)
-  }, [])
-
-  const handleMouseLeave = React.useCallback(() => {
-    hoverTimeout.current = setTimeout(() => setOpen(false), 150)
-  }, [])
-
-  React.useEffect(() => {
-    return () => {
-      if (hoverTimeout.current) clearTimeout(hoverTimeout.current)
-    }
-  }, [])
-
-  return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon"
-          className={cn(
-            inputToolbarButtonClass,
-            processGroupsKeepExpanded && inputToolbarActiveButtonClass
-          )}
-          aria-label="显示选项"
-          onMouseEnter={handleMouseEnter}
-          onMouseLeave={handleMouseLeave}
-        >
-          <Eye className="size-5" />
-        </Button>
-      </PopoverTrigger>
-      <PopoverContent
-        side="top"
-        align="center"
-        sideOffset={8}
-        className="w-auto min-w-[190px] p-2 px-2.5"
-        onOpenAutoFocus={(e) => e.preventDefault()}
-        onMouseEnter={handleMouseEnter}
-        onMouseLeave={handleMouseLeave}
-      >
-        <div className="flex flex-col gap-1.5">
-          <div className="flex items-center justify-between gap-4">
-            <span className="text-xs text-foreground/70">输出完保持展开</span>
-            <Switch
-              checked={processGroupsKeepExpanded}
-              onCheckedChange={onProcessGroupsKeepExpandedChange}
-              className="h-4 w-7 [&>span]:size-3 [&>span]:data-[state=checked]:translate-x-3"
-            />
-          </div>
-        </div>
-      </PopoverContent>
-    </Popover>
-  )
-}
-
 export function AgentView({ sessionId }: { sessionId: string }): React.ReactElement {
   const [persistedSDKMessages, setPersistedSDKMessages] = React.useState<SDKMessage[]>([])
   const persistedSDKMessagesRef = React.useRef<SDKMessage[]>([])
@@ -545,7 +485,6 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
   const agentChannelId = sessionMetaChannelId ?? sessionChannelMap.get(sessionId) ?? defaultChannelId
   const agentModelId = sessionMetaModelId ?? sessionModelMap.get(sessionId) ?? defaultModelId
   const agentChannelIds = useAtomValue(agentChannelIdsAtom)
-  const setAgentChannelIds = useSetAtom(agentChannelIdsAtom)
   const [agentRuntime, setAgentRuntime] = useAtom(agentRuntimeAtom)
   const [agentThinking, setAgentThinking] = useAtom(agentThinkingAtom)
   const agentEffort = useAtomValue(agentEffortAtom)
@@ -1838,15 +1777,6 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
       return map
     })
 
-    const updatedChannelIds = nextAgentChannelIdsAfterModelSelect(
-      agentChannelIds,
-      option.channelId,
-      sessionAgentRuntime,
-    )
-    if (updatedChannelIds !== agentChannelIds) {
-      setAgentChannelIds(updatedChannelIds)
-    }
-
     // 同时更新全局默认值（新会话继承）
     setDefaultChannelId(option.channelId)
     setDefaultModelId(option.modelId)
@@ -1855,7 +1785,6 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
     window.electronAPI.updateSettings({
       agentChannelId: option.channelId,
       agentModelId: option.modelId,
-      agentChannelIds: updatedChannelIds,
     }).catch(console.error)
 
     window.electronAPI.updateAgentSessionModel(sessionId, option.channelId, option.modelId)
@@ -1865,7 +1794,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
         )))
       })
       .catch(console.error)
-  }, [sessionId, streaming, backgroundWaiting, setSessionChannelMap, setSessionModelMap, setDefaultChannelId, setDefaultModelId, agentChannelIds, sessionAgentRuntime, setAgentChannelIds, setAgentSessions])
+  }, [sessionId, streaming, backgroundWaiting, setSessionChannelMap, setSessionModelMap, setDefaultChannelId, setDefaultModelId, setAgentSessions])
 
   const handleAgentRuntimeChange = React.useCallback(async (runtime: AgentRuntime): Promise<void> => {
     if (runtime === sessionAgentRuntime) {
@@ -2281,7 +2210,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
   }, [agentError])
 
   /** 重试：在当前会话中重新发送最后一条用户消息 */
-  const handleRetry = React.useCallback((): void => {
+  const handleRetry = React.useCallback((retryOfErrorUuid?: string): void => {
     if (!agentChannelId || streaming) return
 
     // 找到最后一条用户消息
@@ -2290,6 +2219,15 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
       .map(getUserTextFromSDKMessage)
       .find((text): text is string => text !== null)
     if (!lastUserMessage) return
+
+    // 与主进程按 UUID 的原子删除同步更新当前 React 状态和 LRU cache，避免旧错误
+    // 在下一轮回复开始前仍被页面渲染。旧会话没有 UUID 时保留历史，由主进程幂等处理。
+    const messagesAfterCleanup = removeRetriedErrorSDKMessage(persistedSDKMessages, retryOfErrorUuid)
+    if (messagesAfterCleanup !== persistedSDKMessages) {
+      persistedSDKMessagesRef.current = messagesAfterCleanup
+      setPersistedSDKMessages(messagesAfterCleanup)
+      setMessagesCache((prev) => setSessionMessagesCache(prev, sessionId, messagesAfterCleanup))
+    }
 
     // 清除错误状态
     setAgentStreamErrors((prev) => {
@@ -2325,8 +2263,9 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
       workspaceId: currentWorkspaceId || undefined,
       startedAt: streamStartedAt,
       permissionModeOverride: permissionMode,
+      ...(retryOfErrorUuid && { retryOfErrorUuid }),
     }).catch(console.error)
-  }, [persistedSDKMessages, sessionId, agentChannelId, agentModelId, sessionAgentRuntime, agentChannelProvider, currentWorkspaceId, streaming, setAgentStreamErrors, setStreamingStates, permissionMode])
+  }, [persistedSDKMessages, sessionId, agentChannelId, agentModelId, sessionAgentRuntime, agentChannelProvider, currentWorkspaceId, streaming, setAgentStreamErrors, setStreamingStates, setMessagesCache, permissionMode])
 
   /** 在新对话继续：创建新会话 + 切换 tab + 使用 &session 引用旧会话 */
   const handleRetryInNewSession = React.useCallback(async (): Promise<void> => {
@@ -2590,7 +2529,6 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
 
   // ===== 预览面板状态（toggle 快捷键，分屏布局在 MainArea） =====
   const setPreviewOpenMap = useSetAtom(previewPanelOpenMapAtom)
-  const [processGroupsKeepExpanded, setProcessGroupsKeepExpanded] = useAtom(agentProcessGroupsKeepExpandedAtom)
 
   const togglePreviewPanel = React.useCallback(() => {
     setPreviewOpenMap((prev) => {
@@ -2734,15 +2672,6 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
         />
       ),
     },
-    {
-      key: 'display-options',
-      node: (
-        <DisplayOptionsPopover
-          processGroupsKeepExpanded={processGroupsKeepExpanded}
-          onProcessGroupsKeepExpandedChange={setProcessGroupsKeepExpanded}
-        />
-      ),
-    },
   ], [
     agentChannelIds,
     agentChannelId,
@@ -2772,8 +2701,6 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
     contextStatus.isCompacting,
     streaming,
     handleCompact,
-    processGroupsKeepExpanded,
-    setProcessGroupsKeepExpanded,
   ])
 
   const inputTrailingNode = streaming && !hasTextInput ? (

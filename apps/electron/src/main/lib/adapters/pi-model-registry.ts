@@ -5,7 +5,12 @@
  * ProviderType 到 Pi API 协议、baseUrl、认证头和模型 catalog 默认值的映射。
  */
 
-import { extractZhipuCodingTeamApiToken, type ProviderType } from '@proma/shared'
+import {
+  extractZhipuCodingTeamApiToken,
+  inferAgentSdkContextWindow,
+  type CodexOAuthCredentials,
+  type ProviderType,
+} from '@proma/shared'
 import {
   getPromaUserAgent,
   normalizeAnthropicBaseUrlForSdk,
@@ -14,6 +19,7 @@ import {
 } from '@proma/core'
 import type { Api, KnownProvider, Model } from '@earendil-works/pi-ai/compat'
 import type { PiAgentQueryOptions } from './pi-agent-adapter'
+import { supportsPiDeveloperRole } from './pi-provider-compat'
 
 type PiSdk = typeof import('@earendil-works/pi-coding-agent')
 type PiAiCompat = typeof import('@earendil-works/pi-ai/compat')
@@ -33,16 +39,67 @@ interface PiModelDefaults {
 const ZERO_MODEL_COST: PiModelCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
 export const DEFAULT_CONTEXT_WINDOW = 200_000
 const DEFAULT_MAX_TOKENS = 64_000
+const VOLCENGINE_GLM_52_MAX_TOKENS = 128_000
 const CODEX_BASE_URL = 'https://chatgpt.com/backend-api'
 const CODEX_MAX_TOKENS = 128_000
 const CODEX_54_MINI_CONTEXT_WINDOW = 400_000
-const CODEX_56_CONTEXT_WINDOW = 1_050_000
+// ChatGPT Codex OAuth 实际上下文窗口（与 1.05M API 规格不同）：
+// - GPT-5.4 / 5.5：272K
+// - GPT-5.6 系列：372K
+const CODEX_54_55_CONTEXT_WINDOW = 272_000
+const CODEX_56_CONTEXT_WINDOW = 372_000
 const CODEX_THINKING_LEVEL_MAP = { xhigh: 'xhigh', minimal: 'low' } as const
+
+type CodexRuntimeCredential = CodexOAuthCredentials & {
+  type: 'oauth'
+  [key: string]: unknown
+}
+
+function createCodexRuntimeCredentialStore(
+  initial: CodexOAuthCredentials,
+  onRefreshed?: PiAgentQueryOptions['onCodexOAuthCredentialsRefreshed'],
+) {
+  let credential: CodexRuntimeCredential | undefined = { type: 'oauth', ...initial }
+
+  return {
+    async read(providerId: string): Promise<CodexRuntimeCredential | undefined> {
+      return providerId === 'openai-codex' ? credential : undefined
+    },
+    async list(): Promise<readonly { providerId: string; type: 'oauth' }[]> {
+      return credential ? [{ providerId: 'openai-codex', type: 'oauth' }] : []
+    },
+    async modify(
+      providerId: string,
+      fn: (current: CodexRuntimeCredential | undefined) => Promise<CodexRuntimeCredential | undefined>,
+    ): Promise<CodexRuntimeCredential | undefined> {
+      if (providerId !== 'openai-codex') return undefined
+      const previous = credential
+      credential = await fn(credential)
+
+      if (credential && (
+        previous?.access !== credential.access
+        || previous?.refresh !== credential.refresh
+        || previous?.expires !== credential.expires
+        || previous?.accountId !== credential.accountId
+      )) {
+        try {
+          await onRefreshed?.(credential)
+        } catch (error) {
+          console.warn('[Pi Codex OAuth] 刷新后的凭据回写失败，将在下次执行前重试:', error)
+        }
+      }
+      return credential
+    },
+    async delete(providerId: string): Promise<void> {
+      if (providerId === 'openai-codex') credential = undefined
+    },
+  }
+}
 
 const CODEX_MODEL_PATCHES: PiCatalogModelPatch[] = [
   {
     id: 'gpt-5.4',
-    contextWindow: CODEX_56_CONTEXT_WINDOW,
+    contextWindow: CODEX_54_55_CONTEXT_WINDOW,
   },
   {
     id: 'gpt-5.4-mini',
@@ -50,7 +107,7 @@ const CODEX_MODEL_PATCHES: PiCatalogModelPatch[] = [
   },
   {
     id: 'gpt-5.5',
-    contextWindow: CODEX_56_CONTEXT_WINDOW,
+    contextWindow: CODEX_54_55_CONTEXT_WINDOW,
   },
   {
     id: 'gpt-5.6-sol',
@@ -182,12 +239,19 @@ async function findPiCatalogModel(provider: ProviderType, modelId: string): Prom
 
 async function resolvePiModelDefaults(input: PiAgentQueryOptions): Promise<PiModelDefaults> {
   const catalogModel = input.model ? await findPiCatalogModel(input.provider, input.model) : undefined
+  const isVolcengineGlm52 = input.provider === 'doubao' && input.model?.toLowerCase() === 'glm-5.2'
+  const catalogContextWindow = catalogModel?.contextWindow ?? DEFAULT_CONTEXT_WINDOW
+  const inferredContextWindow = inferAgentSdkContextWindow(input.model, input.provider) ?? DEFAULT_CONTEXT_WINDOW
   return {
     reasoning: catalogModel?.reasoning ?? true,
     input: catalogModel ? [...catalogModel.input] : ['text', 'image'],
     cost: catalogModel ? { ...catalogModel.cost } : { ...ZERO_MODEL_COST },
-    contextWindow: catalogModel?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
-    maxTokens: catalogModel?.maxTokens ?? DEFAULT_MAX_TOKENS,
+    // Provider catalogues may omit or under-report newer models; never lower Proma's verified model capability.
+    contextWindow: Math.max(catalogContextWindow, inferredContextWindow),
+    // Pi 的智谱目录将 GLM-5.2 标为 131072，但火山方舟兼容端点上限为 128000。
+    maxTokens: isVolcengineGlm52
+      ? VOLCENGINE_GLM_52_MAX_TOKENS
+      : (catalogModel?.maxTokens ?? DEFAULT_MAX_TOKENS),
   }
 }
 
@@ -205,6 +269,7 @@ function normalizePiBaseUrl(baseUrl: string | undefined, provider: ProviderType)
 export function requiresPromaUserAgent(provider: ProviderType): boolean {
   return provider === 'kimi-coding'
     || provider === 'xiaomi-token-plan'
+    || provider === 'qwen-token-plan'
     || provider === 'zhipu-coding'
     || provider === 'zhipu-coding-team'
 }
@@ -293,18 +358,22 @@ export async function getCodexCatalogModels(): Promise<PiCatalogModel[]> {
  *
  * openai-codex 是 Pi SDK 的内置 KnownProvider：模型目录、baseUrl 和
  * `openai-codex-responses` 协议全部内置，无需（也不能）手工构造 models 或 baseUrl。
- * 只需把 OAuth access token 作为 runtime key 注入到内置 provider 名 `openai-codex`
- * 下，SDK 的 getApiKey 会按 model.provider 解析到它。
- *
- * 注意：这里的 input.apiKey 必须是编排层用 resolveCodexAccessToken 解析并按需
- * 刷新后的 access token，而不是存储的凭据 JSON。
+ * Pi 0.80.10 将它声明为 OAuth-only provider；runtime API key 不会参与其认证解析。
+ * 因此将 Proma 已刷新过的完整凭据放入一次性内存 OAuth credential store，
+ * 按真实 expires 刷新并回写 Proma，避免读写全局 ~/.pi 认证文件。
  */
 async function buildCodexModel(sdk: PiSdk, input: PiAgentQueryOptions) {
-  // Pi 0.80.10 移除了 AuthStorage / ModelRegistry facade，统一由 ModelRuntime
-  // 管理内置模型、临时 API key 与 provider 配置。
-  const modelRuntime = await sdk.ModelRuntime.create({ allowModelNetwork: false })
-  // 内置 codex 模型的 provider 字段即 'openai-codex'，token 必须设在该名下。
-  await modelRuntime.setRuntimeApiKey('openai-codex', input.apiKey)
+  if (!input.codexOAuthCredentials) {
+    throw new Error('ChatGPT (Codex) OAuth 凭据缺失，请重新登录')
+  }
+
+  const modelRuntime = await sdk.ModelRuntime.create({
+    credentials: createCodexRuntimeCredentialStore(
+      input.codexOAuthCredentials,
+      input.onCodexOAuthCredentialsRefreshed,
+    ),
+    allowModelNetwork: false,
+  })
 
   const resolvedModelId = stripAgentSdkContextSuffix(input.model)
   const codexModels = await getCodexCatalogModels()
@@ -355,6 +424,9 @@ export async function buildModel(sdk: PiSdk, input: PiAgentQueryOptions) {
       cost: modelDefaults.cost,
       contextWindow: modelDefaults.contextWindow,
       maxTokens: modelDefaults.maxTokens,
+      ...(supportsPiDeveloperRole(input.provider) ? {} : {
+        compat: { supportsDeveloperRole: false },
+      }),
     }],
   })
   const model = modelRuntime.getModel(providerName, resolvedModelId ?? 'default')

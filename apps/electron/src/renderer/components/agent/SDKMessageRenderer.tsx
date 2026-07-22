@@ -17,10 +17,9 @@ import { useAtomValue, useSetAtom } from 'jotai'
 import { cn } from '@/lib/utils'
 import { ImageLightbox, type LightboxImage } from '@/components/ui/image-lightbox'
 import { ContentBlock } from './ContentBlock'
-import { TaskProgressCard } from './TaskProgressCard'
 import { TurnFileChangesSummary, buildTurnFileNameMap } from './TurnFileChangesSummary'
 import { ProcessBlockGroup, buildAssistantTurnRenderItems, buildCompletedToolResultIds } from './ProcessBlockGroup'
-import { extractToolResultText, parseTaskCreateResult, TASK_TOOL_NAMES } from './task-progress'
+import { extractToolResultText, TASK_TOOL_NAMES } from './task-progress'
 import { normalizeThinkTagsInContentBlocks } from './thinking-tag-parser'
 // 会话转录的纯逻辑(Turn 分组 / 快照去重 / 预览)已下沉到 @proma/session-core 作为唯一真源。
 // 这里 import 供本文件内部使用，并 re-export 以保持既有 `from './SDKMessageRenderer'` 导入方零改动。
@@ -55,7 +54,7 @@ import { formatMessageTime } from '@/components/chat/ChatMessageItem'
 import { getModelLogo, resolveModelDisplayName, resolveModelProvider } from '@/lib/model-logo'
 import { userProfileAtom } from '@/atoms/user-profile'
 import { channelsAtom, modelSelectorOpenAtom } from '@/atoms/chat-atoms'
-import { agentProcessGroupsKeepExpandedAtom, agentSessionPendingFilesAtom } from '@/atoms/agent-atoms'
+import { agentSessionPendingFilesAtom } from '@/atoms/agent-atoms'
 import { agentSessionsAtom } from '@/atoms/agent-atoms'
 import { activeSessionIdAtom } from '@/atoms/tab-atoms'
 import { automationsAtom, automationFormAtom, automationToDraft } from '@/atoms/automation-atoms'
@@ -295,7 +294,7 @@ function AssistantLogo({ model }: { model?: string }): React.ReactElement {
 
 // groupIntoTurns / mergeAdjacentSameModelTurns 已迁移至 @proma/session-core
 
-function buildTaskProgressData(
+export function buildTaskProgressData(
   topLevelBlocks: SDKContentBlock[],
   turnMessages: SDKMessage[],
 ): {
@@ -340,56 +339,38 @@ function buildTaskProgressData(
 }
 
 /**
- * 扫描全部消息，构建跨 turn 的「历史 TaskCreate id → subject」映射。
+ * 提取一个 turn 中直接属于当前 Agent 的任务工具活动。
  *
- * 早期把这部分逻辑放在 buildTaskProgressData 里，每个 AssistantTurnRenderer 渲染都要
- * 跑一次 → O(T × M)；流式期间 allMessages 引用每帧变化，useMemo 缓存失效，长会话
- * 雪崩。提升到 AgentMessages 顶层后只算一次，O(M)。
+ * Task/Agent 容器内的子 Agent 工具不会进入父会话的浮动进度，避免跨执行单元串扰。
  */
-export function buildHistoricalTaskSubjects(allMessages: SDKMessage[]): Map<string, string> {
-  const historicalTaskSubjects = new Map<string, string>()
-  const globalResultMap = new Map<string, string>()
-  const pendingTaskCreates: SDKToolUseBlock[] = []
+export function buildTaskProgressDataForTurn(turn: AssistantTurn): { taskActivities: ToolActivity[] } {
+  const enrichedBlocks: Array<{ block: SDKContentBlock; parentToolUseId?: string | null }> = []
 
-  for (const msg of allMessages) {
-    if (msg.type === 'user') {
-      const userMsg = msg as SDKUserMessage
-      const blocks = userMsg.message?.content
-      if (!Array.isArray(blocks)) continue
-      for (const b of blocks) {
-        if (b.type === 'tool_result') {
-          const rb = b as SDKToolResultBlock
-          const text = extractToolResultForTask(userMsg, rb)
-          if (text) globalResultMap.set(rb.tool_use_id, text)
-        }
-      }
-    } else if (msg.type === 'assistant') {
-      const aMsg = msg as SDKAssistantMessage
-      const blocks = aMsg.message?.content
-      if (!Array.isArray(blocks)) continue
-      for (const b of blocks) {
-        if (b.type === 'tool_use' && (b as SDKToolUseBlock).name === 'TaskCreate') {
-          pendingTaskCreates.push(b as SDKToolUseBlock)
-        }
+  for (const message of turn.assistantMessages) {
+    const blocks = message.message?.content
+    if (!Array.isArray(blocks)) continue
+    for (const block of blocks) {
+      for (const normalizedBlock of normalizeThinkTagsInContentBlocks([block])) {
+        enrichedBlocks.push({ block: normalizedBlock, parentToolUseId: message.parent_tool_use_id })
       }
     }
   }
 
-  for (const tb of pendingTaskCreates) {
-    const input = tb.input as Record<string, unknown>
-    const subject = typeof input.subject === 'string'
-      ? input.subject
-      : typeof input.description === 'string'
-        ? input.description
-        : undefined
-    if (!subject) continue
-    const resultText = globalResultMap.get(tb.id)
-    const parsedResult = parseTaskCreateResult(resultText)
-    if (parsedResult?.id) historicalTaskSubjects.set(parsedResult.id, parsedResult.subject ?? subject)
+  const agentToolIds = new Set<string>()
+  for (const { block } of enrichedBlocks) {
+    if (block.type !== 'tool_use') continue
+    const tool = block as { name: string; id: string }
+    if (tool.name === 'Agent' || tool.name === 'Task') agentToolIds.add(tool.id)
   }
 
-  return historicalTaskSubjects
+  const topLevelBlocks = enrichedBlocks
+    .filter(({ parentToolUseId }) => !parentToolUseId || !agentToolIds.has(parentToolUseId))
+    .map(({ block }) => block)
+
+  const { taskActivities } = buildTaskProgressData(topLevelBlocks, turn.turnMessages)
+  return { taskActivities }
 }
+
 
 // ===== AssistantTurnRenderer — 渲染一个完整的 assistant turn =====
 
@@ -397,15 +378,13 @@ export interface AssistantTurnRendererProps {
   turn: AssistantTurn
   /** 所有消息（全局，供工具结果查找跨 turn 的结果） */
   allMessages: SDKMessage[]
-  /** 跨 turn 历史 TaskCreate id → subject 映射（由父组件 useMemo 算一次后传入） */
-  historicalTaskSubjects: Map<string, string>
   basePath?: string
   /** 分叉回调（传入最后一条 assistant 消息的 uuid） */
   onFork?: (upToMessageUuid: string) => void
   /** 回退回调（传入 assistant message uuid） */
   onRewind?: (assistantMessageUuid: string) => void
-  /** 错误重试回调（仅当 turn 含错误消息时使用） */
-  onRetry?: () => void
+  /** 错误重试回调（传入本轮开始前应删除的错误 UUID） */
+  onRetry?: (errorUuid?: string) => void
   /** 在新会话中重试回调（仅当 turn 含错误消息时使用） */
   onRetryInNewSession?: () => void
   /** 压缩上下文回调（仅 prompt_too_long 错误使用） */
@@ -418,9 +397,8 @@ export interface AssistantTurnRendererProps {
   sessionModelId?: string
 }
 
-export function AssistantTurnRenderer({ turn, allMessages, historicalTaskSubjects, basePath, onFork, onRewind, onRetry, onRetryInNewSession, onCompact, isStreaming, stoppedByUser, sessionModelId }: AssistantTurnRendererProps): React.ReactElement | null {
+export function AssistantTurnRenderer({ turn, allMessages, basePath, onFork, onRewind, onRetry, onRetryInNewSession, onCompact, isStreaming, stoppedByUser, sessionModelId }: AssistantTurnRendererProps): React.ReactElement | null {
   const channels = useAtomValue(channelsAtom)
-  const processGroupsKeepExpanded = useAtomValue(agentProcessGroupsKeepExpandedAtom)
   // 收集所有 assistant 消息的内容块，保留 parent_tool_use_id 关联
   interface EnrichedBlock {
     block: SDKContentBlock
@@ -432,10 +410,17 @@ export function AssistantTurnRenderer({ turn, allMessages, historicalTaskSubject
   let errorContent: SDKAssistantMessage | null = null
 
   for (const aMsg of turn.assistantMessages) {
+    const msgAny = aMsg as unknown as Record<string, unknown>
+    // 区分两种错误消息：
+    // 1. Orchestrator 造的纯错误消息（带 _errorCode）：content 里的 text 就是错误摘要，不当正文渲染
+    // 2. Pi 混合消息（只带 error、无 _errorCode）：provider 已吐完正文后收尾报错，content 是真正的 assistant 正文
+    const isPureErrorSummary = typeof msgAny._errorCode === 'string'
     if (aMsg.error) {
       hasError = true
       errorContent = aMsg
-      continue
+      // 纯错误消息的 content 不当正文渲染（避免错误摘要重复出现两次）
+      if (isPureErrorSummary) continue
+      // Pi 混合消息：继续向下把 content 收集进 enrichedBlocks，保留真正的助手正文
     }
     const blocks = aMsg.message?.content
     if (Array.isArray(blocks)) {
@@ -483,10 +468,6 @@ export function AssistantTurnRenderer({ turn, allMessages, historicalTaskSubject
     (b) => b.type === 'text' && 'text' in b && !!(b as { text: string }).text
   )
 
-  // Task 聚合数据（useMemo 防止每次渲染重算）
-  const { taskActivities, firstTaskIndex } = React.useMemo(() => {
-    return buildTaskProgressData(topLevelBlocks, turn.turnMessages)
-  }, [topLevelBlocks, turn.turnMessages])
   const completedToolResultIds = React.useMemo(() => {
     return buildCompletedToolResultIds(turn.turnMessages)
   }, [turn.turnMessages])
@@ -519,18 +500,8 @@ export function AssistantTurnRenderer({ turn, allMessages, historicalTaskSubject
   if (enrichedBlocks.length === 0 && !hasError) return null
 
   const renderTopLevelBlock = (block: SDKContentBlock, i: number): React.ReactNode => {
-    // Task 工具块：聚合为卡片，此处用索引定位首个任务工具
+    // 任务进度由底部浮层统一呈现，输出记录不再重复显示任务卡。
     if (block.type === 'tool_use' && TASK_TOOL_NAMES.has((block as SDKToolUseBlock).name)) {
-      if (i === firstTaskIndex) {
-        return (
-          <TaskProgressCard
-            key="task-progress-card"
-            activities={taskActivities}
-            streamEnded={!isStreaming}
-            historicalTaskSubjects={historicalTaskSubjects}
-          />
-        )
-      }
       return null
     }
 
@@ -581,7 +552,6 @@ export function AssistantTurnRenderer({ turn, allMessages, historicalTaskSubject
                 key={`process-${firstIndex}`}
                 blocks={groupBlocks}
                 isStreaming={isStreaming}
-                keepExpandedAfterComplete={processGroupsKeepExpanded}
                 isMessageTail={itemIndex === renderItems.length - 1}
               >
                 {item.items.map((groupItem) => renderProcessGroupBlock(groupItem.block, groupItem.index))}
@@ -589,13 +559,14 @@ export function AssistantTurnRenderer({ turn, allMessages, historicalTaskSubject
             )
           })}
         </div>
-        {/* 如果有错误但也有内容块，在末尾显示错误 */}
+        {/* 如果有错误但也有内容块，在末尾以 tail 形式挂错误横幅附错误提示 + 重试按钮，保留正文本身的 markdown 排版 */}
         {hasError && errorContent && topLevelBlocks.length > 0 && (
-          <div className="mt-3 text-sm text-destructive">
-            {isThinkingSignatureError(errorContent.error?.message)
-              ? `${THINKING_SIGNATURE_ERROR_TITLE}：${THINKING_SIGNATURE_ERROR_MESSAGE}`
-              : (errorContent.error?.message ?? '未知错误')}
-          </div>
+          <AssistantErrorTail
+            message={errorContent}
+            onRetry={onRetry}
+            onRetryInNewSession={onRetryInNewSession}
+            onCompact={onCompact}
+          />
         )}
         </TurnFileMapProvider>
       </MessageContent>
@@ -664,15 +635,30 @@ export function SDKMessageRenderer({
     // 跳过重放消息
     if (aMsg.isReplay) return null
 
-    // 错误消息
+    // 错误消息分发：
+    // - Orchestrator 造的纯错误消息（带 _errorCode）：直接走 ErrorMessage 组件
+    // - Pi 混合消息（只带 error、无 _errorCode）：走下方正常渲染 + 末尾挂 tail
+    //   与 AssistantTurnRenderer 对齐：不检查 hasRenderableContent，有 blocks 就正常渲染正文，
+    //   没有 blocks 才回退到 ErrorMessage
     if (aMsg.error) {
-      return <ErrorMessage message={aMsg} />
+      const msgAny = aMsg as unknown as Record<string, unknown>
+      const isPureErrorSummary = typeof msgAny._errorCode === 'string'
+      if (isPureErrorSummary) {
+        return <ErrorMessage message={aMsg} />
+      }
+      // Pi 混合消息：下面按正常路径收集 content blocks，末尾挂 AssistantErrorTail
     }
 
     const rawBlocks = aMsg.message?.content
-    if (!Array.isArray(rawBlocks) || rawBlocks.length === 0) return null
+    if (!Array.isArray(rawBlocks) || rawBlocks.length === 0) {
+      if (aMsg.error) return <ErrorMessage message={aMsg} />
+      return null
+    }
     const blocks = normalizeThinkTagsInContentBlocks(rawBlocks)
-    if (blocks.length === 0) return null
+    if (blocks.length === 0) {
+      if (aMsg.error) return <ErrorMessage message={aMsg} />
+      return null
+    }
 
     const model = aMsg._channelModelId || aMsg.message?.model || sessionModelId
     const meta = extractMeta(message)
@@ -704,6 +690,10 @@ export function SDKMessageRenderer({
               />
             ))}
           </div>
+          {/* Pi runtime 下「provider 已吐正文 + 收尾报错」的混合消息：末尾挂错误横幅 */}
+          {aMsg.error && (
+            <AssistantErrorTail message={aMsg} />
+          )}
         </MessageContent>
       </Message>
     )
@@ -1058,15 +1048,46 @@ function UserInputMessage({ message }: { message: SDKUserMessage }): React.React
 interface ErrorMessageProps {
   message: SDKAssistantMessage
   /** 重试回调（在当前会话内重试） */
-  onRetry?: () => void
+  onRetry?: (errorUuid?: string) => void
   /** 在新会话中重试回调（创建新会话并引用当前会话继续） */
   onRetryInNewSession?: () => void
   /** 压缩上下文回调（仅 prompt_too_long 错误使用） */
   onCompact?: () => void
 }
 
-function ErrorMessage({ message, onRetry, onRetryInNewSession, onCompact }: ErrorMessageProps): React.ReactElement {
-  const meta = extractMeta(message as unknown as SDKMessage)
+interface AssistantErrorTailProps {
+  message: SDKAssistantMessage
+  /** 重试回调（在当前会话内重试） */
+  onRetry?: (errorUuid?: string) => void
+  /** 在新会话中重试回调（创建新会话并引用当前会话继续） */
+  onRetryInNewSession?: () => void
+  /** 压缩上下文回调（仅 prompt_too_long 错误使用） */
+  onCompact?: () => void
+  /**
+   * 以「独立错误消息」形式渲染：正文用红色 MessageResponse 展示（用于 ErrorMessage 主体）。
+   *
+   * 以 tail 形式（默认 false）渲染时：正文本身已在上层用普通 MessageResponse 展示，这里只输出
+   * 错误标题 + 简短描述 + 诊断详情 + recovery 按钮，附一条分隔线。
+   */
+  standalone?: boolean
+}
+
+/**
+ * 助手消息的错误尾部（诊断详情 + recovery 按钮 + 简短错误描述）。
+ *
+ * 抽出这个组件是为了让「Pi runtime 已经吐了正文，但收尾时上游报错」这种混合消息
+ * 也能保留正文的 markdown 排版，同时把错误提示以尾部 banner 形式挂在最下面。
+ *
+ * standalone=true 时兼容旧 ErrorMessage 的行为：把 error.message / content 里的所有 text
+ * 一并作为红色 MessageResponse 渲染出来，用于「没有正文，只有错误」的场景。
+ */
+export function AssistantErrorTail({
+  message,
+  onRetry,
+  onRetryInNewSession,
+  onCompact,
+  standalone = false,
+}: AssistantErrorTailProps): React.ReactElement | null {
   const errorText = message.error?.message ?? '未知错误'
 
   const msgAny = message as unknown as Record<string, unknown>
@@ -1086,14 +1107,18 @@ function ErrorMessage({ message, onRetry, onRetryInNewSession, onCompact }: Erro
   const setModelSelectorOpen = useSetAtom(modelSelectorOpenAtom)
   const [detailsOpen, setDetailsOpen] = React.useState(false)
 
-  const contentText = message.message?.content
-    ?.filter((b) => b.type === 'text' && 'text' in b)
-    .map((b) => (b as { text: string }).text)
-    .join('\n') ?? errorText
+  // standalone 模式（纯错误消息）：把 content 里所有 text 用双换行拼起来一并渲染，保留 markdown 段落结构。
+  // tail 模式（混合消息）：正文已由上层渲染，这里只用 error.message 作为简短提示。
+  const bodyText = standalone
+    ? (message.message?.content
+        ?.filter((b) => b.type === 'text' && 'text' in b)
+        .map((b) => (b as { text: string }).text)
+        .join('\n\n') || errorText)
+    : errorText
   const isThinkingSignature = errorCode === THINKING_SIGNATURE_ERROR_CODE ||
-    isThinkingSignatureError(contentText, errorText)
+    isThinkingSignatureError(bodyText, errorText)
   const displayTitle = errorTitle ?? (isThinkingSignature ? THINKING_SIGNATURE_ERROR_TITLE : undefined)
-  const displayContentText = isThinkingSignature ? THINKING_SIGNATURE_ERROR_MESSAGE : contentText
+  const displayContentText = isThinkingSignature ? THINKING_SIGNATURE_ERROR_MESSAGE : bodyText
   const displayedErrorActions = (errorActions ?? []).filter((action) => {
     if (action.action === 'retry' && !onRetry) return false
     if (action.action === 'compact' && !onCompact) return false
@@ -1122,7 +1147,7 @@ function ErrorMessage({ message, onRetry, onRetryInNewSession, onCompact }: Erro
         }
         break
       case 'retry':
-        onRetry?.()
+        onRetry?.(typeof message.uuid === 'string' ? message.uuid : undefined)
         break
       case 'compact':
         onCompact?.()
@@ -1161,6 +1186,110 @@ function ErrorMessage({ message, onRetry, onRetryInNewSession, onCompact }: Erro
   const hasLegacyActions = !!(onRetry || onRetryInNewSession || (isPromptTooLong && onCompact))
   const hasActions = hasStructuredActions || hasLegacyActions
 
+  // tail 模式：给出上边距 + 顶部细边分隔线，让它视觉上是「正文之后的一段警告」而不是「消息本身」
+  const rootClass = standalone
+    ? undefined
+    : 'mt-3 pt-3 border-t border-destructive/20'
+
+  return (
+    <div className={rootClass}>
+      {displayTitle && (
+        <div className="text-sm font-medium text-destructive mb-1 flex items-center gap-1.5">
+          {!standalone && <AlertTriangle size={14} className="shrink-0" />}
+          {displayTitle}
+        </div>
+      )}
+      {standalone ? (
+        <div className="text-destructive">
+          <MessageResponse>{displayContentText}</MessageResponse>
+        </div>
+      ) : (
+        displayContentText && (
+          <div className="text-sm text-destructive/90 whitespace-pre-wrap break-words">
+            {displayContentText}
+          </div>
+        )
+      )}
+      {errorDetails && errorDetails.length > 0 && (
+        <div className="mt-2 text-[11px] text-muted-foreground">
+          <button
+            type="button"
+            onClick={() => setDetailsOpen((v) => !v)}
+            className="underline-offset-2 hover:underline"
+          >
+            {detailsOpen ? '收起诊断详情' : '查看诊断详情'}
+          </button>
+          {detailsOpen && (
+            <ul className="mt-1.5 space-y-0.5 list-disc list-inside">
+              {errorDetails.map((d, i) => (
+                <li key={i}>{d}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+      {hasActions && (
+        <div className="flex items-center flex-wrap gap-2 mt-3">
+          {hasStructuredActions &&
+            displayedErrorActions.map((a, i) => (
+              <Button
+                key={`${a.action}-${i}`}
+                size="sm"
+                variant={i === 0 ? 'default' : 'outline'}
+                onClick={() => handleRecoveryAction(a)}
+              >
+                {iconForAction(a.action)}
+                {a.label}
+              </Button>
+            ))}
+          {!hasStructuredActions && isPromptTooLong && onCompact && (
+            <Button size="sm" onClick={onCompact}>
+              <Minimize2 className="size-3.5 mr-1.5" />
+              压缩上下文
+            </Button>
+          )}
+          {!hasStructuredActions && isThinkingSignature && onRetryInNewSession && (
+            <Button
+              size="sm"
+              onClick={onRetryInNewSession}
+              title="新建对话并引用当前会话继续"
+            >
+              <Plus className="size-3.5 mr-1.5" />
+              在新对话继续
+            </Button>
+          )}
+          {!hasStructuredActions && onRetry && (
+            <Button size="sm" variant={isPromptTooLong || isThinkingSignature ? 'outline' : 'default'} onClick={() => onRetry(typeof message.uuid === 'string' ? message.uuid : undefined)}>
+              <RotateCw className="size-3.5 mr-1.5" />
+              重试
+            </Button>
+          )}
+          {!hasStructuredActions && !isThinkingSignature && onRetryInNewSession && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={onRetryInNewSession}
+              title="如遇到未知错误，可点此按钮在新会话中尝试解决"
+            >
+              <Plus className="size-3.5 mr-1.5" />
+              在新会话中重试
+            </Button>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ErrorMessage({ message, onRetry, onRetryInNewSession, onCompact }: ErrorMessageProps): React.ReactElement {
+  const meta = extractMeta(message as unknown as SDKMessage)
+
+  // 复用 AssistantErrorTail 的正文/详情/按钮逻辑，只在这里补上「独立错误消息」的 Message 外壳。
+  const copyText = message.message?.content
+    ?.filter((b) => b.type === 'text' && 'text' in b)
+    .map((b) => (b as { text: string }).text)
+    .join('\n\n') || (message.error?.message ?? '未知错误')
+
   return (
     <Message from="assistant">
       <MessageHeader
@@ -1173,82 +1302,16 @@ function ErrorMessage({ message, onRetry, onRetryInNewSession, onCompact }: Erro
         }
       />
       <MessageContent>
-        {displayTitle && (
-          <div className="text-sm font-medium text-destructive mb-1">{displayTitle}</div>
-        )}
-        <div className="text-destructive">
-          <MessageResponse>{displayContentText}</MessageResponse>
-        </div>
-        {errorDetails && errorDetails.length > 0 && (
-          <div className="mt-2 text-[11px] text-muted-foreground">
-            <button
-              type="button"
-              onClick={() => setDetailsOpen((v) => !v)}
-              className="underline-offset-2 hover:underline"
-            >
-              {detailsOpen ? '收起诊断详情' : '查看诊断详情'}
-            </button>
-            {detailsOpen && (
-              <ul className="mt-1.5 space-y-0.5 list-disc list-inside">
-                {errorDetails.map((d, i) => (
-                  <li key={i}>{d}</li>
-                ))}
-              </ul>
-            )}
-          </div>
-        )}
-        {hasActions && (
-          <div className="flex items-center flex-wrap gap-2 mt-3">
-            {hasStructuredActions &&
-              displayedErrorActions.map((a, i) => (
-                <Button
-                  key={`${a.action}-${i}`}
-                  size="sm"
-                  variant={i === 0 ? 'default' : 'outline'}
-                  onClick={() => handleRecoveryAction(a)}
-                >
-                  {iconForAction(a.action)}
-                  {a.label}
-                </Button>
-              ))}
-            {!hasStructuredActions && isPromptTooLong && onCompact && (
-              <Button size="sm" onClick={onCompact}>
-                <Minimize2 className="size-3.5 mr-1.5" />
-                压缩上下文
-              </Button>
-            )}
-            {!hasStructuredActions && isThinkingSignature && onRetryInNewSession && (
-              <Button
-                size="sm"
-                onClick={onRetryInNewSession}
-                title="新建对话并引用当前会话继续"
-              >
-                <Plus className="size-3.5 mr-1.5" />
-                在新对话继续
-              </Button>
-            )}
-            {!hasStructuredActions && onRetry && (
-              <Button size="sm" variant={isPromptTooLong || isThinkingSignature ? 'outline' : 'default'} onClick={onRetry}>
-                <RotateCw className="size-3.5 mr-1.5" />
-                重试
-              </Button>
-            )}
-            {!hasStructuredActions && !isThinkingSignature && onRetryInNewSession && (
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={onRetryInNewSession}
-                title="如遇到未知错误，可点此按钮在新会话中尝试解决"
-              >
-                <Plus className="size-3.5 mr-1.5" />
-                在新会话中重试
-              </Button>
-            )}
-          </div>
-        )}
+        <AssistantErrorTail
+          message={message}
+          onRetry={onRetry}
+          onRetryInNewSession={onRetryInNewSession}
+          onCompact={onCompact}
+          standalone
+        />
       </MessageContent>
       <MessageActions className="pl-[46px] mt-0.5">
-        <CopyButton content={displayContentText} />
+        <CopyButton content={copyText} />
       </MessageActions>
     </Message>
   )
@@ -1259,13 +1322,11 @@ function ErrorMessage({ message, onRetry, onRetryInNewSession, onCompact }: Erro
 export interface MessageGroupRendererProps {
   group: MessageGroup
   allMessages: SDKMessage[]
-  /** 跨 turn 历史 TaskCreate id → subject 映射（由父组件 useMemo 算一次后传入） */
-  historicalTaskSubjects: Map<string, string>
   basePath?: string
   onFork?: (upToMessageUuid: string) => void
   onRewind?: (assistantMessageUuid: string) => void
-  /** 错误重试回调（仅当 turn 含错误消息时使用） */
-  onRetry?: () => void
+  /** 错误重试回调（传入本轮开始前应删除的错误 UUID） */
+  onRetry?: (errorUuid?: string) => void
   /** 在新会话中重试回调（仅当 turn 含错误消息时使用） */
   onRetryInNewSession?: () => void
   /** 压缩上下文回调（仅 prompt_too_long 错误使用） */
@@ -1324,7 +1385,7 @@ export function getGroupId(group: MessageGroup): string {
 
 // getGroupPreview 已迁移至 @proma/session-core（本文件从该包 import 并 re-export）
 
-export function MessageGroupRenderer({ group, allMessages, historicalTaskSubjects, basePath, onFork, onRewind, onRetry, onRetryInNewSession, onCompact, isStreaming, stoppedByUser, sessionModelId }: MessageGroupRendererProps): React.ReactElement | null {
+export function MessageGroupRenderer({ group, allMessages, basePath, onFork, onRewind, onRetry, onRetryInNewSession, onCompact, isStreaming, stoppedByUser, sessionModelId }: MessageGroupRendererProps): React.ReactElement | null {
   const groupId = getGroupId(group)
 
   if (group.type === 'user') {
@@ -1348,7 +1409,6 @@ export function MessageGroupRenderer({ group, allMessages, historicalTaskSubject
       <AssistantTurnRenderer
         turn={group}
         allMessages={allMessages}
-        historicalTaskSubjects={historicalTaskSubjects}
         basePath={basePath}
         onFork={onFork}
         onRewind={onRewind}

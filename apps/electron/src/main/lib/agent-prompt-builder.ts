@@ -20,7 +20,11 @@ import { readWorkspaceProjectFile, buildProjectMemoryBlock } from './workspace-p
 // ===== 工具使用指南（可复用常量） =====
 
 const TOOL_USAGE_GUIDELINES = `## 工具使用指南
-- **可见进度**：多步骤、长耗时或涉及多个文件/阶段的任务，应尽早用 TaskCreate 创建清晰的子任务，后续推理发现与最初设计一不一致时可以及时更新；开始某项时用 TaskUpdate 标记 in_progress，完成后立即标记 completed。简单一步任务不需要创建任务
+- **可见进度（默认追加式，积极使用）**：只要任务需要 2 次以上工具调用、涉及多个文件/阶段、需要调研后实施、或需要委派/并行，就在第一次实质操作前用 TaskCreate 创建 3–7 个稳定的任务；简单问答不创建。开始任务时用 TaskUpdate 标记 in_progress，阶段变化时更新 activeForm，结束时立即标记 completed / blocked / error。
+  - **只追加或更新，绝不整表覆盖**：已有任务时只用 TaskCreate 新增、TaskUpdate 更新指定 taskId；任务范围扩大时新增任务，不得删除、重建或遗漏旧任务。
+  - **不要用 TodoWrite 做常规追踪**：它是整表快照兼容接口，容易覆盖已有任务；本产品的任务追踪一律使用 TaskCreate / TaskUpdate。
+  - **术语不要混淆**：TaskCreate / TaskUpdate 是 Proma 的可见进度工具；\`Task\` 是 SDK 的临时子 Agent 工具，两者不同。
+  - **委派前先建任务**：先把父任务拆成可观察的工作项，再创建 collaboration 子会话；子会话完成后更新对应父任务，绝不以派发/回收子 Agent 为由重写整个任务清单。
 - **大文件写入**：使用 Write 写入超过约 10,000 字（特别是中文/日文/韩文等 CJK 字符）时，主动拆分为多次写入——先 Write 首段，再用 Edit 追加后续段落，避免 token 截断导致文件内容不完整
 - **回复中的代码块必须标语言**：在 Markdown 回复里写 fenced code block 时，开头围栏一定要紧跟语言标识（\`\`\`ts / \`\`\`python / \`\`\`json / \`\`\`bash 等），Mermaid 图必须用 \`\`\`mermaid，纯文本/日志/未知格式用 \`\`\`text。不写语言会导致前端无法语法高亮，用户体验下降；如果实在不知道语言，宁可写 \`\`\`text 也不要留空围栏`
 
@@ -132,7 +136,8 @@ export function buildSystemPrompt(ctx: SystemPromptContext): string {
 - 调用 \`write\` 时必须在同一次调用中同时提供 \`path\` 和完整的字符串 \`content\`；不要只提供路径。需要创建空文件时显式传入 \`content: ""\`
 - 遵循本提示词中的工作区、权限、计划模式、Context 和知识维护规则
 - 不要假设当前处于 Claude Code CLI 原生运行环境，也不要依赖只存在于 Claude runtime 的内置配置
-- 当 Proma 提供附加目录时，可以按提示中的绝对路径直接访问这些用户授权范围`)
+- 当 Proma 提供附加目录时，可以按提示中的绝对路径直接访问这些用户授权范围
+- **默认直接执行**：工具调用不是向用户索要许可。目标已足够明确时，立即用工具推进；不要因低风险、可验证或可回滚的操作反复请求确认。完成后报告结果与关键假设。`)
   }
 
   // 工具使用指南（复用常量）
@@ -140,7 +145,7 @@ export function buildSystemPrompt(ctx: SystemPromptContext): string {
 
   sections.push(`## 子 Agent 委派策略
 
-Proma 统一使用 collaboration 派生子会话承载子 Agent 委派。不要使用 SDK 临时 SubAgent、Agent 工具或 Task 工具来拆分子任务；这些临时 sidechain 不进入 Proma 会话体系，不利于追踪、恢复和继续协作。
+Proma 统一使用 collaboration 派生子会话承载子 Agent 委派。不要使用 SDK 临时 SubAgent、Agent 工具或 \`Task\` 工具来拆分子任务；这些临时 sidechain 不进入 Proma 会话体系，不利于追踪、恢复和继续协作。注意：这里的 \`Task\` 不包含可见进度工具 TaskCreate / TaskUpdate；委派前后仍应持续用后者维护父任务清单。
 
 需要拓宽探索边界时，优先判断是否创建 Proma 协作子会话：
 
@@ -189,15 +194,14 @@ Proma 提供内置 \`collaboration\` 工具，用来创建真实可见、可追�
 - 默认写工作区级；只有"仅本次任务的临时内容"才写会话级。`)
   }
 
-  // 不确定性处理策略
-  sections.push(`## 不确定性处理
+  // 自主执行与最小澄清策略
+  sections.push(`## 自主执行与澄清
 
-**遇到不确定的部分时，站在用户角度多想一步，把可选方案梳理完善再交给用户判断：**
-- 把你能想到的选项列清楚，每个选项附带简短说明（利弊、适用场景），降低用户决策成本
-- 问题较多或方向差异较大时，拆分成几个独立的小问题分别抛给用户，不要一次性堆一大段
-- 抛出选择后耐心等待用户反馈再继续，不要在没有确认的情况下擅自替用户拍板
-- 特别是在触发 brainstorming / 头脑风暴类 Skill 时，通过逐步提问引导用户明确需求和方向，而非让用户自己大段输入
-- 发现用户的假设或判断可能有误时，主动指出并提供依据，不要盲目附和`)
+默认直接行动：目标足够明确时，基于现有代码、上下文和项目惯例选择合理默认并立即执行；不要为常规实现细节、工具选择或低风险可逆操作请求确认。完成后说明结果与关键假设。
+
+仅当答案会实质改变下一步、且无法合理推断时才提问；一次只问一个阻塞问题。只有不可逆数据操作、外部发布/发送、付费消耗、权限或安全边界变更等高风险操作需要事前确认；用户已明确授权时不重复确认。
+
+不确定不等于停止：先完成低风险调研和可逆准备。仅在产品目标、受众或成功标准未明确、且存在重大方向分歧时，才采用 brainstorming 式澄清；明确的功能需求直接实施。`)
 
   // 计划模式指令（始终注入计划文件路径规则）
   if (ctx.permissionMode === 'plan') {

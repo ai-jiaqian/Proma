@@ -20,6 +20,7 @@ import type {
   ChannelModel,
   ChannelPlanQuotaResult,
   ChannelPlanQuotaWindow,
+  CodexOAuthCredentials,
   FetchModelsInput,
   FetchModelsResult,
   ProviderType,
@@ -69,6 +70,11 @@ const XIAOMI_PRESET_MODELS: ChannelModel[] = [
   { id: 'mimo-v2.5', name: 'MiMo V2.5', enabled: true },
   { id: 'mimo-v2-omni', name: 'MiMo V2 Omni', enabled: true },
   { id: 'mimo-v2-flash', name: 'MiMo V2 Flash', enabled: true },
+]
+const QWEN_TOKEN_PLAN_PRESET_MODELS: ChannelModel[] = [
+  { id: 'qwen3.8-max-preview', name: 'Qwen3.8 Max Preview', enabled: true },
+  { id: 'qwen3.7-max', name: 'Qwen3.7 Max', enabled: true },
+  { id: 'qwen3.6-flash', name: 'Qwen3.6 Flash', enabled: true },
 ]
 const ARK_CODING_PLAN_MODELS: ChannelModel[] = [
   { id: 'doubao-seed-2.0-code', name: 'Doubao Seed 2.0 Code', enabled: true },
@@ -124,6 +130,12 @@ function resolveXiaomiTestModelId(modelId?: string, models?: ChannelModel[]): st
   return resolveFirstTestModelId(models) ?? XIAOMI_PRESET_MODELS[0]!.id
 }
 
+function resolveQwenTokenPlanTestModelId(modelId?: string, models?: ChannelModel[]): string {
+  const explicitModelId = modelId?.trim()
+  if (explicitModelId) return explicitModelId
+  return resolveFirstTestModelId(models) ?? QWEN_TOKEN_PLAN_PRESET_MODELS[0]!.id
+}
+
 function resolveDeepSeekModelsUrl(baseUrl: string): string {
   return `${new URL(baseUrl.trim()).origin}/models`
 }
@@ -136,6 +148,9 @@ function resolveKimiModelsUrl(baseUrl: string): string {
 function inferProviderFromBaseUrl(provider: ProviderType, baseUrl: string): ProviderType {
   try {
     const hostname = new URL(baseUrl.trim()).hostname
+    if (hostname === 'token-plan.cn-beijing.maas.aliyuncs.com') {
+      return 'qwen-token-plan'
+    }
     if (hostname.startsWith('token-plan-') && hostname.endsWith('.xiaomimimo.com')) {
       return 'xiaomi-token-plan'
     }
@@ -417,19 +432,28 @@ export function decryptApiKey(channelId: string): string {
  * 只有一次刷新在飞行，其余调用复用同一 Promise。对应 memory 里记过的
  * 「OAuth 刷新需并发锁」经验。
  */
-const inflightCodexRefresh = new Map<string, Promise<string>>()
+const inflightCodexRefresh = new Map<string, Promise<CodexOAuthCredentials>>()
+
+/** 保存 Pi 或 Proma 刷新后的完整 Codex OAuth 凭据。 */
+export function persistCodexOAuthCredentials(channelId: string, credentials: CodexOAuthCredentials): void {
+  const channel = getChannelById(channelId)
+  if (!channel || channel.provider !== 'openai-codex') {
+    throw new Error(`Codex 渠道不存在或类型不匹配: ${channelId}`)
+  }
+
+  const existing = parseCodexCredentials(decryptKey(channel.apiKey))
+  const merged = {
+    ...credentials,
+    accountId: credentials.accountId ?? existing?.accountId,
+  }
+  updateChannel(channelId, { apiKey: serializeCodexCredentials(merged) })
+}
 
 /**
- * 解析渠道存储的 ChatGPT (Codex) OAuth 凭据，按需刷新并回写，返回可用的 access token。
- *
- * - 渠道 apiKey 字段存的是加密后的凭据 JSON（access/refresh/expires）。
- * - access token 未过期：直接返回。
- * - 已过期或即将过期：用 refresh token 换新，加密回写渠道，返回新的 access token。
- *
- * 仅用于 provider === 'openai-codex' 的渠道。刷新失败时抛错，交由上层映射为
- * expired_oauth_token 并引导用户重新登录。
+ * 解析渠道存储的 ChatGPT (Codex) OAuth 凭据，按需刷新并回写。
+ * Pi runtime 必须接收完整 credential，才能在长时间运行时按真实 expires 刷新 token。
  */
-export async function resolveCodexAccessToken(channelId: string): Promise<string> {
+export async function resolveCodexOAuthCredentials(channelId: string): Promise<CodexOAuthCredentials> {
   const config = readConfig()
   const channel = config.channels.find((c) => c.id === channelId)
   if (!channel) {
@@ -442,23 +466,21 @@ export async function resolveCodexAccessToken(channelId: string): Promise<string
   }
 
   if (!isCodexCredentialExpired(credentials)) {
-    return credentials.access
+    return credentials
   }
 
-  // 过期：去重刷新。同一渠道并发调用复用同一个刷新 Promise。
   const existing = inflightCodexRefresh.get(channelId)
   if (existing) return existing
 
-  const refreshPromise = (async (): Promise<string> => {
+  const refreshPromise = (async (): Promise<CodexOAuthCredentials> => {
     try {
       const refreshed = await refreshCodexOAuth(credentials.refresh)
-      // 回写加密凭据（保留刚拿到的 accountId，缺省沿用旧值）。
       const merged = {
         ...refreshed,
         accountId: refreshed.accountId ?? credentials.accountId,
       }
-      updateChannel(channelId, { apiKey: serializeCodexCredentials(merged) })
-      return refreshed.access
+      persistCodexOAuthCredentials(channelId, merged)
+      return merged
     } finally {
       inflightCodexRefresh.delete(channelId)
     }
@@ -466,6 +488,11 @@ export async function resolveCodexAccessToken(channelId: string): Promise<string
 
   inflightCodexRefresh.set(channelId, refreshPromise)
   return refreshPromise
+}
+
+/** 返回当前有效的 Codex access token，兼容只需要 bearer token 的调用方。 */
+export async function resolveCodexAccessToken(channelId: string): Promise<string> {
+  return (await resolveCodexOAuthCredentials(channelId)).access
 }
 
 /**
@@ -516,6 +543,7 @@ export async function testChannel(channelId: string): Promise<ChannelTestResult>
       case 'xiaomi':
       case 'xiaomi-token-plan':
       case 'qwen-anthropic':
+      case 'qwen-token-plan':
         if (provider === 'deepseek') {
           return await testDeepSeekMessages(
             channel.baseUrl,
@@ -547,6 +575,14 @@ export async function testChannel(channelId: string): Promise<ChannelTestResult>
             apiKey,
             resolveXiaomiTestModelId(undefined, channel.models),
             'xiaomi-token-plan',
+            proxyUrl,
+          )
+        }
+        if (provider === 'qwen-token-plan') {
+          return await testQwenTokenPlanMessages(
+            channel.baseUrl,
+            apiKey,
+            resolveQwenTokenPlanTestModelId(undefined, channel.models),
             proxyUrl,
           )
         }
@@ -703,6 +739,36 @@ async function testXiaomiMessages(
   const response = await fetchFn(url, withTimeout({
     method: 'POST',
     headers,
+    body: JSON.stringify({
+      model: modelId,
+      max_tokens: 8,
+      messages: [{ role: 'user', content: 'ping' }],
+    }),
+  }))
+
+  return normalizeHttpResponse(response)
+}
+
+/**
+ * 通义千问 Token Plan 未开放 /models，连接测试改用用户选择的模型发起极小的 messages 请求。
+ */
+async function testQwenTokenPlanMessages(
+  baseUrl: string,
+  apiKey: string,
+  modelId: string,
+  proxyUrl?: string,
+): Promise<ChannelTestResult> {
+  const url = resolveAnthropicMessagesUrl(baseUrl, 'qwen-token-plan')
+  const fetchFn = getFetchFn(proxyUrl)
+
+  const response = await fetchFn(url, withTimeout({
+    method: 'POST',
+    headers: {
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+      'User-Agent': getPromaUserAgent(pkg.version),
+    },
     body: JSON.stringify({
       model: modelId,
       max_tokens: 8,
@@ -1451,6 +1517,7 @@ export async function testChannelDirect(input: ChannelDirectTestInput): Promise<
       case 'xiaomi':
       case 'xiaomi-token-plan':
       case 'qwen-anthropic':
+      case 'qwen-token-plan':
         if (provider === 'deepseek') {
           return await testDeepSeekMessages(
             input.baseUrl,
@@ -1482,6 +1549,14 @@ export async function testChannelDirect(input: ChannelDirectTestInput): Promise<
             input.apiKey,
             resolveXiaomiTestModelId(input.modelId),
             'xiaomi-token-plan',
+            proxyUrl,
+          )
+        }
+        if (provider === 'qwen-token-plan') {
+          return await testQwenTokenPlanMessages(
+            input.baseUrl,
+            input.apiKey,
+            resolveQwenTokenPlanTestModelId(input.modelId),
             proxyUrl,
           )
         }
@@ -1535,6 +1610,7 @@ export async function fetchModels(input: FetchModelsInput): Promise<FetchModelsR
       case 'xiaomi':
       case 'xiaomi-token-plan':
       case 'qwen-anthropic':
+      case 'qwen-token-plan':
       case 'openai-codex':
         if (provider === 'openai-codex') {
           // ChatGPT (Codex) 走 Pi SDK 内置模型目录，不依赖 baseUrl/apiKey。
@@ -1556,6 +1632,9 @@ export async function fetchModels(input: FetchModelsInput): Promise<FetchModelsR
         }
         if (provider === 'xiaomi-token-plan') {
           return createPresetModelsResult('小米 Token Plan', XIAOMI_PRESET_MODELS)
+        }
+        if (provider === 'qwen-token-plan') {
+          return createPresetModelsResult('通义千问 Token Plan', QWEN_TOKEN_PLAN_PRESET_MODELS)
         }
         if (provider === 'ark-coding-plan') {
           return {

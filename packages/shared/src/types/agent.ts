@@ -619,6 +619,8 @@ export interface AgentSessionMeta {
   workspaceId?: string
   /** 是否置顶 */
   pinned?: boolean
+  /** 是否已星标（仅用于侧栏快速识别，不影响排序或置顶） */
+  starred?: boolean
   /** 是否已归档 */
   archived?: boolean
   /** 附加的外部目录路径列表（绝对路径，作为 SDK additionalDirectories 传递） */
@@ -971,6 +973,8 @@ export interface AgentSendInput {
   mentionedSessionIds?: string[]
   /** 渲染进程生成的流式开始时间戳，主进程原样回传到 STREAM_COMPLETE，确保竞态保护比较的是同一个值 */
   startedAt?: number
+  /** 用户点击错误消息的重试时，指向本轮开始前应删除的错误 UUID。 */
+  retryOfErrorUuid?: string
   /** 触发来源：用户手动、定时任务、父 Agent 委派（用于 UI 区分标记） */
   triggeredBy?: 'user' | 'automation' | 'delegation'
   /** 定时任务执行上下文（注入到系统提示词，用户不可见） */
@@ -1422,6 +1426,8 @@ export const AGENT_IPC_CHANNELS = {
   MIGRATE_CHAT_TO_AGENT: 'agent:migrate-chat-to-agent',
   /** 切换会话置顶状态 */
   TOGGLE_PIN: 'agent:toggle-pin',
+  /** 切换会话星标状态 */
+  TOGGLE_STAR: 'agent:toggle-star',
   /** 清除会话完成状态（兼容清除旧版 manualWorking）。channel 值保留旧名以兼容已缓存的 preload */
   CLEAR_COMPLETION_STATE: 'agent:confirm-working-done',
   /** 切换会话归档状态 */
