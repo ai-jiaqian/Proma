@@ -68,6 +68,7 @@ import { isVisibleRunMessage } from './agent-run-message-visibility'
 import { applyAgentSdkAuthEnv } from './agent-sdk-auth-env'
 import { getAgentSdkMaxOutputTokens } from './agent-sdk-output-limits'
 import { resolvePiThinkingLevel } from './agent-thinking-level'
+import { generateCodexTitle } from './adapters/pi-codex-title-generator'
 import { createFallbackTitle, sanitizeGeneratedTitle, TITLE_PROMPT } from './title-generation'
 
 // ===== 类型定义 =====
@@ -604,7 +605,27 @@ export class AgentOrchestrator {
 
       if (channel.provider === 'openai-codex') {
         const fallbackTitle = createFallbackTitle(userMessage)
-        console.log('[Agent 标题生成] ChatGPT OAuth 渠道使用本地标题:', fallbackTitle)
+        try {
+          const [credentials, proxyUrl] = await Promise.all([
+            resolveCodexOAuthCredentials(channelId),
+            getEffectiveProxyUrl(),
+          ])
+          const generatedTitle = await generateCodexTitle({
+            modelId,
+            prompt: TITLE_PROMPT + userMessage,
+            credentials,
+            proxyUrl,
+            onCredentialsRefreshed: (refreshed) => persistCodexOAuthCredentials(channelId, refreshed),
+          })
+          const title = generatedTitle ? sanitizeGeneratedTitle(generatedTitle) : null
+          if (title) {
+            console.log(`[Agent 标题生成] ChatGPT OAuth 语义标题生成成功: "${title}"`)
+            return title
+          }
+          console.warn('[Agent 标题生成] ChatGPT OAuth 返回空标题，使用本地兜底')
+        } catch (error) {
+          console.warn('[Agent 标题生成] ChatGPT OAuth 语义标题生成失败，使用本地兜底:', error)
+        }
         return fallbackTitle
       }
 
@@ -620,12 +641,12 @@ export class AgentOrchestrator {
       const proxyUrl = await getEffectiveProxyUrl()
       const fetchFn = getFetchFn(proxyUrl)
       const title = await fetchTitle(request, providerAdapter, fetchFn)
-      if (!title) {
-        console.warn('[Agent 标题生成] API 返回空标题')
-        return null
+      const result = title ? sanitizeGeneratedTitle(title) : null
+      if (!result) {
+        console.warn('[Agent 标题生成] API 未返回可用标题')
+        // OpenCode Go 的服务端偶发返回空标题时，仍要完成重命名，避免会话长期停在默认标题。
+        return channel.provider === 'opencode-go-openai' ? createFallbackTitle(userMessage) : null
       }
-
-      const result = sanitizeGeneratedTitle(title)
 
       console.log(`[Agent 标题生成] 生成标题成功: "${result}"`)
       return result
@@ -1639,11 +1660,11 @@ export class AgentOrchestrator {
             persistCodexOAuthCredentials(channelId, credentials)
           },
         }),
-        ...((channel.provider === 'openai-codex' || channel.provider === 'openai-responses')
+        ...((channel.provider === 'openai-codex' || channel.provider === 'openai-responses' || channel.provider === 'openai' || channel.provider === 'custom')
           && isOpenAIReasoningSupportedModel(selectedModelId) && {
-            openAIThinkingLevel: resolvePiThinkingLevel(appSettings, sessionMeta, channel.provider),
+            openAIThinkingLevel: resolvePiThinkingLevel(appSettings, sessionMeta, channel.provider, selectedModelId),
           }),
-        thinkingLevel: resolvePiThinkingLevel(appSettings, sessionMeta, channel.provider),
+        thinkingLevel: resolvePiThinkingLevel(appSettings, sessionMeta, channel.provider, selectedModelId),
         ...(appSettings.agentMaxBudgetUsd != null && appSettings.agentMaxBudgetUsd > 0 && {
           maxBudgetUsd: appSettings.agentMaxBudgetUsd,
         }),
