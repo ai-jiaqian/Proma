@@ -30,7 +30,9 @@ import {
   isPersistableSDKSystemMessage,
   normalizeMcpTransportType,
   inferAgentSdkContextWindow,
-  isOpenAIReasoningSupportedModel,
+  inferReasoningTransport,
+  resolveAgentSdkModelId,
+  resolveReasoningProfile,
   isAgentCompatibleProvider,
 } from '@proma/shared'
 import type { PromaPermissionMode, AskUserRequest, ExitPlanModeRequest, SDKSystemMessage } from '@proma/shared'
@@ -69,6 +71,7 @@ import { isVisibleRunMessage } from './agent-run-message-visibility'
 import { applyAgentSdkAuthEnv } from './agent-sdk-auth-env'
 import { getAgentSdkMaxOutputTokens } from './agent-sdk-output-limits'
 import { resolvePiThinkingLevel } from './agent-thinking-level'
+import { resolvePiReasoningCapability } from './adapters/pi-model-registry'
 import { generateCodexTitle } from './adapters/pi-codex-title-generator'
 import { createFallbackTitle, sanitizeGeneratedTitle, TITLE_PROMPT } from './title-generation'
 
@@ -1116,7 +1119,9 @@ export class AgentOrchestrator {
 
     // 5. 状态初始化
     const accumulatedMessages: SDKMessage[] = []
-    let resolvedModel = modelId || DEFAULT_MODEL_ID
+    // 委派子会话必须继承当前实际运行的模型；未显式传入时与 runtime 的默认值保持一致。
+    const selectedModelId = modelId || DEFAULT_MODEL_ID
+    let resolvedModel = selectedModelId
     let titleGenerationStarted = false
     /** 捕获到的 SDK session ID（用于 resume / recovery） */
     let capturedSdkSessionId = existingSdkSessionId
@@ -1247,7 +1252,7 @@ export class AgentOrchestrator {
           mcpServers,
           sessionId,
           channelId,
-          modelId,
+          modelId: selectedModelId,
           agentRuntime,
           workspaceId,
           workspaceSlug,
@@ -1261,7 +1266,7 @@ export class AgentOrchestrator {
           const result = await buildPiBuiltinTools(piSdk, {
             sessionId,
             channelId,
-            modelId,
+            modelId: selectedModelId,
             agentRuntime,
             workspaceId,
             workspaceSlug,
@@ -1559,7 +1564,12 @@ export class AgentOrchestrator {
       const maxTurns = appSettings.agentMaxTurns && appSettings.agentMaxTurns > 0
         ? appSettings.agentMaxTurns
         : undefined
-      const selectedModelId = modelId || DEFAULT_MODEL_ID
+      const piReasoningCapability = agentRuntime === 'pi'
+        ? await resolvePiReasoningCapability(channel.provider, selectedModelId)
+        : undefined
+      const piThinkingLevel = agentRuntime === 'pi'
+        ? resolvePiThinkingLevel(appSettings, sessionMeta, channel.provider, selectedModelId, piReasoningCapability)
+        : undefined
       const allAdditionalDirectories = collectAttachedDirectories({
         extraDirs: additionalDirectories,
         sessionMeta,
@@ -1572,6 +1582,7 @@ export class AgentOrchestrator {
         sessionId,
         permissionMode: initialPermissionMode,
         collaborationAvailable,
+        currentModelId: selectedModelId,
       }) + (automationContext ? `\n\n## 定时任务执行上下文\n\n${automationContext}` : '')
       const handleSessionId = (sdkSessionId: string, piSessionFile?: string): void => {
         // 仅在 session_id 真正变化时才持久化。SDK v2 几乎每条消息都会回调 onSessionId，
@@ -1649,10 +1660,13 @@ export class AgentOrchestrator {
           },
         }),
         ...((channel.provider === 'openai-codex' || channel.provider === 'openai-responses' || channel.provider === 'openai' || channel.provider === 'custom')
-          && isOpenAIReasoningSupportedModel(selectedModelId) && {
-            openAIThinkingLevel: resolvePiThinkingLevel(appSettings, sessionMeta, channel.provider, selectedModelId),
+          && resolveReasoningProfile({
+            modelId: selectedModelId,
+            transport: inferReasoningTransport(channel.provider),
+          })?.id.startsWith('openai-reasoning-') && {
+            openAIThinkingLevel: piThinkingLevel!,
           }),
-        thinkingLevel: resolvePiThinkingLevel(appSettings, sessionMeta, channel.provider, selectedModelId),
+        thinkingLevel: piThinkingLevel!,
         ...(appSettings.agentMaxBudgetUsd != null && appSettings.agentMaxBudgetUsd > 0 && {
           maxBudgetUsd: appSettings.agentMaxBudgetUsd,
         }),
@@ -1673,7 +1687,8 @@ export class AgentOrchestrator {
         agentRuntime: 'claude',
         sessionId,
         prompt: finalPrompt,
-        model: modelId || DEFAULT_MODEL_ID,
+        // 仅 Claude Agent SDK 使用 `[1m]` 扩展上下文变体；Pi 分支保持原始模型 ID。
+        model: resolveAgentSdkModelId(selectedModelId, channel.provider),
         cwd: agentCwd,
         sdkCliPath: cliPath!,
         env: sdkEnv,
