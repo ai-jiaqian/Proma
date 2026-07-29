@@ -13,6 +13,14 @@
 
 import { shell } from 'electron'
 import type { CodexOAuthCredentials } from '@proma/shared'
+import { getEffectiveProxyUrl } from './proxy-settings-service'
+import {
+  closePiRequestProxyDispatcher,
+  createPiRequestProxyDispatcher,
+  installPiRequestProxyFetch,
+  runWithPiRequestProxy,
+} from './adapters/pi-request-proxy'
+import type { Dispatcher } from 'undici'
 /** Pi 0.80.10 将 OAuth 流程收敛到 ModelRuntime。保持动态 import，避免 Electron 主包将 Pi runtime 内联。 */
 type PiSdk = typeof import('@earendil-works/pi-coding-agent')
 
@@ -66,6 +74,29 @@ let activeLoginAbort: AbortController | undefined
  * Proma 的代理 fetch 重新接回该流程；本 service 只负责与公开 ModelRuntime 交互。
  */
 
+/**
+ * 在全局代理下运行一次 Codex OAuth 网络操作。
+ *
+ * Pi SDK 的 token exchange / refresh 直接用全局 `fetch`（见
+ * `pi-ai/dist/auth/oauth/openai-codex.js` 的 `fetchWithLoginCancellation`），
+ * 自身不带 dispatcher 注入点。Proma 的 `installPiRequestProxyFetch()` 会把全局
+ * fetch 换成「读 AsyncLocalStorage 里的 dispatcher」的版本；只要本操作在
+ * `runWithPiRequestProxy` 的异步链里执行，SDK 的 fetch 就会走代理。
+ *
+ * 这是修复「Codex 登录 token exchange 403 unsupported_country_region_territory」
+ * 的关键：登录/刷新若不接代理，国内直连 auth.openai.com 会被按出口 IP 拦截。
+ */
+async function withCodexOAuthProxy<T>(operation: () => Promise<T>): Promise<T> {
+  installPiRequestProxyFetch()
+  const proxyUrl = await getEffectiveProxyUrl()
+  const dispatcher: Dispatcher | undefined = createPiRequestProxyDispatcher({ proxyUrl })
+  try {
+    return await runWithPiRequestProxy(dispatcher, operation)
+  } finally {
+    await closePiRequestProxyDispatcher(dispatcher)
+  }
+}
+
 export interface CodexLoginCallbacks {
   /** SDK 生成授权 URL 后回调，用于（除自动开浏览器外）通知渲染层展示 URL。 */
   onAuthUrl?: (url: string) => void
@@ -88,30 +119,34 @@ export async function loginCodexOAuth(callbacks?: CodexLoginCallbacks): Promise<
   activeLoginAbort = abort
 
   try {
-    const runtime = await sdk.ModelRuntime.create({
-      credentials: createEphemeralCredentialStore(),
-      allowModelNetwork: false,
-    })
-    const credentials = await runtime.login('openai-codex', 'oauth', {
-      signal: abort.signal,
-      prompt: async (prompt) => {
-        // Pi 先要求选择登录方式；Proma v1 固定浏览器授权，回调服务会处理 code。
-        if (prompt.type === 'select') return 'browser'
-        return new Promise<string>((_resolve, reject) => {
-          prompt.signal?.addEventListener('abort', () => reject(new Error('登录已取消')), { once: true })
-          abort.signal.addEventListener('abort', () => reject(new Error('登录已取消')), { once: true })
+    const credentials = await withCodexOAuthProxy(() =>
+      (async () => {
+        const runtime = await sdk.ModelRuntime.create({
+          credentials: createEphemeralCredentialStore(),
+          allowModelNetwork: false,
         })
-      },
-      notify: (event) => {
-        if (event.type === 'auth_url') {
-          callbacks?.onAuthUrl?.(event.url)
-          shell.openExternal(event.url).catch((err) => console.error('[Codex OAuth] 打开浏览器失败:', err))
-        } else if (event.type === 'progress' || event.type === 'info') {
-          console.log(`[Codex OAuth] ${event.message}`)
-          callbacks?.onProgress?.(event.message)
-        }
-      },
-    })
+        return runtime.login('openai-codex', 'oauth', {
+          signal: abort.signal,
+          prompt: async (prompt) => {
+            // Pi 先要求选择登录方式；Proma v1 固定浏览器授权，回调服务会处理 code。
+            if (prompt.type === 'select') return 'browser'
+            return new Promise<string>((_resolve, reject) => {
+              prompt.signal?.addEventListener('abort', () => reject(new Error('登录已取消')), { once: true })
+              abort.signal.addEventListener('abort', () => reject(new Error('登录已取消')), { once: true })
+            })
+          },
+          notify: (event) => {
+            if (event.type === 'auth_url') {
+              callbacks?.onAuthUrl?.(event.url)
+              shell.openExternal(event.url).catch((err) => console.error('[Codex OAuth] 打开浏览器失败:', err))
+            } else if (event.type === 'progress' || event.type === 'info') {
+              console.log(`[Codex OAuth] ${event.message}`)
+              callbacks?.onProgress?.(event.message)
+            }
+          },
+        })
+      })(),
+    )
     return normalizeCredentials(credentials)
   } finally {
     if (activeLoginAbort === abort) {
@@ -139,8 +174,10 @@ export async function refreshCodexOAuth(refreshToken: string): Promise<CodexOAut
     refresh: refreshToken,
     expires: 0,
   })
-  const runtime = await sdk.ModelRuntime.create({ credentials: store, allowModelNetwork: false })
-  // getAuth() 走 provider 的标准 refresh 流程，并通过 store 原子更新凭据。
-  await runtime.getAuth('openai-codex')
-  return normalizeCredentials(await store.read())
+  return withCodexOAuthProxy(async () => {
+    const runtime = await sdk.ModelRuntime.create({ credentials: store, allowModelNetwork: false })
+    // getAuth() 走 provider 的标准 refresh 流程，并通过 store 原子更新凭据。
+    await runtime.getAuth('openai-codex')
+    return normalizeCredentials(await store.read())
+  })
 }
