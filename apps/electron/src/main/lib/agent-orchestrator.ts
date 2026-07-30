@@ -17,7 +17,7 @@
 import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { accessSync, constants, existsSync, mkdirSync, realpathSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { app } from 'electron'
 import type { AgentRuntime, AgentSendInput, AgentMessage, AgentGenerateTitleInput, AgentProviderAdapter, AgentSessionMeta, CodexOAuthCredentials, TypedError, RetryAttempt, SDKMessage, SDKAssistantMessage, AgentStreamPayload, RewindSessionResult, ProviderType } from '@proma/shared'
@@ -28,6 +28,7 @@ import {
   THINKING_SIGNATURE_ERROR_MESSAGE,
   THINKING_SIGNATURE_ERROR_TITLE,
   isPersistableSDKSystemMessage,
+  normalizePathForCompare,
   normalizeMcpTransportType,
   inferAgentSdkContextWindow,
   inferReasoningTransport,
@@ -37,7 +38,7 @@ import {
 } from '@proma/shared'
 import type { PromaPermissionMode, AskUserRequest, ExitPlanModeRequest, SDKSystemMessage } from '@proma/shared'
 import type { ClaudeAgentQueryOptions } from './adapters/claude-agent-adapter'
-import { isPromptTooLongError, isThinkingSignatureError, friendlyErrorMessage, mapSDKErrorToTypedError, extractErrorDetails, shouldKeepChannelOpen } from './adapters/claude-agent-adapter'
+import { getClaudeSettingSourcesForWorkspace, isPromptTooLongError, isThinkingSignatureError, friendlyErrorMessage, mapSDKErrorToTypedError, extractErrorDetails, shouldKeepChannelOpen } from './adapters/claude-agent-adapter'
 import type { PiAgentQueryOptions } from './adapters/pi-agent-adapter'
 import { getPiAssistantErrorDetails, hasPiAssistantTextContent, stripPiAssistantError } from './adapters/pi-message-adapter'
 import { isTransientNetworkError, isMalformedResponseError, isSessionNotFoundError } from './error-patterns'
@@ -47,18 +48,19 @@ import { getAdapter, fetchTitle, normalizeAnthropicBaseUrlForSdk, getPromaUserAg
 import pkg from '../../../package.json' with { type: 'json' }
 import { getFetchFn } from './proxy-fetch'
 import { getEffectiveProxyUrl } from './proxy-settings-service'
-import { appendSDKMessages, updateAgentSessionMeta, getAgentSessionMeta, getAgentSessionMessages, truncateSDKMessages, removeSDKErrorMessage, resolveUserUuidFromSDK, rewindFilesFromSnapshot, rewindPiAgentSession } from './agent-session-manager'
-import { getAgentWorkspace, getWorkspaceMcpConfig, ensurePluginManifest, getWorkspaceAutoMemoryDir, getWorkspaceAttachedDirectories, getWorkspaceAttachedFiles } from './agent-workspace-manager'
-import { getAgentWorkspacePath, getAgentSessionWorkspacePath, getSdkConfigDir, getWorkspaceFilesDir, getWorkspaceSkillsDir } from './config-paths'
+import { appendSDKMessages, updateAgentSessionMeta, getAgentSessionMeta, getAgentSessionMessages, truncateSDKMessages, removeSDKErrorMessage, resolveUserUuidFromSDK, rewindFilesFromSnapshot, rewindPiAgentSession, ensureClaudeSessionSettings, resolveAgentCwd, getAgentCwdMode } from './agent-session-manager'
+import { getAgentWorkspace, getLocalProjectRootStatus, getProjectFilesPath, getWorkspaceMcpConfig, ensurePluginManifest, getWorkspaceAttachedDirectories, getWorkspaceAttachedFiles } from './agent-workspace-manager'
+import { getAgentWorkspacePath, getAgentSessionWorkspacePath, getConfigDir, getSdkConfigDir, getWorkspaceSkillsDir } from './config-paths'
 import { getRuntimeStatus } from './runtime-init'
 import { getSettings } from './settings-service'
 import { buildSystemPrompt, buildDynamicContext } from './agent-prompt-builder'
 import { MAX_CONTEXT_MESSAGES, buildContextPrompt, buildRecoveryPrompt, buildReferencedSessionsPrompt } from './agent-session-context-prompt'
+import { buildReferencedPlanningPrompt } from './planning-reference-context'
 import { permissionService } from './agent-permission-service'
 import type { PermissionResult, CanUseToolOptions } from './agent-permission-service'
+import { resolvePlanningDeletionPermission } from './planning-permission-policy'
 import { askUserService } from './agent-ask-user-service'
 import { exitPlanService, type ExitPlanPermissionResult } from './agent-exit-plan-service'
-import { removePromaAutoCompactSettings } from './agent-auto-compact-settings'
 import { validateToolInput } from './agent-tool-input-validator'
 import { estimateTokenCount, WRITE_CONTENT_TOKEN_THRESHOLD } from './agent-tool-token-estimator'
 import { injectBuiltinMcpServers } from './builtin-mcp/registry'
@@ -73,6 +75,7 @@ import { getAgentSdkMaxOutputTokens } from './agent-sdk-output-limits'
 import { resolvePiThinkingLevel } from './agent-thinking-level'
 import { resolvePiReasoningCapability } from './adapters/pi-model-registry'
 import { generateCodexTitle } from './adapters/pi-codex-title-generator'
+import { CodexTitleRequestCoordinator } from './codex-title-request-coordinator'
 import { createFallbackTitle, sanitizeGeneratedTitle, TITLE_PROMPT } from './title-generation'
 
 // ===== 类型定义 =====
@@ -331,9 +334,9 @@ const DEFAULT_MODEL_ID = 'claude-sonnet-5'
  *
  * 来源：
  *   1. extraDirs：调用方传入的临时附加目录（例如 sendMessage 时用户当次提交的目录）
- *   2. 会话级 attachedDirectories + attachedFiles 的父目录
+ *   2. 当前会话的私有工作目录，以及会话级 attachedDirectories + attachedFiles 的父目录
  *   3. 工作区级 attachedDirectories + attachedFiles 的父目录
- *   4. 工作区文件目录 workspace-files/
+ *   4. 项目文件根目录（本地项目为用户目录，空白项目为 workspace-files/）
  */
 function collectAttachedDirectories(params: {
   sessionMeta?: AgentSessionMeta
@@ -348,13 +351,14 @@ function collectAttachedDirectories(params: {
   }
 
   for (const d of extraDirs ?? []) push(d)
+  if (workspaceSlug && sessionMeta) push(getAgentSessionWorkspacePath(workspaceSlug, sessionMeta.id))
   for (const d of sessionMeta?.attachedDirectories ?? []) push(d)
   for (const file of sessionMeta?.attachedFiles ?? []) push(dirname(file))
 
   if (workspaceSlug) {
     for (const d of getWorkspaceAttachedDirectories(workspaceSlug)) push(d)
     for (const f of getWorkspaceAttachedFiles(workspaceSlug)) push(dirname(f))
-    push(getWorkspaceFilesDir(workspaceSlug))
+    push(getProjectFilesPath(workspaceSlug))
   }
 
   return result
@@ -381,12 +385,41 @@ ${directoryLines}
 </attached_directories>`
 }
 
+const LOCAL_PROJECT_ROOT_UNAVAILABLE_CODE = 'local_project_root_unavailable'
+
+function createLocalProjectRootUnavailableError(projectRootPath: string, status?: string): Error {
+  const error = new Error(
+    `本地项目根目录不可用: 本地项目根目录不存在或无法访问：${projectRootPath}。请在 Proma 中重新选择项目文件夹。`,
+  ) as Error & { code?: string; details?: string[] }
+  error.code = LOCAL_PROJECT_ROOT_UNAVAILABLE_CODE
+  error.details = status ? [`目录状态: ${status}`] : undefined
+  return error
+}
+
+/** 验证本地项目根，并返回用于跨会话比较的真实规范化路径。 */
+function resolveLocalProjectRootForRewind(projectRootPath: string): string {
+  const status = getLocalProjectRootStatus(projectRootPath)
+  if (status !== 'available') {
+    throw createLocalProjectRootUnavailableError(projectRootPath, status)
+  }
+
+  try {
+    accessSync(projectRootPath, constants.R_OK | constants.W_OK | constants.X_OK)
+    const realRoot = realpathSync(projectRootPath)
+    const normalizedRoot = normalizePathForCompare(realRoot) || realRoot
+    return process.platform === 'win32' ? normalizedRoot.toLowerCase() : normalizedRoot
+  } catch {
+    throw createLocalProjectRootUnavailableError(projectRootPath, 'unavailable')
+  }
+}
+
 // ===== AgentOrchestrator =====
 
 export class AgentOrchestrator {
   private adapter: AgentProviderAdapter
   private eventBus: AgentEventBus
   private activeSessions = new Map<string, number>()
+  private codexTitleRequestCoordinator = new CodexTitleRequestCoordinator()
 
   /** 队列消息本地记录（sessionId → UUID 集合，用于防重） */
   private queuedMessageUuids = new Map<string, Set<string>>()
@@ -465,6 +498,9 @@ export class AgentOrchestrator {
       CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
       // 配置隔离：让 SDK 使用独立的配置目录，不读取用户的 ~/.claude.json
       CLAUDE_CONFIG_DIR: getSdkConfigDir(),
+      // Proma 的全局配置目录与当前项目状态，供 Claude Hooks 等受控子进程使用。
+      PROMA_HOME: getConfigDir(),
+      PROMA_NOWLEDGE_MEM_ENABLED: '0',
     }
 
     // 认证方式按 provider 分支
@@ -575,8 +611,9 @@ export class AgentOrchestrator {
    *
    * 使用 Provider 适配器系统，支持所有渠道。任何错误返回 null。
    */
-  async generateTitle(input: AgentGenerateTitleInput): Promise<string | null> {
+  async generateTitle(input: AgentGenerateTitleInput, signal?: AbortSignal): Promise<string | null> {
     const { userMessage, channelId, modelId } = input
+    if (signal?.aborted) return null
     console.log('[Agent 标题生成] 开始生成标题:', { channelId, modelId, userMessage: userMessage.slice(0, 50) })
 
     try {
@@ -594,13 +631,16 @@ export class AgentOrchestrator {
             resolveCodexOAuthCredentials(channelId),
             getEffectiveProxyUrl(),
           ])
+          if (signal?.aborted) return null
           const generatedTitle = await generateCodexTitle({
             modelId,
             prompt: TITLE_PROMPT + userMessage,
             credentials,
             proxyUrl,
+            signal,
             onCredentialsRefreshed: (refreshed) => persistCodexOAuthCredentials(channelId, refreshed),
           })
+          if (signal?.aborted) return null
           const title = generatedTitle ? sanitizeGeneratedTitle(generatedTitle) : null
           if (title) {
             console.log(`[Agent 标题生成] ChatGPT OAuth 语义标题生成成功: "${title}"`)
@@ -608,6 +648,7 @@ export class AgentOrchestrator {
           }
           console.warn('[Agent 标题生成] ChatGPT OAuth 返回空标题，使用本地兜底')
         } catch (error) {
+          if (signal?.aborted) return null
           console.warn('[Agent 标题生成] ChatGPT OAuth 语义标题生成失败，使用本地兜底:', error)
         }
         return fallbackTitle
@@ -651,18 +692,25 @@ export class AgentOrchestrator {
     channelId: string,
     modelId: string,
     callbacks: SessionCallbacks,
+    signal?: AbortSignal,
   ): Promise<void> {
+    if (signal?.aborted) return
     try {
       const meta = getAgentSessionMeta(sessionId)
       if (!meta || meta.title !== DEFAULT_SESSION_TITLE) return
 
-      const title = await this.generateTitle({ userMessage, channelId, modelId })
-      if (!title) return
+      const title = await this.generateTitle({ userMessage, channelId, modelId }, signal)
+      if (!title || signal?.aborted) return
+
+      // 标题请求是异步的；请求期间用户可能已手动重命名，不能用旧结果覆盖。
+      const latestMeta = getAgentSessionMeta(sessionId)
+      if (!latestMeta || latestMeta.title !== DEFAULT_SESSION_TITLE) return
 
       updateAgentSessionMeta(sessionId, { title })
       callbacks.onTitleUpdated(title)
       console.log(`[Agent 编排] 自动标题生成完成: "${title}"`)
     } catch (error) {
+      if (signal?.aborted) return
       console.warn('[Agent 编排] 自动标题生成失败:', error)
     }
   }
@@ -844,10 +892,11 @@ export class AgentOrchestrator {
    * 通过 EventBus 分发 AgentEvent，通过 callbacks 发送控制信号。
    */
   async sendMessage(input: AgentSendInput, callbacks: SessionCallbacks): Promise<void> {
-    const { sessionId, userMessage, channelId, modelId, agentRuntime: inputAgentRuntime, workspaceId, additionalDirectories, customMcpServers, permissionModeOverride, mentionedSkills, mentionedMcpServers, mentionedSessionIds, automationContext, retryOfErrorUuid } = input
+    const { sessionId, userMessage, channelId, modelId, agentRuntime: inputAgentRuntime, workspaceId: requestedWorkspaceId, additionalDirectories, customMcpServers, permissionModeOverride, mentionedSkills, mentionedMcpServers, mentionedSessionIds, mentionedTodoIds, mentionedCalendarEventIds, automationContext, retryOfErrorUuid } = input
     const stderrChunks: string[] = []
     const streamStartedAt = input.startedAt ?? Date.now()
     let userMessagePersisted = false
+    let sessionMeta = getAgentSessionMeta(sessionId)
 
     const persistInitialUserMessage = (): void => {
       if (userMessagePersisted) return
@@ -917,6 +966,50 @@ export class AgentOrchestrator {
       }
       callbacks.onError(errorContent)
       callbacks.onComplete([], { startedAt: streamStartedAt })
+    }
+
+    // 会话元数据是运行项目的权威来源。渲染端的当前项目只是导航状态，不能
+    // 覆盖已存在会话的项目归属，否则会把 Agent cwd 指到另一个用户项目根。
+    const sessionWorkspaceId = sessionMeta?.workspaceId
+    if (sessionWorkspaceId && requestedWorkspaceId && requestedWorkspaceId !== sessionWorkspaceId) {
+      reportPreflightError({
+        code: 'unknown_error',
+        title: '会话项目不匹配',
+        message: '当前会话所属项目与请求项目不一致，已拒绝执行以避免访问错误的项目目录。',
+        actions: [],
+        canRetry: false,
+      })
+      return
+    }
+    const workspaceId = sessionWorkspaceId ?? requestedWorkspaceId
+
+    // 本地项目根由用户管理。根目录被删除、替换为文件或无法访问时，绝不能
+    // 进入 SDK/Agent 初始化链路，以免后续文件工具通过 mkdir 间接重建该目录。
+    if (workspaceId) {
+      const workspace = getAgentWorkspace(workspaceId)
+      if (!workspace) {
+        reportPreflightError({
+          code: 'workspace_not_found',
+          title: '项目不存在',
+          message: `指定的 Agent 项目不存在或已删除: ${workspaceId}`,
+          actions: [],
+          canRetry: false,
+        })
+        return
+      }
+
+      const projectRootStatus = getLocalProjectRootStatus(workspace.projectRootPath)
+      if (projectRootStatus && projectRootStatus !== 'available') {
+        reportPreflightError({
+          code: 'local_project_root_unavailable',
+          title: '本地项目根目录不可用',
+          message: `本地项目根目录不存在或无法访问：${workspace.projectRootPath}。请在 Proma 中重新选择项目文件夹。`,
+          details: [`目录状态: ${projectRootStatus}`],
+          actions: [],
+          canRetry: false,
+        })
+        return
+      }
     }
 
     // 1. Windows 平台：检查 Shell 环境可用性
@@ -996,7 +1089,6 @@ export class AgentOrchestrator {
     }
 
     const appSettings = getSettings()
-    let sessionMeta = getAgentSessionMeta(sessionId)
     // 历史会话缺失 runtime 时按 Claude 兼容；新会话创建时已持久化其默认 runtime。
     const previousAgentRuntime = normalizeAgentRuntime(sessionMeta?.agentRuntime ?? 'claude')
     const agentRuntime = normalizeAgentRuntime(inputAgentRuntime ?? sessionMeta?.agentRuntime ?? 'claude')
@@ -1043,14 +1135,22 @@ export class AgentOrchestrator {
     // finally 块会通过 generation 匹配来安全清理，不影响正常流程
     const runGeneration = Date.now()
     this.activeSessions.set(sessionId, runGeneration)
+    const usesCodexOAuth = channel.provider === 'openai-codex'
+    let codexForegroundRunActive = false
 
     const releaseActiveRun = (): void => {
       // 在发送 STREAM_COMPLETE 前释放 active slot，避免渲染进程已进入空闲态、
       // 主进程仍在 finally 前短暂拒绝下一条消息。
-      if (this.activeSessions.get(sessionId) !== runGeneration) return
-      this.activeSessions.delete(sessionId)
-      this.sessionPermissionModes.delete(sessionId)
-      this.queuedMessageUuids.delete(sessionId)
+      const ownsActiveRun = this.activeSessions.get(sessionId) === runGeneration
+      if (ownsActiveRun) {
+        this.activeSessions.delete(sessionId)
+        this.sessionPermissionModes.delete(sessionId)
+        this.queuedMessageUuids.delete(sessionId)
+      }
+      if (codexForegroundRunActive) {
+        codexForegroundRunActive = false
+        this.codexTitleRequestCoordinator.endForeground(channelId)
+      }
     }
     const completeRun = (
       messages?: AgentMessage[],
@@ -1130,6 +1230,12 @@ export class AgentOrchestrator {
     let workspace: import('@proma/shared').AgentWorkspace | undefined
 
     try {
+      if (usesCodexOAuth) {
+        codexForegroundRunActive = true
+        await this.codexTitleRequestCoordinator.beginForeground(channelId)
+        if (this.activeSessions.get(sessionId) !== runGeneration) return
+      }
+
       const sdk = agentRuntime === 'claude' ? await import('@anthropic-ai/claude-agent-sdk') : undefined
       const cliPath = agentRuntime === 'claude' ? resolveSDKCliPath() : undefined
 
@@ -1174,61 +1280,32 @@ export class AgentOrchestrator {
       workspace = undefined
       if (workspaceId) {
         const ws = getAgentWorkspace(workspaceId)
-        if (ws) {
-          agentCwd = getAgentSessionWorkspacePath(ws.slug, sessionId)
-          workspaceSlug = ws.slug
-          workspace = ws
-          console.log(`[Agent 编排] 使用 session 级别 cwd: ${agentCwd} (${ws.name}/${sessionId})`)
+        if (!ws) {
+          throw new Error(`指定的 Agent 项目不存在或已删除: ${workspaceId}`)
+        }
+        agentCwd = resolveAgentCwd(ws, sessionId, sessionMeta?.agentCwdMode) ?? homedir()
+        workspaceSlug = ws.slug
+        workspace = ws
+        sdkEnv.PROMA_WORKSPACE_DIR = getAgentWorkspacePath(ws.slug)
+        sdkEnv.PROMA_WORKSPACE_SLUG = ws.slug
+        sdkEnv.PROMA_NOWLEDGE_MEM_ENABLED = getWorkspaceMcpConfig(ws.slug).servers['nowledge-mem']?.enabled ? '1' : '0'
+        console.log(`[Agent 编排] 使用 ${getAgentCwdMode(sessionMeta)} cwd: ${agentCwd} (${ws.name}/${sessionId})`)
 
-          if (agentRuntime === 'claude') {
-            ensurePluginManifest(ws.slug, ws.name)
-          }
+        if (agentRuntime === 'claude') {
+          ensurePluginManifest(ws.slug, ws.name)
+        }
 
-          if (existingSdkSessionId) {
-            console.log(`[Agent 编排] 将尝试 resume: ${existingSdkSessionId}`)
-          } else {
-            console.log(`[Agent 编排] 无 sdkSessionId，将作为新会话启动（回填历史上下文）`)
-          }
+        if (existingSdkSessionId) {
+          console.log(`[Agent 编排] 将尝试 resume: ${existingSdkSessionId}`)
+        } else {
+          console.log(`[Agent 编排] 无 sdkSessionId，将作为新会话启动（回填历史上下文）`)
         }
       }
 
-      // 9.4.1 Fork session JSONL 迁移已在 forkAgentSession 中完成，
-      // fork 后的会话直接使用自己的 cwd，无需回退到源目录。
-      // forkSourceDir 仅作为备用参考字段保留，不再影响 agentCwd。
+      // 9.4.1 Fork session JSONL 迁移已在 forkAgentSession 中完成；fork 的 cwd 语义
+      // 从源会话继承并持久化，避免历史相对路径在恢复时切换到另一文件根。
 
-      // 9.5 确保 SDK 项目设置（plansDirectory → .context）
-      if (agentRuntime === 'claude') {
-        const claudeSettingsDir = join(agentCwd, '.claude')
-        if (!existsSync(claudeSettingsDir)) mkdirSync(claudeSettingsDir, { recursive: true })
-        const settingsPath = join(claudeSettingsDir, 'settings.json')
-        let sdkProjectSettings: Record<string, unknown> = {}
-        try {
-          sdkProjectSettings = JSON.parse(readFileSync(settingsPath, 'utf-8'))
-        } catch { /* 文件不存在或解析失败 */ }
-        let needsWrite = false
-        if (sdkProjectSettings.plansDirectory !== '.context') {
-          sdkProjectSettings.plansDirectory = '.context'
-          needsWrite = true
-        }
-        if (sdkProjectSettings.skipWebFetchPreflight !== true) {
-          sdkProjectSettings.skipWebFetchPreflight = true
-          needsWrite = true
-        }
-        if (workspaceSlug) {
-          const autoMemoryDirectory = getWorkspaceAutoMemoryDir(workspaceSlug)
-          if (sdkProjectSettings.autoMemoryDirectory !== autoMemoryDirectory) {
-            sdkProjectSettings.autoMemoryDirectory = autoMemoryDirectory
-            needsWrite = true
-          }
-        }
-        if (removePromaAutoCompactSettings(sdkProjectSettings)) {
-          needsWrite = true
-        }
-        if (needsWrite) {
-          writeFileSync(settingsPath, JSON.stringify(sdkProjectSettings, null, 2))
-          console.log(`[Agent 编排] 已设置 SDK settings (plansDirectory, skipWebFetchPreflight, autoMemoryDirectory, autoCompact)`)
-        }
-      }
+
 
       // 9.6 直接信任已保存的 sdkSessionId，跳过 listSessions 预验证
       // 原因：listSessions({ dir }) 基于 cwd 路径哈希查找，但 session 级别的 cwd
@@ -1303,7 +1380,7 @@ export class AgentOrchestrator {
 
       // 11.5 注入 mention 引用指令（Skill/MCP/会话）— 仅影响 prompt，不影响持久化
       let enrichedMessage = userMessage
-      const referencedSessionsBlock = buildReferencedSessionsPrompt(sessionId, mentionedSessionIds, workspaceId, workspaceSlug)
+      const referencedSessionsBlock = buildReferencedSessionsPrompt(sessionId, mentionedSessionIds, workspaceSlug)
       if (referencedSessionsBlock) {
         enrichedMessage = `${referencedSessionsBlock}\n\n${enrichedMessage}`
         console.log(`[Agent 编排] 注入 referenced_sessions: ${mentionedSessionIds?.length ?? 0} sessions`)
@@ -1321,6 +1398,15 @@ export class AgentOrchestrator {
         }
         enrichedMessage = `<mentioned_tools>\n${toolLines.join('\n')}\n</mentioned_tools>\n\n${enrichedMessage}`
         console.log(`[Agent 编排] 注入 mentioned_tools: ${mentionedSkills?.length ?? 0} skills, ${mentionedMcpServers?.length ?? 0} MCP`)
+      }
+      const referencedPlanningBlock = buildReferencedPlanningPrompt(
+        mentionedTodoIds,
+        mentionedCalendarEventIds,
+        { requireToolRead: agentRuntime === 'pi' },
+      )
+      if (referencedPlanningBlock) {
+        enrichedMessage = `${referencedPlanningBlock}\n\n${enrichedMessage}`
+        console.log(`[Agent 编排] 注入 referenced_planning: ${mentionedTodoIds?.length ?? 0} todos, ${mentionedCalendarEventIds?.length ?? 0} calendar events`)
       }
 
       const contextualMessage = `${dynamicCtx}\n\n${enrichedMessage}`
@@ -1419,6 +1505,14 @@ export class AgentOrchestrator {
         'mcp__chrome_devtools__list_network_requests',
         'mcp__chrome_devtools__performance_stop_trace',
       ])
+      // Planning 是本地用户数据：计划模式只允许查询，严禁创建、更新、删除或确认/推迟提醒。
+      const PLAN_MODE_READ_ONLY_PLANNING_TOOLS = new Set([
+        'mcp__planning__list_todos', 'mcp__planning__get_todo',
+        'mcp__planning__list_calendar_events', 'mcp__planning__get_calendar_event',
+        'mcp__planning__list_groups', 'mcp__planning__list_tags',
+        'mcp__planning__list_active_reminders',
+      ])
+      const runTriggeredBy = input.triggeredBy
 
       /** Plan 模式是否已被 Agent 进入（初始 plan 模式时天然为 true，其他模式需 EnterPlanMode 触发） */
       let planModeEntered = initialPermissionMode === 'plan'
@@ -1512,6 +1606,23 @@ export class AgentOrchestrator {
           )
         }
 
+        const planningDeletionPermission = resolvePlanningDeletionPermission(
+          toolName,
+          currentMode,
+          runTriggeredBy,
+        )
+        if (planningDeletionPermission === 'deny-unattended') {
+          return { behavior: 'deny' as const, message: '定时任务和协作子 Agent 不能删除本地规划数据，请由用户主会话发起并确认。' }
+        }
+        if (planningDeletionPermission === 'allow') {
+          return { behavior: 'allow' as const, updatedInput: input }
+        }
+        if (planningDeletionPermission === 'require-single-approval') {
+          return permissionService.requestSingleApproval(sessionId, toolName, input, options, (request) => {
+            this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'permission_request', request } })
+          })
+        }
+
         // ── 普通工具的权限分派 ──
 
         switch (currentMode) {
@@ -1544,6 +1655,11 @@ export class AgentOrchestrator {
               return PLAN_MODE_READ_ONLY_CHROME_DEVTOOLS.has(toolName)
                 ? { behavior: 'allow' as const, updatedInput: input }
                 : { behavior: 'deny' as const, message: '计划模式下不允许执行会改变浏览器页面状态的 Chrome DevTools 操作，请在计划审批通过后再执行' }
+            }
+            if (toolName.startsWith('mcp__planning__')) {
+              return PLAN_MODE_READ_ONLY_PLANNING_TOOLS.has(toolName)
+                ? { behavior: 'allow' as const, updatedInput: input }
+                : { behavior: 'deny' as const, message: '计划模式下只能查询任务/日程，不能修改本地规划数据，请在计划审批通过后再执行' }
             }
             // 其他 MCP 工具维持既有策略：计划模式下允许调研用 MCP。
             if (toolName.startsWith('mcp__')) {
@@ -1580,10 +1696,25 @@ export class AgentOrchestrator {
         workspaceName: workspace?.name,
         workspaceSlug,
         sessionId,
+        agentCwd,
         permissionMode: initialPermissionMode,
         collaborationAvailable,
         currentModelId: selectedModelId,
       }) + (automationContext ? `\n\n## 定时任务执行上下文\n\n${automationContext}` : '')
+      const startAutoTitleGeneration = (): void => {
+        if (titleGenerationStarted) return
+        titleGenerationStarted = true
+
+        if (channel.provider === 'openai-codex') {
+          this.codexTitleRequestCoordinator.enqueue(channelId, (signal) =>
+            this.autoGenerateTitle(sessionId, userMessage, channelId, resolvedModel, callbacks, signal),
+          )
+          return
+        }
+
+        this.autoGenerateTitle(sessionId, userMessage, channelId, resolvedModel, callbacks)
+          .catch((err) => console.error('[Agent 编排] 标题生成未捕获异常:', err))
+      }
       const handleSessionId = (sdkSessionId: string, piSessionFile?: string): void => {
         // 仅在 session_id 真正变化时才持久化。SDK v2 几乎每条消息都会回调 onSessionId，
         // capturedSdkSessionId 已初始化为 existingSdkSessionId，并在 recovery 时同步重置。
@@ -1592,20 +1723,26 @@ export class AgentOrchestrator {
         capturedSdkSessionId = sdkSessionId
         if (isNewSessionId || needsPiSessionFile) {
           try {
-            updateAgentSessionMeta(sessionId, {
-              sdkSessionId,
-              ...(agentRuntime === 'pi' && piSessionFile ? { piSessionFile } : {}),
-            })
-            console.log(`[Agent 编排] 已保存 SDK session_id: ${sdkSessionId}`)
+            // 用户可在本轮运行中改选下一轮内核；不能让旧 runtime 回填不兼容的 session artifact。
+            const latestSessionMeta = getAgentSessionMeta(sessionId)
+            if (latestSessionMeta?.agentRuntime !== agentRuntime) {
+              console.log(`[Agent 编排] 忽略已切换 runtime 的 session artifact: ${sdkSessionId}`)
+            } else {
+              updateAgentSessionMeta(sessionId, {
+                sdkSessionId,
+                ...(agentRuntime === 'pi' && piSessionFile ? { piSessionFile } : {}),
+              })
+              console.log(`[Agent 编排] 已保存 SDK session_id: ${sdkSessionId}`)
+            }
           } catch (err) {
             console.error(`[Agent 编排] 保存 SDK session_id 失败:`, err)
           }
         }
 
-        if (!titleGenerationStarted) {
-          titleGenerationStarted = true
-          this.autoGenerateTitle(sessionId, userMessage, channelId, resolvedModel, callbacks)
-            .catch((err) => console.error('[Agent 编排] 标题生成未捕获异常:', err))
+        // Codex OAuth 标题会额外占用订阅请求通道，等待主 Agent 请求结束再发起，
+        // 避免在 session.prompt() 前与主请求竞争同一通道。
+        if (channel.provider !== 'openai-codex') {
+          startAutoTitleGeneration()
         }
       }
       const handleModelResolved = (model: string): void => {
@@ -1626,6 +1763,10 @@ export class AgentOrchestrator {
         })
       }
       const piCustomTools = [...piBuiltinTools, ...piMcpTools]
+      // Claude 会话统一使用 Proma sidecar settings，不加载项目根 .claude。
+      const claudeSettingsFilePath = agentRuntime === 'claude' && workspaceId
+        ? ensureClaudeSessionSettings(workspaceId, sessionId)
+        : undefined
       const queryOptions: ClaudeAgentQueryOptions | PiAgentQueryOptions = agentRuntime === 'pi' ? {
         agentRuntime: 'pi',
         sessionId,
@@ -1674,12 +1815,15 @@ export class AgentOrchestrator {
         onSessionId: handleSessionId,
         onPiEntryBindings: (bindings) => {
           const latest = getAgentSessionMeta(sessionId)
+          // 运行中切到其他内核后，保留旧 turn 展示但不再写入 Pi 专用恢复 artifact。
+          if (latest?.agentRuntime !== 'pi') return
           updateAgentSessionMeta(sessionId, {
-            piEntryBindings: { ...(latest?.piEntryBindings ?? {}), ...bindings },
+            piEntryBindings: { ...(latest.piEntryBindings ?? {}), ...bindings },
           })
         },
         onModelResolved: handleModelResolved,
         onContextWindow: handleContextWindow,
+        retryRunStartedAt: streamStartedAt,
         onRetry: (retry) => {
           this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'retry', ...retry } })
         },
@@ -1690,6 +1834,9 @@ export class AgentOrchestrator {
         // 仅 Claude Agent SDK 使用 `[1m]` 扩展上下文变体；Pi 分支保持原始模型 ID。
         model: resolveAgentSdkModelId(selectedModelId, channel.provider),
         cwd: agentCwd,
+        // cwd 由会话元数据决定（项目根或历史 workbench）；始终不加载该目录的 project 配置。
+        settingSources: getClaudeSettingSourcesForWorkspace(),
+        ...(claudeSettingsFilePath && { settingsFilePath: claudeSettingsFilePath }),
         sdkCliPath: cliPath!,
         env: sdkEnv,
         ...(maxTurns != null && { maxTurns }),
@@ -2230,6 +2377,10 @@ export class AgentOrchestrator {
           // 发送完成信号
           completeRun(getAgentSessionMessages(sessionId), { stoppedByUser: wasStoppedByUser, startedAt: streamStartedAt, resultSubtype: capturedResultSubtype, resultErrors: capturedResultErrors })
 
+          if (!wasStoppedByUser && channel.provider === 'openai-codex') {
+            startAutoTitleGeneration()
+          }
+
           break  // 成功完成，退出重试循环
 
         } catch (error) {
@@ -2505,6 +2656,29 @@ export class AgentOrchestrator {
     return this.activeSessions.has(sessionId)
   }
 
+  /** 同一个真实本地项目根只能由一个运行中会话执行文件回退。 */
+  private hasOtherActiveSessionForLocalProjectRoot(sessionId: string, localProjectRoot: string): boolean {
+    for (const activeSessionId of this.activeSessions.keys()) {
+      if (activeSessionId === sessionId) continue
+
+      const activeSessionMeta = getAgentSessionMeta(activeSessionId)
+      if (!activeSessionMeta?.workspaceId) continue
+
+      const activeWorkspace = getAgentWorkspace(activeSessionMeta.workspaceId)
+      if (!activeWorkspace?.projectRootPath) continue
+
+      try {
+        if (resolveLocalProjectRootForRewind(activeWorkspace.projectRootPath) === localProjectRoot) {
+          return true
+        }
+      } catch {
+        // 运行中的会话已通过启动时校验；若其根后来不可用，无法安全比较，跳过即可。
+      }
+    }
+
+    return false
+  }
+
   /**
    * 运行中动态切换会话的权限模式
    *
@@ -2551,6 +2725,17 @@ export class AgentOrchestrator {
       throw new Error('会话没有 SDK session ID，无法回退')
     }
 
+    const workspace = sessionMeta.workspaceId
+      ? getAgentWorkspace(sessionMeta.workspaceId)
+      : undefined
+    const localProjectRoot = workspace?.projectRootPath
+      ? resolveLocalProjectRootForRewind(workspace.projectRootPath)
+      : undefined
+
+    if (localProjectRoot && this.hasOtherActiveSessionForLocalProjectRoot(sessionId, localProjectRoot)) {
+      throw new Error('同一项目的其他会话正在运行，请先停止同项目的其他会话后再回退文件')
+    }
+
     // Pi 使用原生树状 session 导出一个持久 artifact；不能复用 Claude snapshot
     // 或仅截断 renderer JSONL，否则下一轮 resume 会重新加载被舍弃的上下文。
     if (sessionMeta.agentRuntime === 'pi') {
@@ -2568,12 +2753,9 @@ export class AgentOrchestrator {
     // 0.5 从 SDK session JSONL 解析对应的 user message UUID（rewindFiles 需要）
     let projectDir: string | undefined
     let workspaceSlug: string | undefined
-    if (sessionMeta.workspaceId) {
-      const ws = getAgentWorkspace(sessionMeta.workspaceId)
-      if (ws) {
-        workspaceSlug = ws.slug
-        projectDir = getAgentSessionWorkspacePath(ws.slug, sessionMeta.id)
-      }
+    if (workspace) {
+      workspaceSlug = workspace.slug
+      projectDir = resolveAgentCwd(workspace, sessionId, sessionMeta.agentCwdMode)
     }
     const userMessageUuid = resolveUserUuidFromSDK(sessionMeta.sdkSessionId, assistantMessageUuid, projectDir, sessionMeta.forkSourceSdkSessionId)
     console.log(`[Agent 编排] 回退: 解析 user uuid=${userMessageUuid || '未找到'} (assistant uuid=${assistantMessageUuid}, forkSource=${sessionMeta.forkSourceSdkSessionId ?? 'none'})`)
@@ -2624,6 +2806,7 @@ export class AgentOrchestrator {
       console.log(`[Agent 编排] 正在中止所有活跃会话 (${this.activeSessions.size} 个)...`)
     }
     // 即便 activeSessions 为空，也要调 dispose 清理可能残留的 pidMap / 子进程
+    this.codexTitleRequestCoordinator.dispose()
     this.adapter.dispose()
     this.activeSessions.clear()
     this.sessionPermissionModes.clear()
@@ -2650,6 +2833,8 @@ export class AgentOrchestrator {
     mentionedSkills?: string[],
     mentionedMcpServers?: string[],
     mentionedSessionIds?: string[],
+    mentionedTodoIds?: string[],
+    mentionedCalendarEventIds?: string[],
   ): Promise<string> {
     if (!this.activeSessions.has(sessionId)) {
       throw new Error(`[Agent 编排] 会话未运行，无法追加消息: ${sessionId}`)
@@ -2666,7 +2851,7 @@ export class AgentOrchestrator {
       : undefined
 
     let enrichedText = text
-    const referencedSessionsBlock = buildReferencedSessionsPrompt(sessionId, mentionedSessionIds, meta?.workspaceId, workspaceSlug)
+    const referencedSessionsBlock = buildReferencedSessionsPrompt(sessionId, mentionedSessionIds, workspaceSlug)
     if (referencedSessionsBlock) {
       enrichedText = `${referencedSessionsBlock}\n\n${enrichedText}`
     }
@@ -2682,6 +2867,15 @@ export class AgentOrchestrator {
         toolLines.push(`- MCP 服务器: ${name}（请使用此 MCP 服务器的工具来完成任务）`)
       }
       enrichedText = `<mentioned_tools>\n${toolLines.join('\n')}\n</mentioned_tools>\n\n${enrichedText}`
+    }
+    // Planning read tools are Pi-native. Do not direct Claude sessions to unavailable tools.
+    const referencedPlanningBlock = buildReferencedPlanningPrompt(
+      mentionedTodoIds,
+      mentionedCalendarEventIds,
+      { requireToolRead: normalizeAgentRuntime(meta?.agentRuntime ?? 'claude') === 'pi' },
+    )
+    if (referencedPlanningBlock) {
+      enrichedText = `${referencedPlanningBlock}\n\n${enrichedText}`
     }
 
     const uuid = presetUuid || randomUUID()

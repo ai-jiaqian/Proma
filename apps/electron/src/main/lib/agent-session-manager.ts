@@ -13,7 +13,7 @@ import { createInterface } from 'node:readline'
 import { writeJsonFileAtomic, writeTextFileAtomic, readJsonFileSafe } from './safe-file'
 import { randomUUID } from 'node:crypto'
 import { rmSyncWithRetry, renameWithRetry } from './fs-retry'
-import { join, resolve, dirname } from 'node:path'
+import { join, resolve, dirname, isAbsolute, relative, sep, type PlatformPath } from 'node:path'
 import {
   getAgentSessionsIndexPath,
   getAgentSessionsDir,
@@ -22,9 +22,15 @@ import {
   getAgentWorkspacePath,
   getSdkConfigDir,
 } from './config-paths'
-import { getAgentWorkspace, getWorkspaceAutoMemoryDir } from './agent-workspace-manager'
+import {
+  getAgentWorkspace,
+  getProjectFilesPath,
+  getWorkspaceAutoMemoryDir,
+  listAgentWorkspaces,
+} from './agent-workspace-manager'
 import { resolvePiThinkingLevel } from './agent-thinking-level'
 import { getSettings } from './settings-service'
+import { removePromaAutoCompactSettings } from './agent-auto-compact-settings'
 
 // 在模块加载时一次性设置 SDK 配置目录，避免在 forkSession 等异步调用中临时修改/恢复
 // process.env 导致的并发安全问题（异步操作的 await 间隙其他代码可能读到错误值）
@@ -35,11 +41,13 @@ import type {
   AgentSessionMeta,
   AgentMessage,
   SDKMessage,
+  AgentWorkspace,
   ForkSessionInput,
   AgentMessageSearchResult,
   AgentSessionReferenceSearchInput,
   AgentSessionReferenceSearchResult,
   AgentRuntime,
+  AgentCwdMode,
 } from '@proma/shared'
 import { migratePermissionMode } from '@proma/shared'
 import { getConversationMessages } from './conversation-manager'
@@ -71,6 +79,13 @@ const INDEX_VERSION = 1
  * 同时避免极端会话数量下向渲染进程传输过大列表。
  */
 const MAX_SESSION_REFERENCE_LIMIT = 200
+
+/**
+ * 会话引用的正文搜索是输入框补全路径，必须有独立 I/O 预算。
+ * 标题检索仍覆盖全部会话；仅正文 JSONL 检索优先服务最近会话。
+ */
+const MAX_SESSION_REFERENCE_BODY_SCANS = 50
+const MAX_SESSION_REFERENCE_BODY_BYTES_PER_FILE = 256 * 1024
 
 interface JsonlParseError {
   lineNumber: number
@@ -214,6 +229,83 @@ export function getAgentSessionMeta(id: string): AgentSessionMeta | undefined {
   return index.sessions.find((s) => s.id === id)
 }
 
+/** 缺少标记的存量会话必须保持升级前的私有 workbench cwd。 */
+export function getAgentCwdMode(meta?: Pick<AgentSessionMeta, 'agentCwdMode'>): AgentCwdMode {
+  return meta?.agentCwdMode ?? 'session'
+}
+
+/** Agent 运行 cwd 与 Proma 会话 sidecar 工作台目录解析。 */
+export function resolveAgentCwd(
+  workspace: Pick<AgentWorkspace, 'slug'> | undefined,
+  sessionId: string,
+  agentCwdMode?: AgentCwdMode,
+): string | undefined {
+  if (!workspace) return undefined
+  return getAgentCwdMode({ agentCwdMode }) === 'project'
+    ? getProjectFilesPath(workspace.slug)
+    : getAgentSessionWorkspacePath(workspace.slug, sessionId)
+}
+
+export function resolveAgentWorkbenchDir(
+  workspace: Pick<AgentWorkspace, 'slug' | 'projectRootPath'> | undefined,
+  sessionId: string,
+): string | undefined {
+  if (!workspace) return undefined
+  return getAgentSessionWorkspacePath(workspace.slug, sessionId)
+}
+
+/**
+ * 确保 Claude runtime 的 Proma 会话 sidecar 配置存在。
+ *
+ * Claude 不能依赖 project settings source；此文件会由 adapter 通过 SDK `settings` 选项显式加载。
+ * 新会话的计划目录相对于项目根设置，历史会话保留原先相对于私有 workbench 的 `.context` 语义。
+ */
+export function ensureClaudeSessionSettings(workspaceId: string, sessionId: string): string | undefined {
+  const workspace = getAgentWorkspace(workspaceId)
+  if (!workspace) return undefined
+
+  const sessionDir = getAgentSessionWorkspacePath(workspace.slug, sessionId)
+  const sessionMeta = getAgentSessionMeta(sessionId)
+  const agentCwdMode = getAgentCwdMode(sessionMeta)
+  const claudeDir = join(sessionDir, '.claude')
+  if (!existsSync(claudeDir)) mkdirSync(claudeDir, { recursive: true })
+
+  const settingsPath = join(claudeDir, 'settings.json')
+  let sdkSettings: Record<string, unknown> = {}
+  try {
+    sdkSettings = JSON.parse(readFileSync(settingsPath, 'utf-8'))
+  } catch { /* 文件不存在或解析失败 */ }
+
+  let needsWrite = false
+  const privatePlansDir = join(sessionDir, '.context', 'plan')
+  if (!existsSync(privatePlansDir)) mkdirSync(privatePlansDir, { recursive: true })
+  const agentCwd = resolveAgentCwd(workspace, sessionId, agentCwdMode) ?? sessionDir
+  const plansDirectory = agentCwdMode === 'project'
+    ? relative(agentCwd, privatePlansDir) || '.'
+    : '.context'
+  if (sdkSettings.plansDirectory !== plansDirectory) {
+    sdkSettings.plansDirectory = plansDirectory
+    needsWrite = true
+  }
+  if (sdkSettings.skipWebFetchPreflight !== true) {
+    sdkSettings.skipWebFetchPreflight = true
+    needsWrite = true
+  }
+  const autoMemoryDirectory = getWorkspaceAutoMemoryDir(workspace.slug)
+  if (sdkSettings.autoMemoryDirectory !== autoMemoryDirectory) {
+    sdkSettings.autoMemoryDirectory = autoMemoryDirectory
+    needsWrite = true
+  }
+  if (removePromaAutoCompactSettings(sdkSettings)) {
+    needsWrite = true
+  }
+  if (needsWrite) {
+    writeFileSync(settingsPath, JSON.stringify(sdkSettings, null, 2))
+  }
+
+  return settingsPath
+}
+
 /**
  * 创建新会话
  */
@@ -223,6 +315,7 @@ export function createAgentSession(
   workspaceId?: string,
   modelId?: string,
   agentRuntime: AgentRuntime = 'pi',
+  agentCwdMode?: AgentCwdMode,
 ): AgentSessionMeta {
   const index = readIndex()
   const now = Date.now()
@@ -236,6 +329,7 @@ export function createAgentSession(
     channelId,
     modelId,
     workspaceId,
+    agentCwdMode: workspaceId ? agentCwdMode ?? 'project' : undefined,
     agentRuntime,
     // 新会话继承已持久化的全局思考偏好，之后仍可按会话单独调整。
     reasoningLevel: defaultThinkingLevel,
@@ -249,39 +343,18 @@ export function createAgentSession(
   // 确保消息目录存在
   getAgentSessionsDir()
 
-  // 若有工作区，创建 session 级别子文件夹并初始化 .claude / .context
+  // 若有工作区，创建 session 级别子文件夹和 Proma 工作台目录。
   if (workspaceId) {
     const ws = getAgentWorkspace(workspaceId)
     if (ws) {
       const sessionDir = getAgentSessionWorkspacePath(ws.slug, meta.id)
 
-      // 初始化 .claude/settings.json（plansDirectory → .context）
-      const claudeDir = join(sessionDir, '.claude')
-      if (!existsSync(claudeDir)) mkdirSync(claudeDir, { recursive: true })
-      const settingsPath = join(claudeDir, 'settings.json')
-      let sdkSettings: Record<string, unknown> = {}
-      try {
-        sdkSettings = JSON.parse(readFileSync(settingsPath, 'utf-8'))
-      } catch { /* 文件不存在或解析失败 */ }
-      let needsWrite = false
-      if (sdkSettings.plansDirectory !== '.context') {
-        sdkSettings.plansDirectory = '.context'
-        needsWrite = true
-      }
-      if (sdkSettings.skipWebFetchPreflight !== true) {
-        sdkSettings.skipWebFetchPreflight = true
-        needsWrite = true
-      }
-      const autoMemoryDirectory = getWorkspaceAutoMemoryDir(ws.slug)
-      if (sdkSettings.autoMemoryDirectory !== autoMemoryDirectory) {
-        sdkSettings.autoMemoryDirectory = autoMemoryDirectory
-        needsWrite = true
-      }
-      if (needsWrite) {
-        writeFileSync(settingsPath, JSON.stringify(sdkSettings, null, 2))
+      // 仅 Claude runtime 需要此 SDK 配置；本地项目同样放在 Proma sidecar，避免污染用户项目根目录。
+      if (agentRuntime === 'claude') {
+        ensureClaudeSessionSettings(workspaceId, meta.id)
       }
 
-      // 初始化 .context/ 目录
+      // .context 是 Proma 的会话工作台，本地项目同样需要。
       const contextDir = join(sessionDir, '.context')
       if (!existsSync(contextDir)) mkdirSync(contextDir, { recursive: true })
     }
@@ -638,7 +711,7 @@ export function moveSessionToWorkspace(sessionId: string, targetWorkspaceId: str
 
   const targetWs = getAgentWorkspace(targetWorkspaceId)
   if (!targetWs) {
-    throw new Error(`目标工作区不存在: ${targetWorkspaceId}`)
+    throw new Error(`目标项目不存在: ${targetWorkspaceId}`)
   }
 
   const sessionTreeIds = collectSessionTreeIds(index.sessions, sessionId)
@@ -752,14 +825,12 @@ export async function forkAgentSession(input: ForkSessionInput): Promise<AgentSe
       })
     : sourceMeta.modelId
 
-  // 2. 确定源会话的工作目录（SDK 需要从此目录的项目空间读取 session 文件）
-  let sourceDir: string | undefined
-  if (sourceMeta.workspaceId) {
-    const ws = getAgentWorkspace(sourceMeta.workspaceId)
-    if (ws) {
-      sourceDir = getAgentSessionWorkspacePath(ws.slug, sessionId)
-    }
-  }
+  // 2. 确定源会话的 Agent cwd。fork 必须继承源会话的持久化 cwd 语义。
+  // sidecar 工作台单独解析，fork 时仍需复制其中的 .context 等会话临时文件。
+  const workspace = sourceMeta.workspaceId ? getAgentWorkspace(sourceMeta.workspaceId) : undefined
+  const sourceCwdMode = getAgentCwdMode(sourceMeta)
+  const sourceDir = resolveAgentCwd(workspace, sessionId, sourceCwdMode)
+  const sourceWorkbenchDir = resolveAgentWorkbenchDir(workspace, sessionId)
 
   // 2.5 校验目标消息并确定其所属的 SDK session ID
   // - 当会话经历过 "session not found" 恢复后，sdkSessionId 会被替换为新的，
@@ -816,6 +887,7 @@ export async function forkAgentSession(input: ForkSessionInput): Promise<AgentSe
     sourceMeta.workspaceId,
     forkModelId,
     'claude',
+    sourceCwdMode,
   )
 
   updateAgentSessionMeta(newMeta.id, {
@@ -828,22 +900,19 @@ export async function forkAgentSession(input: ForkSessionInput): Promise<AgentSe
   newMeta.forkSourceDir = sourceDir
   newMeta.forkSourceSdkSessionId = forkSourceSdkSessionId
 
-  // 4.4 计算 fork 目标会话的 cwd（新会话目录），后续多个步骤需要用到
-  let destDir: string | undefined
-  if (sourceDir && sourceMeta.workspaceId) {
-    const ws = getAgentWorkspace(sourceMeta.workspaceId)
-    if (ws) {
-      destDir = getAgentSessionWorkspacePath(ws.slug, newMeta.id)
-    }
-  }
+  // 4.4 计算 fork 目标的 Agent cwd 与 sidecar 工作台目录。
+  const destDir = resolveAgentCwd(workspace, newMeta.id, newMeta.agentCwdMode)
+  const destWorkbenchDir = resolveAgentWorkbenchDir(workspace, newMeta.id)
 
-  // 4.5 将 SDK session JSONL 复制到 fork 自己的 project-hash 目录
+  // 4.5 仅在源、目标 cwd 不同的历史会话 fork 场景中复制 SDK session JSONL。
   // SDK forkSession() 在源 cwd 的 project-hash 下创建 JSONL（如 projects/<hash-of-sourceDir>/<newId>.jsonl），
-  // 但 fork 会话的 cwd 是新的 session 目录（不同 project-hash），resume 时 SDK 会找不到。
+  // 但历史会话的 fork cwd 可能不同，resume 时 SDK 会找不到。
   // 这里直接将 JSONL 复制到 fork 目标 cwd 的 project-hash 下，让后续每轮 resume 都能直接命中。
   // 同时把 JSONL 内容中所有源目录路径改写为目标目录路径，避免历史中的绝对路径误导 Claude
   // 继续在源目录下读写文件。
-  if (sourceDir && destDir) {
+  // 统一项目根后的新会话两端 cwd 相同，forkSession 已经在正确的共享 project-hash 中创建文件，
+  // 不能再次复制到同一路径，否则会在读源文件前将其截断。
+  if (sourceDir && destDir && sourceDir !== destDir) {
     const sourceJsonl = findSdkSessionJsonl(forkResult.sessionId)
     if (sourceJsonl) {
       // SDK 使用简单的字符替换计算 project-hash：path.replace(/[^a-zA-Z0-9]/g, '-')
@@ -862,19 +931,19 @@ export async function forkAgentSession(input: ForkSessionInput): Promise<AgentSe
     }
   }
 
-  // 5. 复制源会话工作区文件到新会话目录
+  // 5. 复制源会话 sidecar 工作台文件到新会话目录；绝不复制本地项目根。
   // 保留 .context/，但跳过依赖、构建产物和 Git 元数据，避免 fork 点击时同步复制巨量目录拖垮主进程。
   // .context/ 必须保留 — Proma 约定 .context/note.md、todo.md、plan/ 等是会话上下文，
   // 如果不复制，fork 后这些参考资料会丢失或被 Claude 误回源目录读取。
-  if (sourceDir && destDir) {
+  if (sourceWorkbenchDir && destWorkbenchDir) {
     try {
-      const copyResult = copyForkWorkspaceFiles(sourceDir, destDir)
+      const copyResult = copyForkWorkspaceFiles(sourceWorkbenchDir, destWorkbenchDir)
       console.log(
-        `[Agent 会话] 已复制工作区文件: ${sourceDir} → ${destDir} `
+        `[Agent 会话] 已复制工作台文件: ${sourceWorkbenchDir} → ${destWorkbenchDir} `
         + `(${copyResult.copiedCount} 个条目, 跳过 ${copyResult.skippedCount} 个, 失败 ${copyResult.failedCount} 个)`,
       )
     } catch (err) {
-      console.warn(`[Agent 会话] 复制工作区文件失败:`, err)
+      console.warn(`[Agent 会话] 复制工作台文件失败:`, err)
     }
   }
 
@@ -912,15 +981,13 @@ async function forkPiAgentSession(sourceMeta: AgentSessionMeta, input: ForkSessi
   const forkModelId = input.modelId !== undefined
     ? assertEnabledModelForChannel({ channelId: sourceMeta.channelId, modelId: input.modelId, purpose: '分叉 Pi Agent 会话' })
     : sourceMeta.modelId
-  const sourceDir = sourceMeta.workspaceId
-    ? getAgentWorkspace(sourceMeta.workspaceId)
-      ? getAgentSessionWorkspacePath(getAgentWorkspace(sourceMeta.workspaceId)!.slug, sourceMeta.id)
-      : undefined
-    : undefined
-  const newMeta = createAgentSession(`${sourceMeta.title} (fork)`, sourceMeta.channelId, sourceMeta.workspaceId, forkModelId, 'pi')
-  const destDir = sourceMeta.workspaceId && getAgentWorkspace(sourceMeta.workspaceId)
-    ? getAgentSessionWorkspacePath(getAgentWorkspace(sourceMeta.workspaceId)!.slug, newMeta.id)
-    : undefined
+  const workspace = sourceMeta.workspaceId ? getAgentWorkspace(sourceMeta.workspaceId) : undefined
+  const sourceCwdMode = getAgentCwdMode(sourceMeta)
+  const sourceDir = resolveAgentCwd(workspace, sourceMeta.id, sourceCwdMode)
+  const sourceWorkbenchDir = resolveAgentWorkbenchDir(workspace, sourceMeta.id)
+  const newMeta = createAgentSession(`${sourceMeta.title} (fork)`, sourceMeta.channelId, sourceMeta.workspaceId, forkModelId, 'pi', sourceCwdMode)
+  const destDir = resolveAgentCwd(workspace, newMeta.id, newMeta.agentCwdMode)
+  const destWorkbenchDir = resolveAgentWorkbenchDir(workspace, newMeta.id)
 
   try {
     const sdk = await import('@earendil-works/pi-coding-agent')
@@ -944,7 +1011,7 @@ async function forkPiAgentSession(sourceMeta: AgentSessionMeta, input: ForkSessi
     newMeta.piSessionFile = piSessionFile
     newMeta.piEntryBindings = { ...(sourceMeta.piEntryBindings ?? {}) }
 
-    if (sourceDir && destDir) copyForkWorkspaceFiles(sourceDir, destDir)
+    if (sourceWorkbenchDir && destWorkbenchDir) copyForkWorkspaceFiles(sourceWorkbenchDir, destWorkbenchDir)
     await copyForkStoredSDKMessages({
       sourceSessionId: sourceMeta.id,
       destSessionId: newMeta.id,
@@ -967,9 +1034,8 @@ export async function rewindPiAgentSession(sessionId: string, assistantMessageUu
   const entryId = meta.piEntryBindings?.[assistantMessageUuid]
   if (!entryId) throw new Error('该 Pi 历史消息尚无 entry ID 映射，无法安全回退')
   if (!meta.piSessionFile || !existsSync(meta.piSessionFile)) throw new Error('未找到 Pi session artifact，无法安全回退')
-  const cwd = meta.workspaceId && getAgentWorkspace(meta.workspaceId)
-    ? getAgentSessionWorkspacePath(getAgentWorkspace(meta.workspaceId)!.slug, meta.id)
-    : process.cwd()
+  const workspace = meta.workspaceId ? getAgentWorkspace(meta.workspaceId) : undefined
+  const cwd = resolveAgentCwd(workspace, meta.id, meta.agentCwdMode) ?? process.cwd()
   const sdk = await import('@earendil-works/pi-coding-agent')
   const manager = sdk.SessionManager.open(meta.piSessionFile, join(getSdkConfigDir(), 'sessions'), cwd)
   const branchFile = manager.createBranchedSession(entryId)
@@ -1399,6 +1465,38 @@ function findSdkSessionJsonl(sdkSessionId: string, _projectDir?: string): string
   return undefined
 }
 
+type RewindPathApi = Pick<PlatformPath, 'isAbsolute' | 'resolve' | 'relative' | 'sep'>
+
+const nativeRewindPathApi: RewindPathApi = { isAbsolute, resolve, relative, sep }
+
+/**
+ * 将快照中的路径解析为允许目录内的绝对路径。
+ * pathApi 参数让 Windows 路径语义可以在非 Windows 平台上独立测试。
+ */
+export function resolveSafeRewindPath(
+  filePath: string,
+  cwd: string,
+  attachedDirectories: string[] = [],
+  pathApi: RewindPathApi = nativeRewindPathApi,
+): string | undefined {
+  const resolvedCwd = pathApi.resolve(cwd)
+  const resolvedPath = pathApi.isAbsolute(filePath)
+    ? pathApi.resolve(filePath)
+    : pathApi.resolve(resolvedCwd, filePath)
+  const allowedDirs = [resolvedCwd, ...attachedDirectories.map((dir) => pathApi.resolve(dir))]
+
+  const isAllowed = allowedDirs.some((dir) => {
+    const relativePath = pathApi.relative(dir, resolvedPath)
+    return relativePath === '' || (
+      relativePath !== '..'
+      && !relativePath.startsWith(`..${pathApi.sep}`)
+      && !pathApi.isAbsolute(relativePath)
+    )
+  })
+
+  return isAllowed ? resolvedPath : undefined
+}
+
 /**
  * 直接从 SDK JSONL 的 file-history-snapshot 恢复文件到指定 user message 时的状态。
  *
@@ -1540,18 +1638,10 @@ export function rewindFilesFromSnapshot(
     const fileHistoryDir = join(sdkConfigDir, 'file-history', effectiveSdkSessionId)
     const filesChanged: string[] = []
 
-    const resolvedCwd = resolve(cwd)
-    // 预计算允许写入的目录列表（cwd + attachedDirectories）
-    const allowedDirs = [resolvedCwd, ...(attachedDirectories || []).map((d) => resolve(d))]
-
     for (const [filePath, backupFileName] of fileState) {
       // SDK 对 cwd 内文件使用相对路径，对 additionalDirectories 内文件使用绝对路径
-      const isAbsolute = filePath.startsWith('/')
-      const fullPath = isAbsolute ? resolve(filePath) : resolve(cwd, filePath)
-
-      // 路径安全检查：文件必须位于 cwd 或 attachedDirectories 之内
-      const isInAllowedDir = allowedDirs.some((dir) => fullPath.startsWith(dir + '/') || fullPath === dir)
-      if (!isInAllowedDir) {
+      const fullPath = resolveSafeRewindPath(filePath, cwd, attachedDirectories)
+      if (!fullPath) {
         console.warn(`[Agent 会话] rewindFiles: 拒绝路径越界 ${filePath}`)
         continue
       }
@@ -1569,9 +1659,8 @@ export function rewindFilesFromSnapshot(
         }
       } else {
         // 文件在 target 时存在 → 用备份恢复
-        const backupPath = resolve(fileHistoryDir, backupFileName)
-        // backupPath 越界检查
-        if (!backupPath.startsWith(resolve(fileHistoryDir) + '/') && backupPath !== resolve(fileHistoryDir)) {
+        const backupPath = resolveSafeRewindPath(backupFileName, fileHistoryDir)
+        if (!backupPath) {
           console.warn(`[Agent 会话] rewindFiles: 拒绝备份路径越界 ${backupFileName}`)
           continue
         }
@@ -1747,9 +1836,13 @@ export async function searchAgentSessionMessages(query: string): Promise<AgentMe
 async function findFirstMatchInAgentJsonl(
   filePath: string,
   queryLower: string,
-  queryLength: number
+  queryLength: number,
+  maxBytes?: number,
 ): Promise<{ messageId: string; role: AgentMessageSearchResult['role']; snippet: string; matchStart: number } | null> {
-  const stream = createReadStream(filePath, { encoding: 'utf-8' })
+  const stream = createReadStream(filePath, {
+    encoding: 'utf-8',
+    ...(maxBytes ? { end: maxBytes - 1 } : {}),
+  })
   const rl = createInterface({ input: stream, crlfDelay: Infinity })
 
   try {
@@ -1807,122 +1900,98 @@ async function findFirstMatchInAgentJsonl(
   }
 }
 
-function extractTextFromPersistedMessage(parsed: unknown): string {
-  if (!parsed || typeof parsed !== 'object') return ''
-  const record = parsed as {
-    content?: unknown
-    message?: { content?: Array<{ type: string; text?: string }> }
-  }
-
-  if (typeof record.content === 'string') {
-    return record.content
-  }
-
-  if (Array.isArray(record.message?.content)) {
-    return record.message.content
-      .filter((b) => b.type === 'text' && b.text)
-      .map((b) => b.text!)
-      .join('\n')
-  }
-
-  return ''
-}
-
-function createSnippet(text: string, matchIndex: number, matchLength: number): string {
-  const snippetStart = Math.max(0, matchIndex - 48)
-  const snippetEnd = Math.min(text.length, matchIndex + matchLength + 48)
-  return (snippetStart > 0 ? '...' : '') +
-    text.slice(snippetStart, snippetEnd) +
-    (snippetEnd < text.length ? '...' : '')
-}
-
-function findSessionMessageSnippet(sessionId: string, query: string): string | undefined {
+async function findSessionMessageSnippet(
+  sessionId: string,
+  query: string,
+  maxBytes?: number,
+): Promise<string | undefined> {
   if (!query || query.length < 2) return undefined
 
   const filePath = getAgentSessionMessagesPath(sessionId)
   if (!existsSync(filePath)) return undefined
 
-  const queryLower = query.toLowerCase()
   try {
-    const raw = readFileSync(filePath, 'utf-8')
-    const lines = raw.split('\n').filter((line) => line.trim())
-
-    for (const line of lines) {
-      let parsed: unknown
-      try {
-        parsed = JSON.parse(line)
-      } catch (error) {
-        console.warn(`[Agent 会话] 会话引用摘要跳过无法解析的 JSONL 行 (${sessionId}):`, error)
-        continue
-      }
-      const textContent = extractTextFromPersistedMessage(parsed)
-      if (!textContent) continue
-
-      const matchIndex = textContent.toLowerCase().indexOf(queryLower)
-      if (matchIndex === -1) continue
-
-      return createSnippet(textContent, matchIndex, query.length)
-    }
+    const hit = await findFirstMatchInAgentJsonl(filePath, query.toLowerCase(), query.length, maxBytes)
+    return hit?.snippet
   } catch {
     return undefined
   }
+}
 
-  return undefined
+function createSessionReferenceSearchResult(
+  session: AgentSessionMeta,
+  workspacesById: ReadonlyMap<string, { name: string; slug: string }>,
+  fields: Pick<AgentSessionReferenceSearchResult, 'matchSource' | 'snippet'>,
+): AgentSessionReferenceSearchResult {
+  const workspace = session.workspaceId ? workspacesById.get(session.workspaceId) : undefined
+
+  return {
+    sessionId: session.id,
+    title: session.title,
+    ...(workspace ? {
+      workspaceName: workspace.name,
+      workspaceSlug: workspace.slug,
+    } : {}),
+    updatedAt: session.updatedAt,
+    ...fields,
+  }
 }
 
 /**
- * 搜索当前工作区可引用的 Agent 会话。
+ * 搜索可引用的 Agent 会话。
  *
- * 仅返回当前工作区、未归档、非当前会话的结果；无关键词时返回最近更新的会话。
+ * 指定工作区时仅返回该工作区；省略工作区时跨工作区搜索。两种模式都排除已归档和当前会话；无关键词时返回最近更新的会话。
  */
-export function searchAgentSessionReferences(input: AgentSessionReferenceSearchInput): AgentSessionReferenceSearchResult[] {
+export async function searchAgentSessionReferences(input: AgentSessionReferenceSearchInput): Promise<AgentSessionReferenceSearchResult[]> {
   const workspaceId = input?.workspaceId?.trim()
-  if (!workspaceId) return []
 
   const query = (input?.query ?? '').trim()
   const queryLower = query.toLowerCase()
   const requestedLimit = Number.isFinite(input?.limit) ? input.limit! : 20
   const limit = Math.min(Math.max(requestedLimit, 1), MAX_SESSION_REFERENCE_LIMIT)
+  const workspacesById = new Map(
+    listAgentWorkspaces().map((workspace) => [workspace.id, workspace]),
+  )
 
   const candidates = listAgentSessions()
-    .filter((session) => session.workspaceId === workspaceId)
+    .filter((session) => !workspaceId || session.workspaceId === workspaceId)
     .filter((session) => !session.archived)
     .filter((session) => session.id !== input?.excludeSessionId)
 
   const results: AgentSessionReferenceSearchResult[] = []
+  let bodyScanCount = 0
 
   for (const session of candidates) {
     if (results.length >= limit) break
 
     if (!queryLower) {
-      results.push({
-        sessionId: session.id,
-        title: session.title,
-        updatedAt: session.updatedAt,
+      results.push(createSessionReferenceSearchResult(session, workspacesById, {
         matchSource: 'recent',
-      })
+      }))
       continue
     }
 
     if (session.title.toLowerCase().includes(queryLower)) {
-      results.push({
-        sessionId: session.id,
-        title: session.title,
-        updatedAt: session.updatedAt,
+      results.push(createSessionReferenceSearchResult(session, workspacesById, {
         matchSource: 'title',
-      })
+      }))
       continue
     }
 
-    const snippet = findSessionMessageSnippet(session.id, query)
+    // 即使正文预算耗尽，仍继续遍历，确保较旧但标题命中的会话不会漏掉。
+    if (bodyScanCount >= MAX_SESSION_REFERENCE_BODY_SCANS) continue
+    bodyScanCount += 1
+
+    const snippet = await findSessionMessageSnippet(
+      session.id,
+      query,
+      MAX_SESSION_REFERENCE_BODY_BYTES_PER_FILE,
+    )
     if (snippet) {
-      results.push({
-        sessionId: session.id,
-        title: session.title,
-        updatedAt: session.updatedAt,
+      results.push(createSessionReferenceSearchResult(session, workspacesById, {
         snippet,
         matchSource: 'message',
-      })
+      }))
     }
   }
 
