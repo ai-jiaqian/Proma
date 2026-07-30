@@ -6,8 +6,10 @@ mock.module('./user-profile-service', () => ({
 }))
 
 mock.module('./agent-workspace-manager', () => ({
-  getAgentWorkspaceBySlug: () => undefined,
-  getProjectFilesPath: () => '/tmp/sample-project',
+  getAgentWorkspaceBySlug: (slug: string) =>
+    slug === 'local-project' ? { slug, projectRootPath: '/tmp/local-project' } : undefined,
+  getProjectFilesPath: (slug: string) =>
+    slug === 'local-project' ? '/tmp/local-project' : '/tmp/sample-project',
   getWorkspaceMcpConfig: () => ({ servers: {} }),
 }))
 
@@ -29,6 +31,17 @@ function buildPrompt(agentCwd: string): string {
     workspaceSlug: 'sample-project',
     sessionId: 'session-1',
     agentCwd,
+    permissionMode: 'bypassPermissions',
+  })
+}
+
+function buildLocalProjectPrompt(): string {
+  return buildSystemPrompt({
+    agentRuntime: 'pi',
+    workspaceName: '本地项目',
+    workspaceSlug: 'local-project',
+    sessionId: 'session-2',
+    agentCwd: '/tmp/local-project',
     permissionMode: 'bypassPermissions',
   })
 }
@@ -78,6 +91,35 @@ describe('项目与会话工作台提示词', () => {
 
     expect(context).toContain('项目: 示例项目')
     expect(context).not.toContain('工作区: 示例项目')
+  })
+})
+
+describe('fork 目录原生模式：本地项目走 AGENTS.md', () => {
+  test('Given 本地项目 When 构建提示词 Then 不注入 Proma 记忆体系', () => {
+    const prompt = buildLocalProjectPrompt()
+
+    expect(prompt).not.toContain('KNOWLEDGE_MANAGEMENT_SECTION')
+    expect(prompt).not.toContain('内容路由')
+    expect(prompt).not.toContain('Auto Memory')
+    expect(prompt).not.toContain('PROJECT.md')
+  })
+
+  test('Given 本地项目 When 构建提示词 Then 指引使用项目根 AGENTS.md', () => {
+    const prompt = buildLocalProjectPrompt()
+
+    expect(prompt).toContain('AGENTS.md')
+    expect(prompt).toContain('项目根目录（工作目录）: /tmp/local-project')
+  })
+
+  test('Given 本地项目 When 构建动态上下文 Then 不注入 PROJECT.md 块', () => {
+    const context = buildDynamicContext({
+      workspaceName: '本地项目',
+      workspaceSlug: 'local-project',
+      agentCwd: '/tmp/local-project',
+    })
+
+    expect(context).not.toContain('PROJECT.md')
+    expect(context).toContain('项目: 本地项目')
   })
 })
 

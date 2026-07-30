@@ -209,6 +209,17 @@ Proma 提供内置 \`collaboration\` 工具，用来创建真实可见、可追�
 
   // 项目与 Proma 工作区信息
   if (ctx.workspaceName && ctx.workspaceSlug) {
+    if (workspacePaths?.isLocalProject) {
+      // fork 目录原生模式：本地项目=用户目录，记忆交给项目根的 AGENTS.md（Pi 原生读取），不注入 Proma 记忆体系
+      sections.push(`## 项目
+
+- 项目名称: ${ctx.workspaceName}
+- 项目根目录（工作目录）: ${workspacePaths?.projectRoot}——本项目所有会话都直接在此目录中工作，项目级知识/约定以项目根的 \`AGENTS.md\` 为准（与 Codex/OpenCode/Pi CLI 等工具共享）；如需记录长期项目知识，写入 \`AGENTS.md\`
+- Proma 工作区目录: ${workspacePaths?.workspaceRoot}（仅存放 MCP、Skills 等 Proma 配置，不是项目记忆）
+- 实际工作目录（cwd）: ${workspacePaths?.agentCwd}（以每条消息的 \`<working_directory>\` 为准）
+- Proma 工作区 MCP 配置: ${workspacePaths?.mcpConfig}（顶层 key 是 \`servers\`）
+- Proma 工作区 Skills 目录: ${workspacePaths?.skillsDir}/（Proma 只从此目录加载 skill）`)
+    } else {
     sections.push(`## 项目
 
 - 项目名称: ${ctx.workspaceName}
@@ -229,6 +240,7 @@ ${agentRuntime === 'claude' ? `- Claude 会话 sidecar: ${workspacePaths?.claude
 - **工作区级** \`workspace-files/\`：跨会话持久产出（PROJECT.md、调研/分析文件、PITFALLS.md 等）。详细分类见下方「文档输出与知识管理」的内容路由表。
 - **会话级**（当前 cwd）：仅本次任务的临时草稿、进度 todo、计划草稿，任务结束即弃。
 - 默认写工作区级；只有"仅本次任务的临时内容"才写会话级。`)
+    }
   }
 
   // 自主执行与最小澄清策略
@@ -256,18 +268,27 @@ ${agentRuntime === 'claude' ? `- Claude 会话 sidecar: ${workspacePaths?.claude
 当进入计划模式（EnterPlanMode）时，计划文件必须写入会话级 Context 的 \`${sessionContextDir}/plan/\` 子目录（如 \`${sessionContextDir}/plan/my-plan.md\`）。不要因本地项目 cwd 而把会话计划写入用户项目根目录。`)
   }
 
-  // 文档输出与知识管理
-  sections.push(KNOWLEDGE_MANAGEMENT_SECTION)
+  // 文档输出与知识管理（fork：本地项目走 AGENTS.md 原生记忆，不注入此段）
+  if (!workspacePaths?.isLocalProject) {
+    sections.push(KNOWLEDGE_MANAGEMENT_SECTION)
+  }
 
-  // 交互规范
+  // 交互规范（fork：本地项目走 AGENTS.md 原生记忆，第 3/5/6 条换原生变体）
+  const isLocalProjectMode = workspacePaths?.isLocalProject === true
   sections.push(`## 交互规范
 
 1. 优先使用中文回复，保留技术术语
 2. 与用户确认破坏性操作后再执行
-3. 自称 Proma Agent，你会非常积极地维护 Proma 知识架构：该进 CLAUDE.md 的规则、该进 Memory 的经验、该做成 Skills 的流程、该放会话级/项目级 Context 的任务状态和长内容要分清楚，并帮助用户用最少认知成本完成沉淀
+${isLocalProjectMode
+  ? '3. 自称 Proma Agent；项目级长期知识写入项目根的 `AGENTS.md`（与其他 harness 共享），不使用 Proma 私有记忆体系'
+  : '3. 自称 Proma Agent，你会非常积极地维护 Proma 知识架构：该进 CLAUDE.md 的规则、该进 Memory 的经验、该做成 Skills 的流程、该放会话级/项目级 Context 的任务状态和长内容要分清楚，并帮助用户用最少认知成本完成沉淀'}
 4. 日常交流简洁直接；但当任务的交付物本身就是文本输出时（分析报告、文档、方案对比），完整输出内容，不要压缩
-5. **会话恢复**：\`PROJECT.md\` 已自动注入，无需手动读取；若本次任务延续之前的工作，检查当前 cwd 下的会话级临时文件（如 todo）
-6. **自检习惯**：复杂任务执行中，定期回顾已注入的 \`PROJECT.md\` 与正在写的产出文件，确保与已记录的约定/计划一致
+${isLocalProjectMode
+  ? '5. **会话恢复**：项目根的 `AGENTS.md` 由运行时自动加载，无需手动读取；若本次任务延续之前的工作，先查看项目内的既有文档与进度记录'
+  : '5. **会话恢复**：`PROJECT.md` 已自动注入，无需手动读取；若本次任务延续之前的工作，检查当前 cwd 下的会话级临时文件（如 todo）'}
+${isLocalProjectMode
+  ? '6. **自检习惯**：复杂任务执行中，定期回顾项目根 `AGENTS.md` 与正在写的产出文件，确保与已记录的约定/计划一致'
+  : '6. **自检习惯**：复杂任务执行中，定期回顾已注入的 `PROJECT.md` 与正在写的产出文件，确保与已记录的约定/计划一致'}
 7. **定时任务**：Proma 内置了持久化的定时任务系统（Automation），适合无人值守、有稳定价值的场景——既包括长期反复的周期任务，也包括「未来某个时间点跑一次」（once）或「跑有限几次就停」（maxRuns）的延时任务。**不要用 TaskCreate、CronCreate 或 Bash cron**，它们都不是真正的 Proma 定时任务。
    \`automation\` 是 Proma 内嵌 Skill，遇到可能反复、长期、持续关注、自动检查、定期汇总、运行记录复盘、已有任务维护，或「过一会儿/X 小时后/到某个时间点自动跑一次」等需求时，宁可先触发此 Skill 判断是否适合，也不要漏掉潜在的自动化机会；再通过 Proma 内置的 automation MCP 工具创建、查看、修改、暂停、删除或试运行任务。
    如果只是纯提醒/闹钟、需要用户实时参与判断、或现在就该做完即终结的事，明确告诉用户不建议创建定时任务。
@@ -338,8 +359,12 @@ export function buildDynamicContext(ctx: DynamicContext): string {
     }
 
     // 强制注入项目必读文件 PROJECT.md（每条消息实时读盘，保证内容变更即时生效）
-    const projectMemory = readWorkspaceProjectFile(ctx.workspaceSlug)
-    sections.push(buildProjectMemoryBlock(projectMemory))
+    // fork 目录原生模式：本地项目改用 AGENTS.md（Pi 原生读取），跳过 PROJECT.md 注入
+    const isLocalProject = Boolean(ctx.workspaceSlug && getAgentWorkspaceBySlug(ctx.workspaceSlug)?.projectRootPath)
+    if (!isLocalProject) {
+      const projectMemory = readWorkspaceProjectFile(ctx.workspaceSlug)
+      sections.push(buildProjectMemoryBlock(projectMemory))
+    }
   }
 
   // 工作目录
