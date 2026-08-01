@@ -74,15 +74,27 @@ export function GeneralSettings(): React.ReactElement {
   const [nameInput, setNameInput] = React.useState(userProfile.userName)
   const [showEmojiPicker, setShowEmojiPicker] = React.useState(false)
   const [archiveAfterDays, setArchiveAfterDays] = React.useState<number>(7)
+  const [agentIslandEnabled, setAgentIslandEnabled] = React.useState(true)
   const fileInputRef = React.useRef<HTMLInputElement>(null)
 
   // 加载归档天数设置
   React.useEffect(() => {
     window.electronAPI.getSettings().then((settings) => {
       setArchiveAfterDays(settings.archiveAfterDays ?? 7)
+      setAgentIslandEnabled(settings.agentIsland?.enabled ?? true)
     }).catch(console.error)
   }, [])
 
+  /** 更新灵动岛开关 */
+  const handleAgentIslandChange = async (checked: boolean): Promise<void> => {
+    setAgentIslandEnabled(checked)
+    try {
+      await window.electronAPI.updateSettings({ agentIsland: { enabled: checked } })
+    } catch (error) {
+      console.error('[通用设置] 更新 Agent 灵动岛失败:', error)
+      setAgentIslandEnabled(!checked)
+    }
+  }
   /** 更新归档天数 */
   const handleArchiveDaysChange = async (value: string): Promise<void> => {
     const days = parseInt(value, 10)
@@ -363,6 +375,14 @@ export function GeneralSettings(): React.ReactElement {
             onCheckedChange={(checked) => {
               setSessionHoverPreviewEnabled(checked)
               updateSessionHoverPreviewEnabled(checked)
+            }}
+          />
+          <SettingsToggle
+            label="Agent 灵动岛"
+            description="在 Mac 刘海屏显示需要接手的 Agent 与 1 小时内的待办/日程；外接无刘海屏默认不覆盖菜单栏"
+            checked={agentIslandEnabled}
+            onCheckedChange={(checked) => {
+              void handleAgentIslandChange(checked)
             }}
           />
         </SettingsCard>

@@ -17,7 +17,7 @@ import * as React from 'react'
 import { unstable_batchedUpdates } from 'react-dom'
 import { useAtom, useAtomValue, useSetAtom, useStore } from 'jotai'
 import { toast } from 'sonner'
-import { Box, CornerDownLeft, Square, Settings, X, Copy, Check, Brain, Sparkles, ChevronDown, ListTodo } from 'lucide-react'
+import { Box, CornerDownLeft, Square, Settings, X, Copy, Check, Brain, Sparkles, ChevronDown, ListTodo, Paperclip } from 'lucide-react'
 import { AgentMessages } from './AgentMessages'
 import { AgentHeader } from './AgentHeader'
 import { AgentMessageQueue } from './AgentMessageQueue'
@@ -30,7 +30,7 @@ import { PlanModeDashedBorder } from './PlanModeDashedBorder'
 import { ModelSelector } from '@/components/chat/ModelSelector'
 import { AttachmentPreviewItem } from '@/components/chat/AttachmentPreviewItem'
 import { QuotedSelectionChip } from '@/components/diff/QuotedSelectionChip'
-import { RichTextInput } from '@/components/ai-elements/rich-text-input'
+import { RichTextInput, type RichTextInputHandle } from '@/components/ai-elements/rich-text-input'
 import { SpeechButton } from '@/components/ai-elements/speech-button'
 import { InputToolbarOverflow, type ToolbarItem } from '@/components/ai-elements/InputToolbarOverflow'
 import {
@@ -116,9 +116,10 @@ import { AgentSessionProvider } from '@/contexts/session-context'
 import { draftSessionIdsAtom } from '@/atoms/draft-session-atoms'
 import { sendWithCmdEnterAtom } from '@/atoms/shortcut-atoms'
 import { useOpenPreview } from '@/components/diff/preview-opener'
-import type { AgentRuntime, AgentSendInput, AgentPendingFile, AgentThinkingLevel, FileDialogLargeFile, ModelOption, ReasoningCapability, SDKMessage, SDKUserMessage, ProviderType } from '@proma/shared'
+import type { AgentRuntime, AgentSendInput, AgentPendingFile, AgentThinkingLevel, FileDialogLargeFile, FileDialogResult, ModelOption, ReasoningCapability, SDKMessage, SDKUserMessage, ProviderType } from '@proma/shared'
 import { inferAgentSdkContextWindow, inferContextWindow, inferReasoningTransport, isCodexFastModeSupportedModel, MAX_ATTACHMENT_SIZE, normalizeReasoningCapabilityLevel, normalizeReasoningLevel, resolveReasoningCapability, resolveReasoningProfile } from '@proma/shared'
 import { fileToBase64, formatFileNames, getFileParentPath } from '@/lib/file-utils'
+import { getFilePanelDragData, INSERT_FILE_MENTION_EVENT, type FilePanelDragItem } from '@/lib/file-panel-drag'
 import { buildQuotedSelectionBlock } from '@/lib/quoted-selection'
 import { createClipboardPendingFile, createClipboardTextDraft, makeUniqueAttachmentName } from '@/lib/clipboard-text-attachment'
 import {
@@ -738,6 +739,8 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
 
   // pendingFiles ref（供 addFilesAsAttachments 读取最新列表，避免闭包旧值）
   const pendingFilesRef = React.useRef(pendingFiles)
+  // RichTextInput 命令接口 ref（右侧文件面板拖入时插入 @file 引用）
+  const richTextInputRef = React.useRef<RichTextInputHandle>(null)
   React.useEffect(() => {
     pendingFilesRef.current = pendingFiles
   }, [pendingFiles])
@@ -1279,7 +1282,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
     return () => { cancelled = true }
   }, [sessionId, refreshVersion, setStreamingStates, setLiveMessagesMap, setMessagesCache, store])
 
-  // 从会话元数据初始化附加目录（仅冷启动水合，后续由 handleAttachFolder/handleDetachDirectory 实时写入）
+  // 从会话元数据初始化附加目录（仅冷启动水合，后续由 handleAttachContent/handleDetachDirectory 实时写入）
   React.useEffect(() => {
     const meta = sessions.find((s) => s.id === sessionId)
     const dirs = meta?.attachedDirectories ?? []
@@ -1652,76 +1655,87 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
     }
   }, [attachSessionFile, makeUniqueFilename, setPendingFiles])
 
-  /** 打开文件选择对话框 */
-  const handleOpenFileDialog = React.useCallback(async (): Promise<void> => {
-    try {
-      const result = await window.electronAPI.openFileDialog()
-      const largeFiles = result.largeFiles ?? []
-      const skippedFiles = result.skippedFiles ?? []
-      if (result.files.length === 0 && largeFiles.length === 0 && skippedFiles.length === 0) return
+  /** 将已选文件加入待发送附件，目录由外层走会话授权路径。 */
+  const addDialogFilesAsAttachments = React.useCallback(async (result: FileDialogResult): Promise<void> => {
+    const largeFiles = result.largeFiles ?? []
+    const skippedFiles = result.skippedFiles ?? []
+    const oversized: string[] = []
 
-      const oversized: string[] = []
+    for (const fileInfo of result.files) {
+      if (fileInfo.size > MAX_ATTACHMENT_SIZE) {
+        oversized.push(fileInfo.filename)
+        continue
+      }
+      const previewUrl = fileInfo.mediaType.startsWith('image/')
+        ? `data:${fileInfo.mediaType};base64,${fileInfo.data}`
+        : undefined
 
-      for (const fileInfo of result.files) {
-        if (fileInfo.size > MAX_ATTACHMENT_SIZE) {
-          oversized.push(fileInfo.filename)
-          continue
-        }
-        const previewUrl = fileInfo.mediaType.startsWith('image/')
-          ? `data:${fileInfo.mediaType};base64,${fileInfo.data}`
-          : undefined
-
-        const pending: AgentPendingFile = {
-          id: `pending-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-          filename: fileInfo.filename,
-          mediaType: fileInfo.mediaType,
-          size: fileInfo.size,
-          previewUrl,
-        }
-
-        if (!window.__pendingAgentFileData) {
-          window.__pendingAgentFileData = new Map<string, string>()
-        }
-        window.__pendingAgentFileData.set(pending.id, fileInfo.data)
-
-        setPendingFiles((prev) => [...prev, pending])
+      const pending: AgentPendingFile = {
+        id: `pending-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        filename: fileInfo.filename,
+        mediaType: fileInfo.mediaType,
+        size: fileInfo.size,
+        previewUrl,
       }
 
-      if (oversized.length > 0) {
-        toast.error(`以下文件超过 100MB 且无法取得本地路径，已跳过：${formatFileNames(oversized)}`)
+      if (!window.__pendingAgentFileData) {
+        window.__pendingAgentFileData = new Map<string, string>()
       }
-      await addLargeDialogFilesAsReferences(largeFiles)
-      if (skippedFiles.length > 0) {
-        toast.warning(`以下文件无法读取，已跳过：${formatFileNames(skippedFiles.map((f) => f.filename))}`)
-      }
-    } catch (error) {
-      console.error('[AgentView] 文件选择对话框失败:', error)
+      window.__pendingAgentFileData.set(pending.id, fileInfo.data)
+
+      setPendingFiles((prev) => [...prev, pending])
+    }
+
+    if (oversized.length > 0) {
+      toast.error(`以下文件超过 100MB 且无法取得本地路径，已跳过：${formatFileNames(oversized)}`)
+    }
+    await addLargeDialogFilesAsReferences(largeFiles)
+    if (skippedFiles.length > 0) {
+      toast.warning(`以下文件无法读取，已跳过：${formatFileNames(skippedFiles.map((file) => file.filename))}`)
     }
   }, [addLargeDialogFilesAsReferences, setPendingFiles])
 
-  /** 附加文件夹（不复制，仅记录路径） */
-  const handleAttachFolder = React.useCallback(async (): Promise<void> => {
+  /** 打开混合选择器：文件作为附件，文件夹仅授权给当前会话。 */
+  const handleAttachContent = React.useCallback(async (): Promise<void> => {
     try {
-      const result = await window.electronAPI.openFolderDialog()
-      if (!result) return
+      const result = await window.electronAPI.openFileOrFolderDialog()
+      const largeFiles = result.largeFiles ?? []
+      const skippedFiles = result.skippedFiles ?? []
+      if (result.files.length === 0 && largeFiles.length === 0 && skippedFiles.length === 0 && result.directories.length === 0) return
 
-      const updated = await window.electronAPI.attachDirectory({
-        sessionId,
-        directoryPath: result.path,
-      })
+      await addDialogFilesAsAttachments(result)
 
-      setAttachedDirsMap((prev) => {
-        const map = new Map(prev)
-        map.set(sessionId, updated)
-        return map
-      })
+      const attachedDirectoryNames: string[] = []
+      const failedDirectoryNames: string[] = []
+      for (const directory of result.directories) {
+        try {
+          const updated = await window.electronAPI.attachDirectory({
+            sessionId,
+            directoryPath: directory.path,
+          })
+          setAttachedDirsMap((prev) => {
+            const map = new Map(prev)
+            map.set(sessionId, updated)
+            return map
+          })
+          attachedDirectoryNames.push(directory.name)
+        } catch (error) {
+          console.error('[AgentView] 附加文件夹失败:', error)
+          failedDirectoryNames.push(directory.name)
+        }
+      }
 
-      toast.success(`已附加目录: ${result.name}`)
+      if (attachedDirectoryNames.length > 0) {
+        toast.success(`已附加目录: ${formatFileNames(attachedDirectoryNames)}`)
+      }
+      if (failedDirectoryNames.length > 0) {
+        toast.error(`以下文件夹附加失败：${formatFileNames(failedDirectoryNames)}`)
+      }
     } catch (error) {
-      console.error('[AgentView] 附加文件夹失败:', error)
-      toast.error('附加文件夹失败')
+      console.error('[AgentView] 附加内容选择失败:', error)
+      toast.error('附加文件或文件夹失败')
     }
-  }, [sessionId, setAttachedDirsMap])
+  }, [addDialogFilesAsAttachments, sessionId, setAttachedDirsMap])
 
   /** 移除待发送文件 */
   const handleRemoveFile = React.useCallback((id: string): void => {
@@ -1831,6 +1845,25 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
       })
   }, [addClipboardTextDraft])
 
+  /** 将右侧文件面板拖入的目录附加到会话（保持 Agent 可访问）。返回是否成功。 */
+  const addPanelDirectory = React.useCallback(async (dirPath: string): Promise<boolean> => {
+    try {
+      const updated = await window.electronAPI.attachDirectory({
+        sessionId,
+        directoryPath: dirPath,
+      })
+      setAttachedDirsMap((prev) => {
+        const map = new Map(prev)
+        map.set(sessionId, updated)
+        return map
+      })
+      return true
+    } catch (error) {
+      console.error('[AgentView] 面板拖拽附加目录失败:', error)
+      return false
+    }
+  }, [sessionId, setAttachedDirsMap])
+
   /** 拖放处理 */
   const handleDragOver = React.useCallback((e: React.DragEvent): void => {
     e.preventDefault()
@@ -1848,6 +1881,25 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
     e.preventDefault()
     e.stopPropagation()
     setIsDragOver(false)
+
+    // 优先识别右侧文件面板的自定义拖拽载荷（会话文件 / 项目文件引用）
+    // 文件直接插入引用；文件夹先附加到会话（Agent 可访问），附加成功后才插入引用，
+    // 避免失败时留下 Agent 无法访问的无效引用。
+    const panelItems = getFilePanelDragData(e.dataTransfer)
+    if (panelItems && panelItems.length > 0) {
+      const files = panelItems.filter((item) => !item.isDirectory)
+      const dirs = panelItems.filter((item) => item.isDirectory)
+      if (files.length > 0) {
+        richTextInputRef.current?.insertFileMentions(files)
+      }
+      for (const dir of dirs) {
+        const ok = await addPanelDirectory(dir.path)
+        if (ok) {
+          richTextInputRef.current?.insertFileMentions([dir])
+        }
+      }
+      return
+    }
 
     const droppedFiles = Array.from(e.dataTransfer.files)
     if (droppedFiles.length === 0) return
@@ -1870,7 +1922,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
         // 通过主进程检测目录 vs 文件
         const { directories, files: filePaths } = await window.electronAPI.checkPathsType(paths)
 
-        // 拖拽的文件夹直接附加
+        // 拖拽的文件夹：附加到会话 + 插入可见的文件夹引用（与右侧面板拖拽体验一致）
         for (const dirPath of directories) {
           try {
             const updated = await window.electronAPI.attachDirectory({
@@ -1882,7 +1934,14 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
               map.set(sessionId, updated)
               return map
             })
-            const dirName = dirPath.split('/').pop() || dirPath
+            const dirName = dirPath.split(/[\\/]/).pop() || dirPath
+            // 在输入框插入文件夹引用 chip（Agent 通过附加目录可访问）
+            richTextInputRef.current?.insertFileMentions([{
+              path: dirPath,
+              name: dirName,
+              isDirectory: true,
+              scope: 'project',
+            }])
             toast.success(`已附加目录: ${dirName}`)
           } catch (error) {
             console.error('[AgentView] 拖拽附加文件夹失败:', error)
@@ -1907,7 +1966,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
       // 无路径信息：回退，所有项按普通文件处理
       addFilesAsAttachments(droppedFiles)
     }
-  }, [sessionId, addFilesAsAttachments, setAttachedDirsMap])
+  }, [sessionId, addFilesAsAttachments, addPanelDirectory, setAttachedDirsMap])
 
   /** ModelSelector 选择回调 */
   const handleModelSelect = React.useCallback((option: ModelOption): void => {
@@ -2647,6 +2706,17 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
     return () => window.removeEventListener('proma:focus-input', handler)
   }, [])
 
+  // 监听文件面板三点菜单「引用到 Agent」事件：在输入框插入 @file 引用
+  React.useEffect(() => {
+    const handler = (event: Event): void => {
+      const items = (event as CustomEvent<FilePanelDragItem[]>).detail
+      if (!items || items.length === 0) return
+      richTextInputRef.current?.insertFileMentions(items)
+    }
+    window.addEventListener(INSERT_FILE_MENTION_EVENT, handler)
+    return () => window.removeEventListener(INSERT_FILE_MENTION_EVENT, handler)
+  }, [])
+
   const allAskUserRequests = useAtomValue(allPendingAskUserRequestsAtom)
   const allPermissionRequests = useAtomValue(allPendingPermissionRequestsAtom)
   const allExitPlanRequests = useAtomValue(allPendingExitPlanRequestsAtom)
@@ -2819,6 +2889,26 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
     },
     { key: 'speech', node: <SpeechButton className={inputToolbarButtonClass} /> },
     {
+      key: 'attach-content',
+      node: (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className={inputToolbarButtonClass}
+              onClick={() => void handleAttachContent()}
+              aria-label="附加文件或文件夹"
+            >
+              <Paperclip className="size-[17px]" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="top"><p>附加文件或文件夹</p></TooltipContent>
+        </Tooltip>
+      ),
+    },
+    {
       key: 'context-usage',
       node: (
         <ContextUsageBadge
@@ -2860,6 +2950,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
     contextStatus.contextWindow,
     contextStatus.isCompacting,
     streaming,
+    handleAttachContent,
     handleCompact,
   ])
 
@@ -3068,6 +3159,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
             )}
 
             <RichTextInput
+              ref={richTextInputRef}
               value={inputContent}
               onChange={setInputContent}
               onSubmit={handleSend}
@@ -3077,8 +3169,8 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
               placeholder={
                 agentChannelId && hasAvailableModel
                   ? sendWithCmdEnter
-                    ? '输入消息... (输入 / 打开菜单，⌘/Ctrl+Enter 发送)'
-                    : '输入消息... (输入 / 打开菜单，Enter 发送)'
+                    ? '输入消息...（@ 引用文件，/ 调用 Skill，# 使用 MCP，& 引用会话，～ 引用待办/日程；⌘/Ctrl+Enter 发送）'
+                    : '输入消息...（@ 引用文件，/ 调用 Skill，# 使用 MCP，& 引用会话，～ 引用待办/日程；Enter 发送）'
                   : !agentChannelId
                     ? '请先在设置中选择 Agent 供应商'
                     : '暂无可用模型，请先在设置中启用渠道'
@@ -3095,10 +3187,6 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
               htmlValue={inputHtmlContent}
               onHtmlChange={setInputHtmlContent}
               sendWithCmdEnter={sendWithCmdEnter}
-              commandActions={{
-                onAttachFile: handleOpenFileDialog,
-                onAttachFolder: handleAttachFolder,
-              }}
             />
 
             {/* Footer 工具栏 — 容器变窄时尾部按钮自动折叠进「更多」Popover */}

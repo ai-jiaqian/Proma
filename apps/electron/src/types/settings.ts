@@ -92,6 +92,15 @@ export interface VoiceDictationStateEvent {
   message?: string
 }
 
+/** 外部应用听写状态条的实时显示数据。 */
+export interface VoiceDictationIndicatorEvent {
+  state: 'recording' | 'stopping'
+  /** 已归一化、平滑处理后的麦克风音量（0~1）。 */
+  volume: number
+  /** 尚未提交给第三方应用的实时转写文本。 */
+  transcript: string
+}
+
 /** 开始语音输入会话参数 */
 export interface VoiceDictationStartInput {
   sessionId: string
@@ -103,13 +112,29 @@ export interface VoiceDictationAudioChunkInput {
   data: ArrayBuffer
 }
 
+/** 将当前识别结果作为 Proma 输入框中的临时组合文本预览。 */
+export interface VoiceDictationPreviewInput {
+  sessionId: string
+  text: string
+}
+
 /** 结束语音输入会话参数 */
 export interface VoiceDictationStopInput {
+  /** 当前 ASR WebSocket 会话 ID */
   sessionId: string
+  /** 跨 ASR 重连保持稳定的听写会话 ID */
+  previewSessionId?: string
 }
 
 /** 输出语音输入文本参数 */
 export interface VoiceDictationCommitInput {
+  sessionId: string
+  text: string
+}
+
+/** 主窗口接收的语音组合文本事件。 */
+export interface VoiceDictationTextEvent {
+  sessionId: string
   text: string
 }
 
@@ -191,6 +216,12 @@ export type MarkdownFontSize = 'small' | 'medium' | 'large'
 /** 默认 Markdown 字号档位 */
 export const DEFAULT_MARKDOWN_FONT_SIZE: MarkdownFontSize = 'medium'
 
+/** Agent 灵动岛偏好。外接/无刘海屏默认不绘制顶部覆盖层。 */
+export interface AgentIslandSettings {
+  /** 是否启用 Agent / 近期 Todo 日程的灵动岛提醒，默认 true。 */
+  enabled?: boolean
+}
+
 /** 应用设置 */
 export interface AppSettings {
   /** 主题模式 */
@@ -271,6 +302,8 @@ export interface AppSettings {
   autoCleanupTempOnStart?: boolean
   /** 自动清理 N 天前已归档会话的 SDK 数据（0 = 禁用，默认 0） */
   autoCleanupArchivedDays?: number
+  /** Agent 灵动岛偏好（macOS 刘海屏优先，其他平台使用 Electron 降级体验）。 */
+  agentIsland?: AgentIslandSettings
   /** 主窗口状态（大小、位置、是否最大化） */
   mainWindowState?: MainWindowState
   /** 独立任务/日程窗口状态（大小、位置、是否最大化） */
@@ -363,6 +396,8 @@ export const VOICE_DICTATION_IPC_CHANNELS = {
   STOP: 'voice-dictation:stop',
   /** 取消语音输入会话 */
   CANCEL: 'voice-dictation:cancel',
+  /** 同步 Proma 输入框中的临时识别文本 */
+  PREVIEW: 'voice-dictation:preview',
   /** 输出最终文本 */
   COMMIT: 'voice-dictation:commit',
   /** 隐藏语音输入窗口 */
@@ -377,8 +412,18 @@ export const VOICE_DICTATION_IPC_CHANNELS = {
   TRANSCRIPT: 'voice-dictation:transcript',
   /** 状态事件 */
   STATE: 'voice-dictation:state',
+  /** 外部应用听写状态条事件 */
+  INDICATOR_STATE: 'voice-dictation:indicator-state',
+  /** 主窗口上报麦克风音量，用于外部应用状态条。 */
+  REPORT_VOLUME: 'voice-dictation:report-volume',
+  /** 主窗口上报实时转写，用于外部应用状态条。 */
+  REPORT_TRANSCRIPT: 'voice-dictation:report-transcript',
   /** 主窗口插入文本 */
   INSERT_TEXT: 'voice-dictation:insert-text',
+  /** 主窗口更新临时组合文本 */
+  PREVIEW_TEXT: 'voice-dictation:preview-text',
+  /** 主窗口撤销临时组合文本 */
+  CLEAR_PREVIEW_TEXT: 'voice-dictation:clear-preview-text',
   /** 检查麦克风权限状态 */
   CHECK_MIC_PERMISSION: 'voice-dictation:check-mic-permission',
   /** 请求麦克风权限 */

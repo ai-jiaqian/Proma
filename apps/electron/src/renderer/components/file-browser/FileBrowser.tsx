@@ -56,6 +56,7 @@ import {
   STICKY_ROW_BASE_CLASS,
   canBeSticky,
 } from './tree-row-layout'
+import { setFilePanelDragData, dispatchInsertFileMention } from '@/lib/file-panel-drag'
 
 /** 计算目标路径相对 rootPath 的祖先目录集合（不含 rootPath 自身、含目标的所有上级） */
 export function computeRevealAncestors(rootPath: string, targetPath: string): Set<string> {
@@ -113,6 +114,8 @@ interface FileBrowserProps {
   access?: FileAccessOptions
   /** 当前项目共享文件根；存在时，会话文件可移入此目录。 */
   projectRootPath?: string | null
+  /** 混合来源时用 badge 标记会话文件。 */
+  showSessionBadge?: boolean
   /** 点击添加到聊天（在文件操作菜单中显示） */
   onAddToChat?: (entry: FileEntry) => void
   /** 单击文件时在内联预览面板中显示（替代外部窗口预览） */
@@ -126,7 +129,7 @@ function sortEntries(entries: ScopedFileEntry[]): ScopedFileEntry[] {
   })
 }
 
-export function FileBrowser({ rootPath, roots, hideToolbar, embedded, hideEmpty, access, projectRootPath, onAddToChat, onFilePreview }: FileBrowserProps): React.ReactElement {
+export function FileBrowser({ rootPath, roots, hideToolbar, embedded, hideEmpty, access, projectRootPath, showSessionBadge = true, onAddToChat, onFilePreview }: FileBrowserProps): React.ReactElement {
   const browserRoots = React.useMemo<FileBrowserRoot[]>(() => {
     if (roots && roots.length > 0) return roots.filter((root) => Boolean(root.path))
     return rootPath ? [{ path: rootPath, scope: 'project' }] : []
@@ -395,6 +398,7 @@ export function FileBrowser({ rootPath, roots, hideToolbar, embedded, hideEmpty,
           onDelete={handleRequestDelete}
           onMove={handleMove}
           onPromoteToProject={projectRootPath ? handlePromoteToProject : undefined}
+          showSessionBadge={showSessionBadge}
           onRefresh={loadRoot}
           onClearSelection={() => setSelectedPaths(new Set())}
           onAddToChat={onAddToChat}
@@ -502,6 +506,7 @@ interface FileTreeItemProps {
   onDelete: (entry: FileEntry) => void
   onMove: (entry: FileEntry) => void
   onPromoteToProject?: (entry: ScopedFileEntry) => void
+  showSessionBadge: boolean
   onRefresh: () => Promise<void>
   onClearSelection: () => void
   onAddToChat?: (entry: FileEntry) => void
@@ -530,6 +535,7 @@ function FileTreeItem({
   onDelete,
   onMove,
   onPromoteToProject,
+  showSessionBadge,
   onRefresh,
   onClearSelection,
   onAddToChat,
@@ -649,6 +655,17 @@ function FileTreeItem({
     }
   }
 
+  /** 拖拽到 Agent 输入框：写入面板文件引用载荷 */
+  const handleRowDragStart = React.useCallback((e: React.DragEvent): void => {
+    e.stopPropagation()
+    setFilePanelDragData(e.dataTransfer, [{
+      path: entry.path,
+      name: entry.name,
+      isDirectory: entry.isDirectory,
+      scope: entry.scope,
+    }])
+  }, [entry.path, entry.name, entry.isDirectory, entry.scope])
+
   /** 删除后刷新子目录 */
   const handleRefreshAfterDelete = async (): Promise<void> => {
     if (childrenLoaded) {
@@ -750,6 +767,8 @@ function FileTreeItem({
           zIndex: isSticky ? stickyZIndex : undefined,
         }}
         onClick={handleClick}
+        draggable={!isRenaming}
+        onDragStart={handleRowDragStart}
       >
         <span
           aria-hidden="true"
@@ -817,7 +836,7 @@ function FileTreeItem({
         ) : (
           <>
             <span className="relative z-10 truncate text-xs flex-1">{entry.name}</span>
-            {entry.scope === 'session' && (
+            {showSessionBadge && entry.scope === 'session' && (
               <span className="relative z-10 flex-shrink-0 rounded-md bg-muted px-1.5 py-0.5 text-[10px] leading-none text-muted-foreground">
                 会话文件
               </span>
@@ -828,6 +847,7 @@ function FileTreeItem({
         {/* 右侧操作按钮占位（始终占位，避免行宽跳动） */}
         <div
           className="relative z-10 flex-shrink-0 mr-1"
+          draggable={false}
           onClick={(e) => e.stopPropagation()}
           onMouseDown={(e) => e.stopPropagation()}
         >
@@ -851,6 +871,20 @@ function FileTreeItem({
               </button>
             </DropdownMenuTrigger>
               <DropdownMenuContent align="start" className="w-40 z-[9999] min-w-0 p-0.5">
+                {menuSelectedCount === 1 && (
+                  <DropdownMenuItem
+                    className="text-xs py-1 [&>svg]:size-3.5"
+                    onSelect={() => dispatchInsertFileMention([{
+                      path: entry.path,
+                      name: entry.name,
+                      isDirectory: entry.isDirectory,
+                      scope: entry.scope,
+                    }])}
+                  >
+                    <MessageSquarePlus />
+                    引用到 Agent
+                  </DropdownMenuItem>
+                )}
                 {onAddToChat && !entry.isDirectory && menuSelectedCount === 1 && (
                   <DropdownMenuItem
                     className="text-xs py-1 [&>svg]:size-3.5"
@@ -973,6 +1007,7 @@ function FileTreeItem({
               onDelete={onDelete}
               onMove={onMove}
               onPromoteToProject={onPromoteToProject}
+              showSessionBadge={showSessionBadge}
               onRefresh={handleRefreshAfterDelete}
               onClearSelection={onClearSelection}
               onAddToChat={onAddToChat}
