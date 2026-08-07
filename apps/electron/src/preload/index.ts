@@ -20,6 +20,8 @@ import type {
   FetchModelsResult,
   ChannelPlanQuotaResult,
   CodexOAuthLoginResult,
+  XaiOAuthLoginResult,
+  XaiOAuthDeviceCode,
   ConversationMeta,
   ChatMessage,
   ChatSendInput,
@@ -133,7 +135,17 @@ import type {
   CreatePlanningGroupInput,
   UpdatePlanningGroupInput,
   SnoozePlanningReminderInput,
-  AgentIslandState,
+  PlanningNativeSyncEntity,
+  PlanningNativeSyncStatus,
+  PlanningNativeSyncPermissionResult,
+  PlanningNativeSyncTarget,
+  PlanningNativeConnection,
+  PlanningNativeSyncConflict,
+  ConnectPlanningNativeConnectionInput,
+  ResolvePlanningNativeSyncConflictInput,
+  PlanningSyncProfile,
+  SavePlanningSyncProfileInput,
+  AgentIslandWindowSnapshot,
 } from '@proma/shared'
 import type {
   UserProfile,
@@ -147,12 +159,15 @@ import type {
   VoiceDictationResizeInput,
   VoiceDictationSettings,
   VoiceDictationSettingsUpdate,
+  VoiceDictationShownEvent,
   VoiceDictationStartInput,
   VoiceDictationIndicatorEvent,
   VoiceDictationStateEvent,
   VoiceDictationStopInput,
   VoiceDictationTestResult,
+  VoiceDictationToggleInput,
   VoiceDictationTranscriptEvent,
+  VoiceDictationTextDeliveryInput,
   VoiceDictationTextEvent,
   MicPermissionResult,
   TrayCreateSessionData,
@@ -208,6 +223,8 @@ export interface ElectronAPI {
 
   /** 在系统默认浏览器中打开外部链接 */
   openExternal: (url: string) => Promise<void>
+  /** 在系统剪贴板中写入纯文本 */
+  writeClipboardText: (text: string) => Promise<void>
 
   // ===== 窗口控制（Windows 自定义标题栏）=====
 
@@ -252,10 +269,22 @@ export interface ElectronAPI {
   getChannelPlanQuota: (channelId: string) => Promise<ChannelPlanQuotaResult>
 
   /** 发起 ChatGPT (Codex) OAuth 登录，返回序列化凭据（作为 apiKey 存储） */
-  codexOAuthLogin: () => Promise<CodexOAuthLoginResult>
+  codexOAuthLogin: (method?: import('@proma/shared').CodexOAuthLoginMethod) => Promise<CodexOAuthLoginResult>
 
   /** 取消进行中的 ChatGPT (Codex) OAuth 登录 */
   codexOAuthCancel: () => Promise<void>
+
+  /** 订阅登录期间，接收 Codex device code 与授权链接。返回取消订阅函数。 */
+  onCodexOAuthDeviceCode: (callback: (deviceCode: import('@proma/shared').CodexOAuthDeviceCode) => void) => () => void
+
+  /** 发起 xAI（Grok/X 订阅）OAuth 登录 */
+  xaiOAuthLogin: () => Promise<XaiOAuthLoginResult>
+
+  /** 取消进行中的 xAI OAuth 登录 */
+  xaiOAuthCancel: () => Promise<void>
+
+  /** 订阅登录期间，接收 xAI device code 与授权链接。返回取消订阅函数。 */
+  onXaiOAuthDeviceCode: (callback: (deviceCode: XaiOAuthDeviceCode) => void) => () => void
 
   // ===== 对话管理相关 =====
 
@@ -599,6 +628,9 @@ export interface ElectronAPI {
 
   /** 从其他工作区导入 Skill */
   importSkillFromWorkspace: (targetSlug: string, sourceSlug: string, skillSlug: string) => Promise<SkillMeta>
+
+  /** 从其他工作区批量导入多个 Skill */
+  batchImportSkillsFromWorkspaces: (targetSlug: string, selections: import('@proma/shared').BulkImportWorkspaceSelection[]) => Promise<import('@proma/shared').BulkImportSkillsResult>
 
   /** 从源工作区同步更新已导入的 Skill */
   updateSkillFromSource: (targetSlug: string, skillSlug: string) => Promise<SkillMeta>
@@ -1035,7 +1067,7 @@ export interface ElectronAPI {
   /** 测试语音输入连接 */
   testVoiceDictationConnection: (updates?: VoiceDictationSettingsUpdate) => Promise<VoiceDictationTestResult>
   /** 唤起或停止语音输入浮窗 */
-  toggleVoiceDictation: () => Promise<void>
+  toggleVoiceDictation: (input?: VoiceDictationToggleInput) => Promise<void>
   /** 开始语音输入会话 */
   startVoiceDictation: (input: VoiceDictationStartInput) => Promise<void>
   /** 发送语音音频分片 */
@@ -1057,7 +1089,7 @@ export interface ElectronAPI {
   /** 调整语音输入窗口高度 */
   resizeVoiceDictation: (input: VoiceDictationResizeInput) => Promise<void>
   /** 订阅语音输入窗口显示事件 */
-  onVoiceDictationShown: (callback: () => void) => () => void
+  onVoiceDictationShown: (callback: (event: VoiceDictationShownEvent) => void) => () => void
   /** 订阅语音输入停止请求事件 */
   onVoiceDictationToggleStop: (callback: () => void) => () => void
   /** 订阅语音输入转写事件 */
@@ -1068,10 +1100,12 @@ export interface ElectronAPI {
   onVoiceDictationIndicatorState: (callback: (event: VoiceDictationIndicatorEvent) => void) => () => void
   /** 订阅主窗口插入语音文本事件 */
   onVoiceDictationInsertText: (callback: (data: VoiceDictationTextEvent) => void) => () => void
+  /** 确认最终语音文本是否已被当前输入目标消费。 */
+  acknowledgeVoiceDictationTextDelivery: (input: VoiceDictationTextDeliveryInput) => void
   /** 订阅主窗口临时识别文本更新事件 */
   onVoiceDictationPreviewText: (callback: (data: VoiceDictationTextEvent) => void) => () => void
   /** 订阅主窗口撤销临时识别文本事件 */
-  onVoiceDictationClearPreviewText: (callback: (data: Pick<VoiceDictationTextEvent, 'sessionId'>) => void) => () => void
+  onVoiceDictationClearPreviewText: (callback: (data: Pick<VoiceDictationTextEvent, 'sessionId' | 'targetInputId'>) => void) => () => void
 
   /** 检查麦克风权限状态 */
   checkMicrophonePermission: () => Promise<MicPermissionResult>
@@ -1159,23 +1193,42 @@ export interface ElectronAPI {
   onPlanningRemindersDue: (callback: (reminders: ActivePlanningReminder[]) => void) => () => void
   onPlanningChanged: (callback: (change: PlanningChange) => void) => () => void
   onPlanningAgentOperation: (callback: (operation: PlanningAgentOperation) => void) => () => void
+  /** macOS EventKit 同步设置；非 macOS 返回 unsupported 或空集合。 */
+  getPlanningNativeSyncStatus: () => Promise<PlanningNativeSyncStatus>
+  requestPlanningNativeSyncAccess: (entity: PlanningNativeSyncEntity) => Promise<PlanningNativeSyncPermissionResult>
+  openPlanningNativeSyncPrivacySettings: (entity: PlanningNativeSyncEntity) => Promise<void>
+  listPlanningNativeSyncTargets: (entity: PlanningNativeSyncEntity) => Promise<PlanningNativeSyncTarget[]>
+  listPlanningNativeConnectionTargets: (entity: PlanningNativeSyncEntity) => Promise<PlanningNativeSyncTarget[]>
+  listPlanningNativeConnections: (entity?: PlanningNativeSyncEntity) => Promise<PlanningNativeConnection[]>
+  connectPlanningNativeConnection: (input: ConnectPlanningNativeConnectionInput) => Promise<PlanningNativeConnection>
+  disconnectPlanningNativeConnection: (id: string) => Promise<boolean>
+  listPlanningNativeSyncConflicts: () => Promise<PlanningNativeSyncConflict[]>
+  resolvePlanningNativeSyncConflict: (input: ResolvePlanningNativeSyncConflictInput) => Promise<boolean>
+  listPlanningSyncProfiles: () => Promise<PlanningSyncProfile[]>
+  savePlanningSyncProfile: (input: SavePlanningSyncProfileInput) => Promise<PlanningSyncProfile>
 
   /** Agent 灵动岛桥接（主进程状态机 → 灵动岛窗口） */
   agentIsland: {
     /** 订阅灵动岛全量状态 */
-    onState: (callback: (state: AgentIslandState) => void) => () => void
+    onState: (callback: (snapshot: AgentIslandWindowSnapshot) => void) => () => void
     /** 外部触发展开/收起切换 */
     onToggleExpanded: (callback: () => void) => () => void
     /** 同步展开/收起状态到主进程（避免下一条 Agent 事件覆盖本地状态） */
     setExpanded: (expanded: boolean) => Promise<void>
+    /** 发送鼠标进入/离开 island surface 的意图；主进程负责展开防抖。 */
+    setHovered: (hovered: boolean) => Promise<void>
     /** 按内容调整窗口尺寸（pill ↔ 展开卡） */
     resize: (width: number, height: number) => Promise<void>
     /** 拖拽移动窗口位置 */
     move: (x: number, y: number) => Promise<void>
     /** 打开/聚焦主窗口 */
     openMainWindow: () => Promise<void>
+    /** 打开独立 Planning 窗口。 */
+    openPlanning: () => Promise<void>
     /** 打开指定 Agent 会话（聚焦主窗口） */
     openSession: (sessionId: string) => Promise<void>
+    /** 用户已在主应用中主动查看完成会话，清除灵动岛未读状态 */
+    markSessionViewed: (sessionId: string) => Promise<void>
   }
 }
 
@@ -1243,6 +1296,10 @@ const electronAPI: ElectronAPI = {
     return ipcRenderer.invoke(IPC_CHANNELS.OPEN_EXTERNAL, url)
   },
 
+  writeClipboardText: (text: string) => {
+    return ipcRenderer.invoke(IPC_CHANNELS.WRITE_CLIPBOARD_TEXT, text)
+  },
+
   // 窗口控制
   windowMinimize: () => {
     return ipcRenderer.invoke(IPC_CHANNELS.WINDOW_MINIMIZE)
@@ -1303,12 +1360,32 @@ const electronAPI: ElectronAPI = {
     return ipcRenderer.invoke(CHANNEL_IPC_CHANNELS.GET_PLAN_QUOTA, channelId)
   },
 
-  codexOAuthLogin: () => {
-    return ipcRenderer.invoke(CHANNEL_IPC_CHANNELS.CODEX_OAUTH_LOGIN)
+  codexOAuthLogin: (method?: import('@proma/shared').CodexOAuthLoginMethod) => {
+    return ipcRenderer.invoke(CHANNEL_IPC_CHANNELS.CODEX_OAUTH_LOGIN, method)
   },
 
   codexOAuthCancel: () => {
     return ipcRenderer.invoke(CHANNEL_IPC_CHANNELS.CODEX_OAUTH_CANCEL)
+  },
+
+  onCodexOAuthDeviceCode: (callback: (deviceCode: import('@proma/shared').CodexOAuthDeviceCode) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, deviceCode: import('@proma/shared').CodexOAuthDeviceCode) => callback(deviceCode)
+    ipcRenderer.on(CHANNEL_IPC_CHANNELS.CODEX_OAUTH_DEVICE_CODE, listener)
+    return () => ipcRenderer.removeListener(CHANNEL_IPC_CHANNELS.CODEX_OAUTH_DEVICE_CODE, listener)
+  },
+
+  xaiOAuthLogin: () => {
+    return ipcRenderer.invoke(CHANNEL_IPC_CHANNELS.XAI_OAUTH_LOGIN)
+  },
+
+  xaiOAuthCancel: () => {
+    return ipcRenderer.invoke(CHANNEL_IPC_CHANNELS.XAI_OAUTH_CANCEL)
+  },
+
+  onXaiOAuthDeviceCode: (callback: (deviceCode: XaiOAuthDeviceCode) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, deviceCode: XaiOAuthDeviceCode) => callback(deviceCode)
+    ipcRenderer.on(CHANNEL_IPC_CHANNELS.XAI_OAUTH_DEVICE_CODE, listener)
+    return () => ipcRenderer.removeListener(CHANNEL_IPC_CHANNELS.XAI_OAUTH_DEVICE_CODE, listener)
   },
 
   // 对话管理
@@ -1756,6 +1833,14 @@ const electronAPI: ElectronAPI = {
       targetSlug,
       sourceSlug,
       skillSlug,
+    )
+  },
+
+  batchImportSkillsFromWorkspaces: (targetSlug: string, selections: import('@proma/shared').BulkImportWorkspaceSelection[]) => {
+    return ipcRenderer.invoke(
+      AGENT_IPC_CHANNELS.BATCH_IMPORT_SKILLS_FROM_WORKSPACES,
+      targetSlug,
+      selections,
     )
   },
 
@@ -2423,8 +2508,8 @@ const electronAPI: ElectronAPI = {
     return ipcRenderer.invoke(VOICE_DICTATION_IPC_CHANNELS.TEST_CONNECTION, updates)
   },
 
-  toggleVoiceDictation: () => {
-    return ipcRenderer.invoke(VOICE_DICTATION_IPC_CHANNELS.TOGGLE)
+  toggleVoiceDictation: (input?: VoiceDictationToggleInput) => {
+    return ipcRenderer.invoke(VOICE_DICTATION_IPC_CHANNELS.TOGGLE, input)
   },
 
   startVoiceDictation: (input: VoiceDictationStartInput) => {
@@ -2467,8 +2552,8 @@ const electronAPI: ElectronAPI = {
     return ipcRenderer.invoke(VOICE_DICTATION_IPC_CHANNELS.RESIZE, input)
   },
 
-  onVoiceDictationShown: (callback: () => void) => {
-    const listener = (): void => callback()
+  onVoiceDictationShown: (callback: (event: VoiceDictationShownEvent) => void) => {
+    const listener = (_: unknown, event: VoiceDictationShownEvent): void => callback(event)
     ipcRenderer.on(VOICE_DICTATION_IPC_CHANNELS.SHOWN, listener)
     return () => { ipcRenderer.removeListener(VOICE_DICTATION_IPC_CHANNELS.SHOWN, listener) }
   },
@@ -2503,14 +2588,18 @@ const electronAPI: ElectronAPI = {
     return () => { ipcRenderer.removeListener(VOICE_DICTATION_IPC_CHANNELS.INSERT_TEXT, listener) }
   },
 
+  acknowledgeVoiceDictationTextDelivery: (input: VoiceDictationTextDeliveryInput) => {
+    ipcRenderer.send(VOICE_DICTATION_IPC_CHANNELS.ACK_INSERT_TEXT, input)
+  },
+
   onVoiceDictationPreviewText: (callback: (data: VoiceDictationTextEvent) => void) => {
     const listener = (_: unknown, data: VoiceDictationTextEvent): void => callback(data)
     ipcRenderer.on(VOICE_DICTATION_IPC_CHANNELS.PREVIEW_TEXT, listener)
     return () => { ipcRenderer.removeListener(VOICE_DICTATION_IPC_CHANNELS.PREVIEW_TEXT, listener) }
   },
 
-  onVoiceDictationClearPreviewText: (callback: (data: Pick<VoiceDictationTextEvent, 'sessionId'>) => void) => {
-    const listener = (_: unknown, data: Pick<VoiceDictationTextEvent, 'sessionId'>): void => callback(data)
+  onVoiceDictationClearPreviewText: (callback: (data: Pick<VoiceDictationTextEvent, 'sessionId' | 'targetInputId'>) => void) => {
+    const listener = (_: unknown, data: Pick<VoiceDictationTextEvent, 'sessionId' | 'targetInputId'>): void => callback(data)
     ipcRenderer.on(VOICE_DICTATION_IPC_CHANNELS.CLEAR_PREVIEW_TEXT, listener)
     return () => { ipcRenderer.removeListener(VOICE_DICTATION_IPC_CHANNELS.CLEAR_PREVIEW_TEXT, listener) }
   },
@@ -2648,11 +2737,23 @@ const electronAPI: ElectronAPI = {
     ipcRenderer.on(PLANNING_IPC_CHANNELS.AGENT_OPERATION, listener)
     return () => { ipcRenderer.removeListener(PLANNING_IPC_CHANNELS.AGENT_OPERATION, listener) }
   },
+  getPlanningNativeSyncStatus: () => ipcRenderer.invoke(PLANNING_IPC_CHANNELS.GET_NATIVE_SYNC_STATUS),
+  requestPlanningNativeSyncAccess: (entity: PlanningNativeSyncEntity) => ipcRenderer.invoke(PLANNING_IPC_CHANNELS.REQUEST_NATIVE_SYNC_ACCESS, entity),
+  openPlanningNativeSyncPrivacySettings: (entity: PlanningNativeSyncEntity) => ipcRenderer.invoke(PLANNING_IPC_CHANNELS.OPEN_NATIVE_SYNC_PRIVACY_SETTINGS, entity),
+  listPlanningNativeSyncTargets: (entity: PlanningNativeSyncEntity) => ipcRenderer.invoke(PLANNING_IPC_CHANNELS.LIST_NATIVE_SYNC_TARGETS, entity),
+  listPlanningNativeConnectionTargets: (entity: PlanningNativeSyncEntity) => ipcRenderer.invoke(PLANNING_IPC_CHANNELS.LIST_NATIVE_CONNECTION_TARGETS, entity),
+  listPlanningNativeConnections: (entity?: PlanningNativeSyncEntity) => ipcRenderer.invoke(PLANNING_IPC_CHANNELS.LIST_NATIVE_CONNECTIONS, entity),
+  connectPlanningNativeConnection: (input: ConnectPlanningNativeConnectionInput) => ipcRenderer.invoke(PLANNING_IPC_CHANNELS.CONNECT_NATIVE_CONNECTION, input),
+  disconnectPlanningNativeConnection: (id: string) => ipcRenderer.invoke(PLANNING_IPC_CHANNELS.DISCONNECT_NATIVE_CONNECTION, id),
+  listPlanningNativeSyncConflicts: () => ipcRenderer.invoke(PLANNING_IPC_CHANNELS.LIST_NATIVE_SYNC_CONFLICTS),
+  resolvePlanningNativeSyncConflict: (input: ResolvePlanningNativeSyncConflictInput) => ipcRenderer.invoke(PLANNING_IPC_CHANNELS.RESOLVE_NATIVE_SYNC_CONFLICT, input),
+  listPlanningSyncProfiles: () => ipcRenderer.invoke(PLANNING_IPC_CHANNELS.LIST_SYNC_PROFILES),
+  savePlanningSyncProfile: (input: SavePlanningSyncProfileInput) => ipcRenderer.invoke(PLANNING_IPC_CHANNELS.SAVE_SYNC_PROFILE, input),
 
   // ===== Agent 灵动岛 =====
   agentIsland: {
-    onState: (callback: (state: AgentIslandState) => void) => {
-      const listener = (_: Electron.IpcRendererEvent, state: AgentIslandState): void => callback(state)
+    onState: (callback: (snapshot: AgentIslandWindowSnapshot) => void) => {
+      const listener = (_: Electron.IpcRendererEvent, snapshot: AgentIslandWindowSnapshot): void => callback(snapshot)
       ipcRenderer.on(AGENT_ISLAND_IPC_CHANNELS.STATE, listener)
       return () => { ipcRenderer.removeListener(AGENT_ISLAND_IPC_CHANNELS.STATE, listener) }
     },
@@ -2663,14 +2764,20 @@ const electronAPI: ElectronAPI = {
     },
     setExpanded: (expanded: boolean) =>
       ipcRenderer.invoke(AGENT_ISLAND_IPC_CHANNELS.SET_EXPANDED, expanded),
+    setHovered: (hovered: boolean) =>
+      ipcRenderer.invoke(AGENT_ISLAND_IPC_CHANNELS.SET_HOVERED, hovered),
     resize: (width: number, height: number) =>
       ipcRenderer.invoke(AGENT_ISLAND_IPC_CHANNELS.RESIZE, { width, height }),
     move: (x: number, y: number) =>
       ipcRenderer.invoke(AGENT_ISLAND_IPC_CHANNELS.MOVE, { x, y }),
     openMainWindow: () =>
       ipcRenderer.invoke(AGENT_ISLAND_IPC_CHANNELS.OPEN_MAIN_WINDOW),
+    openPlanning: () =>
+      ipcRenderer.invoke(AGENT_ISLAND_IPC_CHANNELS.OPEN_PLANNING),
     openSession: (sessionId: string) =>
       ipcRenderer.invoke(AGENT_ISLAND_IPC_CHANNELS.OPEN_SESSION, sessionId),
+    markSessionViewed: (sessionId: string) =>
+      ipcRenderer.invoke(AGENT_ISLAND_IPC_CHANNELS.MARK_SESSION_VIEWED, sessionId),
   },
 }
 

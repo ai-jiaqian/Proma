@@ -109,7 +109,33 @@ function getMainRendererWebContents(): WebContents | null {
   return win && !win.webContents.isDestroyed() ? win.webContents : null
 }
 
+function publishRunStopped(
+  sessionId: string,
+  stoppedByUser: boolean | undefined,
+  startedAt: number | undefined,
+): void {
+  if (!stoppedByUser) return
+  eventBus.emit(sessionId, {
+    kind: 'proma_event',
+    event: {
+      type: 'run_stopped',
+      ...(startedAt != null ? { startedAt } : {}),
+    },
+  })
+}
+
 // ===== EventBus IPC 转发中间件 =====
+
+/**
+ * 完成事件只需要侧栏/导航使用的轻量 meta。Pi 的 entry bindings 仅用于主进程
+ * session fork/rewind，传到 renderer 会在长会话完成时徒增 IPC 序列化成本。
+ */
+function getSessionMetaForRenderer(sessionId: string) {
+  const session = getAgentSessionMeta(sessionId)
+  if (!session) return undefined
+  const { piEntryBindings: _piEntryBindings, ...meta } = session
+  return meta
+}
 
 eventBus.use((sessionId, payload, next) => {
   const wc = sessionWebContents.get(sessionId)
@@ -166,6 +192,7 @@ export async function runAgent(
         }
       },
       onComplete: (messages, opts) => {
+        publishRunStopped(input.sessionId, opts?.stoppedByUser, opts?.startedAt)
         if (!webContents.isDestroyed()) {
           sendAgentStreamComplete(webContents, input, {
             messages,
@@ -174,8 +201,16 @@ export async function runAgent(
             resultSubtype: opts?.resultSubtype,
             resultErrors: opts?.resultErrors,
             backgroundTasksPending: opts?.backgroundTasksPending,
+            // 只读取刚完成的轻量 meta，renderer 可据此增量更新列表，避免再取 5,000+ 条全量会话。
+            session: getSessionMetaForRenderer(input.sessionId),
           })
         }
+      },
+      onRunStarted: ({ startedAt }) => {
+        eventBus.emit(input.sessionId, {
+          kind: 'proma_event',
+          event: { type: 'run_started', startedAt },
+        })
       },
       onTitleUpdated: (title) => {
         eventBus.emit(input.sessionId, {
@@ -254,6 +289,7 @@ export async function runAgentHeadless(
       },
       onComplete: (messages, opts) => {
         callbacks.onComplete(messages)
+        publishRunStopped(runInput.sessionId, opts?.stoppedByUser, opts?.startedAt)
         // 同步到渲染进程
         if (wc && !wc.isDestroyed()) {
           sendAgentStreamComplete(wc, runInput, {
@@ -263,6 +299,8 @@ export async function runAgentHeadless(
             resultSubtype: opts?.resultSubtype,
             resultErrors: opts?.resultErrors,
             backgroundTasksPending: opts?.backgroundTasksPending,
+            // 只读取刚完成的轻量 meta，renderer 可据此增量更新列表，避免再取 5,000+ 条全量会话。
+            session: getSessionMetaForRenderer(runInput.sessionId),
           })
         }
       },

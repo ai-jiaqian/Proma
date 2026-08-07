@@ -56,6 +56,7 @@ irm https://raw.githubusercontent.com/ai-jiaqian/Proma/main/scripts/install.ps1 
 | 联网与内嵌 AI 能力 | 按需自行配置搜索、生图等服务及对应 API Key | 提供更完整的 Proma Cloud 联网与内嵌能力，包括 WebSearch，以及 GPT Image 2 生图和编辑 |
 | 对外 API 与服务 | 主要使用你自行配置的供应商 API | 可创建独立、可设额度上限的 Proma Cloud API Key，将 LLM、工具和多模态能力接入自己的应用或服务 |
 | 团队额度管理 | 需自行搭建成员、额度分配与用量管理机制 | 团队管理员可向成员分配或回收共享团队额度，支持按月自动分配，并查看成员用量与额度流水 |
+| Skills 分发与协作 | Skills 为工作区本地能力，团队内分发与共享需自行组织 | 企业版支持 Skills 的组织级分发与团队协作：管理员可将团队沉淀的 Skills 一键下发到成员，成员侧免安装直接使用，并统一管理版本、更新与使用范围 |
 | 订阅与用量 | 自行管理供应商账号、余额与用量 | 在应用内管理订阅与余额，并查看模型、Agent 和工具的用量明细 |
 | 从开源版切换 | — | 直接覆盖安装即可，继续使用已有的本地 Proma 数据 |
 
@@ -63,7 +64,7 @@ irm https://raw.githubusercontent.com/ai-jiaqian/Proma/main/scripts/install.ps1 
 
 ### 企业版与商业授权
 
-如果你的组织计划面向数百至数千名员工规模部署 Proma，可以采购企业版授权；我们也可围绕实际部署需求提供范围明确的轻量定制服务。欢迎通过微信联系：`geekthings`。
+如果你的组织计划面向数百至数千名员工规模部署 Proma，可以采购企业版授权；我们也可围绕实际部署需求提供范围明确的轻量定制服务。企业版提供组织级 Skills 分发与团队协作能力，让团队沉淀的最佳实践可以一键下发、统一维护。欢迎通过微信联系：`geekthings`。
 
 ### 首次配置
 
@@ -140,6 +141,7 @@ Proma 的 Agent 模式提供两套可切换的内核：
 | OpenAI、OpenAI Responses、Google、智谱 AI、豆包、通义千问 | 支持 | 暂不支持 | 支持 |
 | OpenAI 兼容自定义端点 | 支持 | 暂不支持 | 支持 |
 | ChatGPT 订阅（Codex OAuth） | — | 支持 | 支持 |
+| xAI 订阅（Grok OAuth） | — | — | 支持 |
 
 > Pi Runtime 可在每个 Agent 会话的输入框下方直接切换；切换会开启新的底层 SDK 会话，但不会删除 Proma 中已保存的消息。Pi 会桥接工作区 Skills、用户 MCP Server，以及 Proma 内置的 Automation / Collaboration 工具；不同模型供应商对工具调用、推理和上下文长度的支持仍可能不同。
 

@@ -28,6 +28,7 @@ export function getSettings(): AppSettings {
       longTextPasteAsAttachmentEnabled: false,
       richTextRenderingEnabled: false,
       feishuSessionMirror: { mode: 'off' },
+      visionRelay: { enabled: false },
       builtinMcpDisabledIds: [],
       agentRuntime: DEFAULT_AGENT_RUNTIME,
       windowsShellPreference: 'auto',
@@ -50,6 +51,7 @@ export function getSettings(): AppSettings {
       longTextPasteAsAttachmentEnabled: data.longTextPasteAsAttachmentEnabled ?? false,
       richTextRenderingEnabled: data.richTextRenderingEnabled ?? false,
       feishuSessionMirror: data.feishuSessionMirror ?? { mode: 'off' },
+      visionRelay: data.visionRelay ?? { enabled: false },
       builtinMcpDisabledIds: settings.builtinMcpDisabledIds ?? [],
       agentRuntime: settings.agentRuntime ?? DEFAULT_AGENT_RUNTIME,
       windowsShellPreference: settings.windowsShellPreference ?? 'auto',
@@ -66,6 +68,7 @@ export function getSettings(): AppSettings {
       longTextPasteAsAttachmentEnabled: false,
       richTextRenderingEnabled: false,
       feishuSessionMirror: { mode: 'off' },
+      visionRelay: { enabled: false },
       builtinMcpDisabledIds: [],
       agentRuntime: DEFAULT_AGENT_RUNTIME,
       windowsShellPreference: 'auto',
@@ -84,6 +87,12 @@ export function updateSettings(updates: Partial<AppSettings>): AppSettings {
   const updated: AppSettings = {
     ...current,
     ...updates,
+    // Agent Island has independently persisted presentation preferences (for
+    // example the Windows position). Preserve them when the settings toggle
+    // only updates `enabled`.
+    agentIsland: updates.agentIsland === undefined
+      ? current.agentIsland
+      : { ...current.agentIsland, ...updates.agentIsland },
   }
   const filePath = getSettingsPath()
 

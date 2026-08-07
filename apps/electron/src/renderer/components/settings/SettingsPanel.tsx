@@ -8,9 +8,11 @@
 import * as React from "react";
 import { useAtom, useAtomValue, useSetAtom } from "jotai";
 import { cn } from "@/lib/utils";
+import { detectIsWindows, WINDOW_CONTROLS_INSET_RIGHT } from "@/lib/platform";
 import {
   Settings,
   Radio,
+  Eye,
   Palette,
   Info,
   Globe,
@@ -52,6 +54,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { ChannelSettings } from "./ChannelSettings";
+import { VisionRelaySettings } from "./VisionRelaySettings";
 import { GeneralSettings } from "./GeneralSettings";
 import { ProxySettings } from "./ProxySettings";
 import { AppearanceSettings } from "./AppearanceSettings";
@@ -76,6 +79,7 @@ interface TabItem {
 const BASE_TABS: TabItem[] = [
   { id: "general", label: "通用设置", icon: <Settings size={16} /> },
   { id: "channels", label: "模型配置", icon: <Radio size={16} /> },
+  { id: "vision-relay", label: "视觉助手", icon: <Eye size={16} /> },
   { id: "prompts", label: "提示词管理", icon: <BookOpen size={16} /> },
   { id: "proxy", label: "代理设置", icon: <Globe size={16} /> },
 ];
@@ -120,6 +124,8 @@ function renderTabContent(tab: SettingsTab): React.ReactElement {
       return <GeneralSettings />;
     case "channels":
       return <ChannelSettings />;
+    case "vision-relay":
+      return <VisionRelaySettings />;
     case "prompts":
       return <PromptSettings />;
     case "proxy":
@@ -166,6 +172,7 @@ export function SettingsPanel({
   const [mainTabs, setMainTabs] = useAtom(tabsAtom);
   const setMainActiveTabId = useSetAtom(activeTabIdAtom);
   const openSession = useOpenSession()
+  const isWindows = React.useMemo(() => detectIsWindows(), [])
 
   /** 统一的退出拦截对话框状态 */
   type PendingAction =
@@ -282,10 +289,18 @@ export function SettingsPanel({
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-content-area text-foreground">
-      <div
-        aria-hidden="true"
-        className="titlebar-drag-region pointer-events-none h-[35px] flex-shrink-0 bg-[hsl(var(--sidebar-surface))]"
-      />
+      {/* 顶部可拖动标题栏区域。背景层保持全宽；drag 层在 Windows 上必须避开右上角的
+          WindowControls 按钮区域（WINDOW_CONTROLS_INSET_RIGHT），否则 OS hitmask 会把
+          按钮点击误判为标题栏点击，导致最小化/最大化/关闭按钮无响应（与 AppShell/TabBar 一致）。 */}
+      <div className="relative h-[35px] flex-shrink-0 bg-[hsl(var(--sidebar-surface))]">
+        <div
+          aria-hidden="true"
+          className={cn(
+            'titlebar-drag-region pointer-events-none absolute left-0 top-0 h-full',
+            isWindows ? WINDOW_CONTROLS_INSET_RIGHT : 'right-0',
+          )}
+        />
+      </div>
 
       {/* 主体：左导航 + 右内容 */}
       <div className="flex flex-1 min-h-0">

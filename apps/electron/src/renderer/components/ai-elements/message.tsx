@@ -26,6 +26,7 @@ import { CalendarDays, ChevronDown, ChevronUp, Paperclip, FileText, ListTodo, Sp
 import { cn } from '@/lib/utils'
 import { shouldInspectMermaidCodeBlock, shouldRenderMermaidCodeBlock } from '@/lib/mermaid-detection'
 import { normalizeLatexDelimiters } from '@/lib/normalize-latex'
+import { copyTextToClipboard } from '@/lib/clipboard'
 import { Button } from '@/components/ui/button'
 import { ImageLightbox, type LightboxImage } from '@/components/ui/image-lightbox'
 import {
@@ -37,7 +38,7 @@ import {
 import { LoadingIndicator } from '@/components/ui/loading-indicator'
 import { CodeBlock, MermaidBlock } from '@proma/ui'
 import { detectLanguage } from '@proma/core'
-import { FilePathChip, isAbsoluteFilePath, isRelativeFilePath } from './file-path-chip'
+import { FilePathChip, isAbsoluteFilePath, isImageFilePath, isRelativeFilePath } from './file-path-chip'
 import type { HTMLAttributes, ComponentProps, ReactNode } from 'react'
 import type { FileAttachment } from '@proma/shared'
 
@@ -273,8 +274,18 @@ function safeDecode(raw: string): string {
   }
 }
 
+/**
+ * 附加 basePaths 上下文 — 用于把会话目录与附加目录穿透到各类文件 chip。
+ */
+const BasePathsContext = React.createContext<string[] | undefined>(undefined)
+
+/** 提供附加目录候选给所有内嵌的 MessageResponse。 */
+export function BasePathsProvider({ basePaths, children }: { basePaths?: string[]; children: React.ReactNode }): React.ReactElement {
+  return <BasePathsContext.Provider value={basePaths}>{children}</BasePathsContext.Provider>
+}
+
 /** 仅在普通文本中转换旧引用，避免改写 inline code、fenced code 和缩进代码块。 */
-function normalizeNamedReferenceDelimiters(markdown: string): string {
+export function normalizeNamedReferenceDelimiters(markdown: string): string {
   const normalizeText = (text: string): string => text.replace(
     /(&(?:session|todo|calendar_event):[A-Za-z0-9-]+)~(\S+)/g,
     '$1::$2'
@@ -325,6 +336,14 @@ function MentionChip({ type, value }: { type: MentionType; value: string }): Rea
   const style = MENTION_STYLES[type]
   const Icon = style.icon
   const decoded = safeDecode(value)
+  const contextBasePaths = React.useContext(BasePathsContext)
+
+  // 图片引用原先会以内联图片显示。改为 chip 后仍沿用同一文件预览入口，
+  // 避免用户只能看到文件名而无法查看内容。
+  if (type === 'file' && isImageFilePath(decoded)) {
+    return <FilePathChip filePath={decoded} basePaths={contextBasePaths} />
+  }
+
   const isNamedReference = type === 'session' || type === 'todo' || type === 'calendar_event'
   const [referenceId = '', ...labelParts] = isNamedReference ? decoded.split('::') : [decoded]
   const label = labelParts.length > 0 ? labelParts.join('::') : undefined
@@ -429,17 +448,6 @@ export function remarkPreserveBreaks() {
 
 /** remark 插件函数签名 */
 export type RemarkPluginFn = () => (tree: MdastParent) => void
-
-/**
- * 附加 basePaths 上下文 — 用于把"附加目录候选"穿透到 MarkdownInlineCode 而不必逐层透传 props。
- * AgentMessages 在顶层用 BasePathsProvider 包裹，FilePathChip 渲染时会自动取到。
- */
-const BasePathsContext = React.createContext<string[] | undefined>(undefined)
-
-/** 提供附加目录候选给所有内嵌的 MessageResponse */
-export function BasePathsProvider({ basePaths, children }: { basePaths?: string[]; children: React.ReactNode }): React.ReactElement {
-  return <BasePathsContext.Provider value={basePaths}>{children}</BasePathsContext.Provider>
-}
 
 /**
  * 本轮「文件名 → 绝对路径」映射上下文 — 由 AssistantTurnRenderer 提供，作用域为单个 turn。
@@ -555,7 +563,7 @@ const MarkdownPre = React.memo(function MarkdownPre({
       // normalize Windows/legacy-Mac line endings before feeding to Mermaid parser
       const mermaidCode = extractText(codeProps.children).replace(/\r\n?/g, '\n').replace(/\n$/, '')
       if (shouldRenderMermaidCodeBlock(className, mermaidCode)) {
-        return <MermaidBlock code={mermaidCode} />
+        return <MermaidBlock code={mermaidCode} onCopy={copyTextToClipboard} />
       }
     }
 
@@ -567,12 +575,12 @@ const MarkdownPre = React.memo(function MarkdownPre({
         const patchedCode = React.cloneElement(codeChild, {
           className: `${className} language-${detected}`.trim(),
         } as Partial<React.HTMLAttributes<HTMLElement>>)
-        return <CodeBlock>{patchedCode}</CodeBlock>
+        return <CodeBlock onCopy={copyTextToClipboard}>{patchedCode}</CodeBlock>
       }
     }
   }
 
-  return <CodeBlock>{preChildren}</CodeBlock>
+  return <CodeBlock onCopy={copyTextToClipboard}>{preChildren}</CodeBlock>
 })
 
 /** 行内代码 / 文件路径渲染器 */

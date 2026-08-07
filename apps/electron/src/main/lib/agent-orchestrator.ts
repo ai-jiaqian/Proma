@@ -20,7 +20,7 @@ import { join, dirname } from 'node:path'
 import { accessSync, constants, existsSync, mkdirSync, realpathSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { app } from 'electron'
-import type { AgentRuntime, AgentSendInput, AgentMessage, AgentGenerateTitleInput, AgentProviderAdapter, AgentSessionMeta, CodexOAuthCredentials, TypedError, RetryAttempt, SDKMessage, SDKAssistantMessage, AgentStreamPayload, RewindSessionResult, ProviderType } from '@proma/shared'
+import type { AgentRuntime, AgentSendInput, AgentMessage, AgentGenerateTitleInput, AgentProviderAdapter, AgentSessionMeta, CodexOAuthCredentials, XaiOAuthCredentials, TypedError, RetryAttempt, SDKMessage, SDKAssistantMessage, AgentStreamPayload, RewindSessionResult, ProviderType } from '@proma/shared'
 import {
   PROMA_DEFAULT_PERMISSION_MODE,
   PROMA_PERMISSION_MODE_CONFIG,
@@ -43,7 +43,7 @@ import type { PiAgentQueryOptions } from './adapters/pi-agent-adapter'
 import { getPiAssistantErrorDetails, hasPiAssistantTextContent, stripPiAssistantError } from './adapters/pi-message-adapter'
 import { isTransientNetworkError, isMalformedResponseError, isSessionNotFoundError } from './error-patterns'
 import { AgentEventBus } from './agent-event-bus'
-import { decryptApiKey, getChannelById, listChannels, persistCodexOAuthCredentials, resolveChannelRuntimeApiKey, resolveCodexOAuthCredentials } from './channel-manager'
+import { decryptApiKey, getChannelById, listChannels, persistCodexOAuthCredentials, persistXaiOAuthCredentials, resolveChannelRuntimeApiKey, resolveCodexOAuthCredentials, resolveXaiOAuthCredentials } from './channel-manager'
 import { getAdapter, fetchTitle, normalizeAnthropicBaseUrlForSdk, getPromaUserAgent } from '@proma/core'
 import pkg from '../../../package.json' with { type: 'json' }
 import { getFetchFn } from './proxy-fetch'
@@ -418,12 +418,13 @@ export class AgentOrchestrator {
   private adapter: AgentProviderAdapter
   private eventBus: AgentEventBus
   private activeSessions = new Map<string, number>()
+  private nextRunGeneration = 0
 
   /** 队列消息本地记录（sessionId → UUID 集合，用于防重） */
   private queuedMessageUuids = new Map<string, Set<string>>()
 
-  /** 被用户手动中止的会话集合（在 stop 中标记，catch block 中消费） */
-  private stoppedBySessions = new Set<string>()
+  /** 被用户手动中止的运行代际（在 stop 中标记，在对应运行的终态路径消费）。 */
+  private stoppedBySessions = new Map<string, number>()
 
   /** 运行中会话的当前权限模式（支持运行时动态切换） */
   private sessionPermissionModes = new Map<string, PromaPermissionMode>()
@@ -439,10 +440,10 @@ export class AgentOrchestrator {
    * SDK 在 query.close() 后不一定走异常路径：某些版本会先正常 yield result 再结束迭代。
    * 因此停止标记必须在所有终态路径统一消费，而不能只依赖 catch 块。
    */
-  private consumeStoppedByUser(sessionId: string): boolean {
-    const stoppedByUser = this.stoppedBySessions.has(sessionId)
+  private consumeStoppedByUser(sessionId: string, runGeneration: number): boolean {
+    if (this.stoppedBySessions.get(sessionId) !== runGeneration) return false
     this.stoppedBySessions.delete(sessionId)
-    return stoppedByUser
+    return true
   }
 
   /**
@@ -626,6 +627,12 @@ export class AgentOrchestrator {
     if (!channel) {
       console.warn('[Agent 标题生成] 渠道不存在:', channelId)
       return null
+    }
+
+    if (channel.provider === 'xai') {
+      // xAI subscription uses Pi's provider-specific OAuth transport; title generation's
+      // generic channel adapter only understands API keys, so retain a local deterministic title.
+      return createFallbackTitle(userMessage)
     }
 
     if (channel.provider === 'openai-codex') {
@@ -899,7 +906,7 @@ export class AgentOrchestrator {
    * 通过 EventBus 分发 AgentEvent，通过 callbacks 发送控制信号。
    */
   async sendMessage(input: AgentSendInput, callbacks: SessionCallbacks): Promise<void> {
-    const { sessionId, userMessage, channelId, modelId, agentRuntime: inputAgentRuntime, workspaceId: requestedWorkspaceId, additionalDirectories, customMcpServers, permissionModeOverride, mentionedSkills, mentionedMcpServers, mentionedSessionIds, mentionedTodoIds, mentionedCalendarEventIds, automationContext, retryOfErrorUuid } = input
+    const { sessionId, userMessage, rawUserMessage, channelId, modelId, agentRuntime: inputAgentRuntime, workspaceId: requestedWorkspaceId, additionalDirectories, customMcpServers, permissionModeOverride, mentionedSkills, mentionedMcpServers, mentionedSessionIds, mentionedTodoIds, mentionedCalendarEventIds, automationContext, retryOfErrorUuid } = input
     const stderrChunks: string[] = []
     const streamStartedAt = input.startedAt ?? Date.now()
     let userMessagePersisted = false
@@ -907,9 +914,10 @@ export class AgentOrchestrator {
 
     const persistInitialUserMessage = (): void => {
       if (userMessagePersisted) return
-      this.persistUserMessage(sessionId, userMessage)
+      // rawUserMessage 保留展示/持久化用的原始文本（@file 编码原文，remarkMentions 解码显示）；
+      // userMessage 是传给 Agent 的 SDK 文本（@file 路径已解码为真实路径）。
+      this.persistUserMessage(sessionId, rawUserMessage ?? userMessage)
       userMessagePersisted = true
-      callbacks.onRunStarted?.({ startedAt: streamStartedAt })
     }
 
     // 0. 并发保护
@@ -1061,21 +1069,28 @@ export class AgentOrchestrator {
 
     let apiKey: string
     let codexOAuthCredentials: CodexOAuthCredentials | undefined
+    let xaiOAuthCredentials: XaiOAuthCredentials | undefined
     try {
-      // ChatGPT (Codex) OAuth 渠道必须保留完整凭据给 Pi runtime，才能按真实
-      // expires 刷新；其余渠道只需解密 API Key。
+      // 订阅 OAuth 渠道必须保留完整凭据给 Pi runtime，才能在执行中按真实 expires
+      // 自动刷新；其余渠道只需解密 API Key。
       if (channel.provider === 'openai-codex') {
         codexOAuthCredentials = await resolveCodexOAuthCredentials(channelId)
         apiKey = codexOAuthCredentials.access
+      } else if (channel.provider === 'xai') {
+        xaiOAuthCredentials = await resolveXaiOAuthCredentials(channelId)
+        apiKey = xaiOAuthCredentials.access
       } else {
         apiKey = decryptApiKey(channelId)
       }
     } catch (err) {
-      if (channel.provider === 'openai-codex') {
+      if (channel.provider === 'openai-codex' || channel.provider === 'xai') {
+        const isXai = channel.provider === 'xai'
         reportPreflightError({
           code: 'expired_oauth_token',
-          title: 'ChatGPT 登录已失效',
-          message: '无法刷新 ChatGPT 登录凭据，登录可能已过期或被撤销。请在设置中重新登录 ChatGPT。',
+          title: isXai ? 'xAI 登录已失效' : 'ChatGPT 登录已失效',
+          message: isXai
+            ? '无法刷新 xAI 登录凭据，登录可能已过期或被撤销。请在设置中重新登录 xAI。'
+            : '无法刷新 ChatGPT 登录凭据，登录可能已过期或被撤销。请在设置中重新登录 ChatGPT。',
           actions: [
             { key: 's', label: '打开渠道设置', action: 'open_channel_settings' },
           ],
@@ -1140,8 +1155,9 @@ export class AgentOrchestrator {
     // 2.1 立即抢占会话槽位（在所有同步检查通过后、第一个 await 之前）
     // 防止 buildSdkEnv 等 await 期间并发调用绕过上方的检查，导致多条重复消息写入 JSONL
     // finally 块会通过 generation 匹配来安全清理，不影响正常流程
-    const runGeneration = Date.now()
+    const runGeneration = ++this.nextRunGeneration
     this.activeSessions.set(sessionId, runGeneration)
+    callbacks.onRunStarted?.({ startedAt: streamStartedAt })
 
     const releaseActiveRun = (): void => {
       // 在发送 STREAM_COMPLETE 前释放 active slot，避免渲染进程已进入空闲态、
@@ -1300,7 +1316,12 @@ export class AgentOrchestrator {
       // 9.4.1 Fork session JSONL 迁移已在 forkAgentSession 中完成；fork 的 cwd 语义
       // 从源会话继承并持久化，避免历史相对路径在恢复时切换到另一文件根。
 
-
+      // 必须与 runtime 接收的附加目录保持一致；视觉助手据此限制允许外发的图片路径。
+      const allAdditionalDirectories = collectAttachedDirectories({
+        extraDirs: additionalDirectories,
+        sessionMeta,
+        workspaceSlug,
+      })
 
       // 9.6 直接信任已保存的 sdkSessionId，跳过 listSessions 预验证
       // 原因：listSessions({ dir }) 基于 cwd 路径哈希查找，但 session 级别的 cwd
@@ -1342,6 +1363,7 @@ export class AgentOrchestrator {
             agentRuntime,
             workspaceId,
             workspaceSlug,
+            allowedRoots: allAdditionalDirectories,
             permissionMode: permissionModeOverride ?? sessionMeta?.permissionMode ?? PROMA_DEFAULT_PERMISSION_MODE,
             triggeredBy: input.triggeredBy,
           })
@@ -1601,6 +1623,15 @@ export class AgentOrchestrator {
           )
         }
 
+        // 视觉助手由用户在全局设置中显式启用并选择外发渠道；在正常会话中直接放行，
+        // 仍由工具服务限制为当前会话/附加目录内的图片。计划模式不执行任何外发操作。
+        if (toolName === 'VisionRelay') {
+          if (currentMode === 'plan') {
+            return { behavior: 'deny' as const, message: '计划模式下不能将本地图片发送给视觉模型，请在计划获批后执行。' }
+          }
+          return { behavior: 'allow' as const }
+        }
+
         const planningDeletionPermission = resolvePlanningDeletionPermission(
           toolName,
           currentMode,
@@ -1681,11 +1712,6 @@ export class AgentOrchestrator {
       const piThinkingLevel = agentRuntime === 'pi'
         ? resolvePiThinkingLevel(appSettings, sessionMeta, channel.provider, selectedModelId, piReasoningCapability)
         : undefined
-      const allAdditionalDirectories = collectAttachedDirectories({
-        extraDirs: additionalDirectories,
-        sessionMeta,
-        workspaceSlug,
-      })
       const systemPromptAppend = buildSystemPrompt({
         agentRuntime,
         workspaceName: workspace?.name,
@@ -1765,6 +1791,7 @@ export class AgentOrchestrator {
         apiKey,
         baseUrl: channel.baseUrl,
         provider: channel.provider,
+        channelId,
         channelName: channel.name,
         proxyUrl,
         runtimeEnv,
@@ -1786,7 +1813,13 @@ export class AgentOrchestrator {
             persistCodexOAuthCredentials(channelId, credentials)
           },
         }),
-        ...((channel.provider === 'openai-codex' || channel.provider === 'openai-responses' || channel.provider === 'openai' || channel.provider === 'custom')
+        ...(xaiOAuthCredentials && {
+          xaiOAuthCredentials,
+          onXaiOAuthCredentialsRefreshed: (credentials: XaiOAuthCredentials) => {
+            persistXaiOAuthCredentials(channelId, credentials)
+          },
+        }),
+        ...((channel.provider === 'openai-codex' || channel.provider === 'xai' || channel.provider === 'openai-responses' || channel.provider === 'openai' || channel.provider === 'custom')
           && resolveReasoningProfile({
             modelId: selectedModelId,
             transport: inferReasoningTransport(channel.provider),
@@ -1942,7 +1975,7 @@ export class AgentOrchestrator {
 
             // 等待期间如果会话被中止，退出
             if (!this.activeSessions.has(sessionId)) {
-              const wasStoppedByUser = this.consumeStoppedByUser(sessionId)
+              const wasStoppedByUser = this.consumeStoppedByUser(sessionId, runGeneration)
               this.persistSDKMessages(sessionId, accumulatedMessages, Date.now() - queryStartedAt)
               try { updateAgentSessionMeta(sessionId, { stoppedByUser: wasStoppedByUser }) } catch { /* 会话可能已删除 */ }
               completeRun(getAgentSessionMessages(sessionId), { stoppedByUser: wasStoppedByUser, startedAt: streamStartedAt })
@@ -2327,7 +2360,7 @@ export class AgentOrchestrator {
             continue
           }
 
-          const wasStoppedByUser = this.consumeStoppedByUser(sessionId)
+          const wasStoppedByUser = this.consumeStoppedByUser(sessionId, runGeneration)
 
           // 正常完成 — 如果之前有可见重试，发送 retry_cleared
           if (!wasStoppedByUser && retryAttemptsScheduled > RETRY_VISIBILITY_THRESHOLD) {
@@ -2377,7 +2410,7 @@ export class AgentOrchestrator {
 
           // 用户主动中止
           if (!this.activeSessions.has(sessionId)) {
-            const wasStoppedByUser = this.consumeStoppedByUser(sessionId)
+            const wasStoppedByUser = this.consumeStoppedByUser(sessionId, runGeneration)
             console.log(`[Agent 编排] 会话 ${sessionId} 已被用户中止`)
             this.persistSDKMessages(sessionId, accumulatedMessages, Date.now() - queryStartedAt)
             // 持久化中断状态到会话 meta
@@ -2625,9 +2658,10 @@ export class AgentOrchestrator {
    * 再调用 adapter.abort() 中止底层 SDK 进程。
    */
   stop(sessionId: string): void {
+    const runGeneration = this.activeSessions.get(sessionId)
     this.activeSessions.delete(sessionId)
     this.sessionPermissionModes.delete(sessionId)
-    this.stoppedBySessions.add(sessionId)
+    if (runGeneration != null) this.stoppedBySessions.set(sessionId, runGeneration)
     this.queuedMessageUuids.delete(sessionId)
     this.adapter.abort(sessionId)
     console.log(`[Agent 编排] 已中止会话: ${sessionId}`)

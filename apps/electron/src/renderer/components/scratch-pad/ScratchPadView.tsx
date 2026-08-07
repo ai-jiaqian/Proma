@@ -59,8 +59,13 @@ import {
   VOICE_DICTATION_INSERT_EVENT,
   VOICE_DICTATION_PREVIEW_EVENT,
   getLastFocusedVoiceInputId,
+  isVoiceDictationTargetInput,
   setLastFocusedVoiceInputId,
 } from '@/lib/voice-input-focus'
+import {
+  isVoiceDictationPreviewRangeCurrent,
+  type VoiceDictationPreviewRange,
+} from '@/lib/voice-dictation-preview'
 import { SelectionActionPopover } from '@/components/selection/SelectionActionPopover'
 import { SELECTION_ACTION_POPOVER_SELECTOR } from '@/lib/quoted-selection'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
@@ -141,7 +146,7 @@ function ScratchPadEditor({ variant }: ScratchPadEditorProps): React.ReactElemen
   const pointerSelectingRef = React.useRef(false)
   const captureTimerRef = React.useRef<number | null>(null)
   const openSideChatPendingRef = React.useRef(false)
-  const voicePreviewRef = React.useRef<{ sessionId: string; from: number; to: number } | null>(null)
+  const voicePreviewRef = React.useRef<VoiceDictationPreviewRange | null>(null)
 
   // Image lightbox state for edit functionality
   const [lightboxSrc, setLightboxSrc] = React.useState<string | null>(null)
@@ -566,6 +571,7 @@ function ScratchPadEditor({ variant }: ScratchPadEditorProps): React.ReactElemen
         sessionId: current.sessionId,
         from: from.pos,
         to: Math.max(from.pos, to.pos),
+        text: current.text,
       }
     }
 
@@ -579,32 +585,44 @@ function ScratchPadEditor({ variant }: ScratchPadEditorProps): React.ReactElemen
     if (!editor) return
 
     const updatePreview = (event: Event): void => {
-      const { sessionId, text } = (event as CustomEvent<{ sessionId?: string; text?: string }>).detail ?? {}
+      const { sessionId, text, targetInputId } = (event as CustomEvent<{ sessionId?: string; text?: string; targetInputId?: string | null }>).detail ?? {}
       const previewText = text?.trim()
       if (!sessionId || !previewText) return
 
       const current = voicePreviewRef.current
       if (current && current.sessionId !== sessionId) return
-      if (!current && getLastFocusedVoiceInputId() !== SCRATCH_PAD_VOICE_INPUT_ID) return
+      if (!current && !isVoiceDictationTargetInput(SCRATCH_PAD_VOICE_INPUT_ID, targetInputId)) return
       const from = current?.from ?? editor.state.selection.from
       const to = current?.to ?? editor.state.selection.to
       editor.view.dispatch(editor.state.tr.insertText(previewText, from, to))
-      voicePreviewRef.current = { sessionId, from, to: from + previewText.length }
+      voicePreviewRef.current = { sessionId, from, to: from + previewText.length, text: previewText }
       event.preventDefault()
+    }
+
+    const clearPreviewRange = (): void => {
+      const current = voicePreviewRef.current
+      if (!current) return
+      if (!editor.view.isDestroyed && isVoiceDictationPreviewRangeCurrent(
+        current,
+        (from, to) => editor.state.doc.textBetween(from, to, '\n', '\n'),
+      )) {
+        editor.view.dispatch(editor.state.tr.delete(current.from, current.to))
+      }
+      voicePreviewRef.current = null
     }
 
     const clearPreview = (event: Event): void => {
       const { sessionId } = (event as CustomEvent<{ sessionId?: string }>).detail ?? {}
       const current = voicePreviewRef.current
       if (!current || current.sessionId !== sessionId) return
-      editor.view.dispatch(editor.state.tr.delete(current.from, current.to))
-      voicePreviewRef.current = null
+      clearPreviewRange()
       event.preventDefault()
     }
 
     window.addEventListener(VOICE_DICTATION_PREVIEW_EVENT, updatePreview)
     window.addEventListener(VOICE_DICTATION_CLEAR_PREVIEW_EVENT, clearPreview)
     return () => {
+      clearPreviewRange()
       window.removeEventListener(VOICE_DICTATION_PREVIEW_EVENT, updatePreview)
       window.removeEventListener(VOICE_DICTATION_CLEAR_PREVIEW_EVENT, clearPreview)
     }
@@ -626,7 +644,7 @@ function ScratchPadEditor({ variant }: ScratchPadEditorProps): React.ReactElemen
   React.useEffect(() => {
     if (!editor) return
     const handler = (event: Event): void => {
-      const customEvent = event as CustomEvent<{ sessionId?: string; text?: string }>
+      const customEvent = event as CustomEvent<{ sessionId?: string; text?: string; targetInputId?: string | null }>
       const text = customEvent.detail?.text?.trim()
       if (!text) return
 
@@ -638,7 +656,7 @@ function ScratchPadEditor({ variant }: ScratchPadEditorProps): React.ReactElemen
         editor.view.dispatch(transaction)
         voicePreviewRef.current = null
       } else {
-        if (getLastFocusedVoiceInputId() !== SCRATCH_PAD_VOICE_INPUT_ID) return
+        if (!isVoiceDictationTargetInput(SCRATCH_PAD_VOICE_INPUT_ID, customEvent.detail?.targetInputId)) return
         editor.chain().focus().insertContent({ type: 'text', text }).run()
       }
       event.preventDefault()
@@ -699,8 +717,8 @@ function ScratchPadEditor({ variant }: ScratchPadEditorProps): React.ReactElemen
 
   const isPane = variant === 'pane'
   const scrollClassName = isPane
-    ? 'flex-1 overflow-auto scrollbar-thin px-4 pt-4 pb-20'
-    : 'flex-1 overflow-auto scrollbar-thin px-8 pt-6 pb-20'
+    ? 'flex-1 overflow-auto scrollbar-thin px-4 pt-4'
+    : 'flex-1 overflow-auto scrollbar-thin px-8 pt-6'
   const contentClassName = isPane ? 'h-full max-w-none' : 'max-w-3xl mx-auto h-full'
   const speechWrapperClassName = isPane
     ? 'absolute left-1/2 -translate-x-1/2 bottom-9 z-20'
@@ -750,7 +768,7 @@ function ScratchPadEditor({ variant }: ScratchPadEditorProps): React.ReactElemen
           {loaded ? (
             <EditorContent
               editor={editor}
-              className="scratch-pad-editor prose prose-sm dark:prose-invert max-w-none h-full [&_.ProseMirror]:min-h-full [&_.ProseMirror]:outline-none [&_.ProseMirror]:text-sm [&_.ProseMirror_p.is-editor-empty:first-child::before]:text-muted-foreground/50 [&_.ProseMirror_p.is-editor-empty:first-child::before]:content-[attr(data-placeholder)] [&_.ProseMirror_p.is-editor-empty:first-child::before]:float-left [&_.ProseMirror_p.is-editor-empty:first-child::before]:pointer-events-none [&_.ProseMirror_p.is-editor-empty:first-child::before]:h-0"
+              className="scratch-pad-editor prose prose-sm dark:prose-invert max-w-none h-full [&_.ProseMirror]:min-h-full [&_.ProseMirror]:pb-[33vh] [&_.ProseMirror]:outline-none [&_.ProseMirror]:text-sm [&_.ProseMirror_p.is-editor-empty:first-child::before]:text-muted-foreground/50 [&_.ProseMirror_p.is-editor-empty:first-child::before]:content-[attr(data-placeholder)] [&_.ProseMirror_p.is-editor-empty:first-child::before]:float-left [&_.ProseMirror_p.is-editor-empty:first-child::before]:pointer-events-none [&_.ProseMirror_p.is-editor-empty:first-child::before]:h-0"
             />
           ) : (
             <div className="min-h-[200px] flex items-center justify-center">
@@ -769,7 +787,7 @@ function ScratchPadEditor({ variant }: ScratchPadEditorProps): React.ReactElemen
       )}
       {/* 底部居中悬浮：圆形语音输入按钮 */}
       <div className={speechWrapperClassName}>
-        <SpeechButton className={speechButtonClassName} />
+        <SpeechButton className={speechButtonClassName} voiceInputId={SCRATCH_PAD_VOICE_INPUT_ID} />
       </div>
       <div className="h-[28px] border-t border-border/40 px-4 flex items-center justify-between">
         <div className="flex items-center gap-3">
