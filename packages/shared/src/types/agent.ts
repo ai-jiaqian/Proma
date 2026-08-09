@@ -404,7 +404,6 @@ export type ErrorCode =
   | 'agent_provider_not_supported'
   | 'agent_model_unavailable'
   | 'api_key_decrypt_failed'
-  | 'claude_binary_not_found'
   | 'agent_runtime_not_found'
   | 'workspace_not_found'
   | 'local_project_root_unavailable'
@@ -635,6 +634,9 @@ export type AgentStreamPayload =
  */
 export type AgentCwdMode = 'session' | 'project'
 
+/** 会话私有工作台的文件布局。缺失字段兼容旧版 `.context/` 子目录。 */
+export type SessionWorkbenchLayout = 'legacy-context' | 'root'
+
 /**
  * Agent 会话轻量索引项
  *
@@ -656,8 +658,11 @@ export interface AgentSessionMeta {
   piSessionFile?: string
   /** Proma assistant UI UUID 到 Pi 树状 session entry ID 的持久映射。 */
   piEntryBindings?: Record<string, string>
-  /** 当前会话使用的 Agent runtime；历史会话缺省为 claude */
-  agentRuntime?: import('./agent-provider').AgentRuntime
+  /** 已退役 Claude runtime 的只读 transcript；必须新建 Pi 会话才能继续。 */
+  legacyTranscript?: {
+    sourceRuntime: 'claude'
+    continuationRequired: true
+  }
   /** ChatGPT Codex Fast Mode 开关；仅 Pi + ChatGPT OAuth 的受支持模型实际生效。 */
   codexFastMode?: boolean
   /** 本会话的推理深度；未设置时兼容旧版全局思考设置。 */
@@ -671,6 +676,11 @@ export interface AgentSessionMeta {
    * session workbench cwd。
    */
   agentCwdMode?: AgentCwdMode
+  /**
+   * 会话私有工作台的文件布局。新会话在 workbench 根目录直接存放计划、handoff
+   * 等私有资料；缺失字段的历史会话保留 `.context/` 路径以兼容工具历史。
+   */
+  sessionWorkbenchLayout?: SessionWorkbenchLayout
   /** 是否置顶 */
   pinned?: boolean
   /** 是否已星标（仅用于侧栏快速识别，不影响排序或置顶） */
@@ -683,10 +693,6 @@ export interface AgentSessionMeta {
   attachedFiles?: string[]
   /** 分叉来源：源会话的 Proma 工作目录（SDK session 文件在此目录的项目空间中，首次 resume 后清除） */
   forkSourceDir?: string
-  /** 分叉来源：源会话的 SDK session ID（用于 rewind 时读取源会话的 file-history-snapshot 和备份文件） */
-  forkSourceSdkSessionId?: string
-  /** 回退后的 resume 截断点：下次发消息时传给 SDK resumeSessionAt（消费后清除） */
-  resumeAtMessageUuid?: string
   /** 历史兼容字段：旧版手动保留状态 */
   manualWorking?: boolean
   /** Agent 执行完成但用户尚未清除完成状态 */
@@ -1004,9 +1010,14 @@ export interface WorkspaceMemoryFileSummary {
 
 /** 工作区记忆摘要 */
 export interface WorkspaceMemorySummary {
-  /** 工作区级 CLAUDE.md */
-  claudeMd: WorkspaceMemoryFileSummary
-  /** SDK auto memory 目录 */
+  /** 工作区级 AGENTS.md */
+  agentsMd: WorkspaceMemoryFileSummary
+  /** 迁移时发现内容不同的 legacy CLAUDE.md；必须由用户手动合并。 */
+  instructionConflict?: {
+    legacyPath: string
+    agentsPath: string
+  }
+  /** Proma 工作区自动记忆目录 */
   autoMemory: {
     /** 绝对目录路径 */
     directory: string
@@ -1045,14 +1056,10 @@ export interface AgentSendInput {
   channelId: string
   /** 模型 ID */
   modelId?: string
-  /** 本轮请求使用的 Agent runtime（用于输入区快速切换后的兜底同步） */
-  agentRuntime?: import('./agent-provider').AgentRuntime
   /** 工作区 ID（用于确定 cwd） */
   workspaceId?: string
   /** 附加的外部目录（绝对路径，传递给 SDK additionalDirectories） */
   additionalDirectories?: string[]
-  /** 动态注入的 MCP 服务器（仅在本次会话中生效，如飞书群聊工具） */
-  customMcpServers?: Record<string, Record<string, unknown>>
   /** 强制覆盖权限模式（飞书等无 UI 交互场景下强制 'bypassPermissions'） */
   permissionModeOverride?: PromaPermissionMode
   /** 用户通过 /skill:xxx 引用的 Skill slug 列表 */
@@ -1628,10 +1635,10 @@ export const AGENT_IPC_CHANNELS = {
   RENAME_SKILL_ENTRY: 'agent:rename-skill-entry',
   /** 获取工作区记忆摘要 */
   GET_WORKSPACE_MEMORY_SUMMARY: 'agent:get-workspace-memory-summary',
-  /** 读取工作区 CLAUDE.md */
-  READ_WORKSPACE_CLAUDE_MD: 'agent:read-workspace-claude-md',
-  /** 写入工作区 CLAUDE.md */
-  WRITE_WORKSPACE_CLAUDE_MD: 'agent:write-workspace-claude-md',
+  /** 读取工作区 AGENTS.md */
+  READ_WORKSPACE_AGENTS_MD: 'agent:read-workspace-agents-md',
+  /** 写入工作区 AGENTS.md */
+  WRITE_WORKSPACE_AGENTS_MD: 'agent:write-workspace-agents-md',
   /** 列出工作区 auto memory 文件树 */
   LIST_WORKSPACE_AUTO_MEMORY_FILES: 'agent:list-workspace-auto-memory-files',
   /** 读取工作区 auto memory 文件 */
@@ -1735,7 +1742,6 @@ export const AGENT_IPC_CHANNELS = {
   /** 热切换指定会话的权限模式（运行中生效，不广播到其他会话） */
   UPDATE_SESSION_PERMISSION_MODE: 'agent:update-session-permission-mode',
   /** 切换指定会话的 Agent runtime（下一轮生效，跨 runtime 时清空 SDK resume ID） */
-  UPDATE_SESSION_AGENT_RUNTIME: 'agent:update-session-agent-runtime',
   /** 切换指定会话的 ChatGPT Codex Fast Mode（下一轮 Pi 请求生效） */
   UPDATE_SESSION_CODEX_FAST_MODE: 'agent:update-session-codex-fast-mode',
   /** 查询 Pi catalog 或专属 profile 支持的会话级推理档位 */
