@@ -152,7 +152,7 @@ import type {
 } from '@proma/shared'
 import type { UserProfile, AppSettings } from '../types'
 import { getRuntimeStatus, getGitRepoStatus, reinitializeRuntime } from './lib/runtime-init'
-import { getUnstagedChanges, getFileDiff, getUntrackedContent, revertFile, getDiffContents, listWorktrees, getWorktreeChanges, getMainRepoRoot } from './lib/git-diff-service'
+import { getUnstagedChanges, invalidateGitDiffCache, getFileDiff, getUntrackedContent, revertFile, getDiffContents, listWorktrees, getWorktreeChanges, getMainRepoRoot } from './lib/git-diff-service'
 import { registerPromaFilePath } from './lib/local-file-protocol'
 import { registerUpdaterIpc } from './lib/updater/updater-ipc'
 import {
@@ -208,7 +208,8 @@ import {
   downloadInstaller,
   launchInstaller,
 } from './lib/installer-downloader'
-import { getProxySettings, saveProxySettings } from './lib/proxy-settings-service'
+import { getEffectiveProxyUrl, getProxySettings, saveProxySettings } from './lib/proxy-settings-service'
+import { getFetchFn } from './lib/proxy-fetch'
 import { detectSystemProxy } from './lib/system-proxy-detector'
 import {
   listAutomations,
@@ -311,6 +312,7 @@ import {
   listWorkspaceAutoMemoryFiles,
   readWorkspaceAutoMemoryFile,
   writeWorkspaceAutoMemoryFile,
+  approveWorkspaceProjectKnowledgeMaintenance,
   getWorkspaceAttachedDirectories,
   getWorkspaceAttachedFiles,
   attachWorkspaceDirectory,
@@ -323,6 +325,22 @@ import {
   cleanupStaleWorkspaceAttachedPaths,
 } from './lib/agent-workspace-manager'
 import { movePathSafely } from './lib/file-move-service'
+import { subscribeWorkspaceMemoryChanges } from './lib/workspace-memory-change-watcher'
+import { confirmWorkspaceMemoryWindowClose, markWorkspaceMemoryWindowReady } from './lib/workspace-memory-window'
+
+/** Renderer-scoped subscriptions; disposed on explicit tab cleanup or renderer destruction. */
+const workspaceMemoryWatchSubscriptions = new Map<number, Map<string, () => void>>()
+const workspaceMemoryWatchDestroyedListeners = new Set<number>()
+
+function stopWorkspaceMemoryWatch(webContentsId: number, workspaceSlug: string): void {
+  const subscriptions = workspaceMemoryWatchSubscriptions.get(webContentsId)
+  const unsubscribe = subscriptions?.get(workspaceSlug)
+  if (!unsubscribe) return
+  unsubscribe()
+  subscriptions?.delete(workspaceSlug)
+  if (subscriptions?.size === 0) workspaceMemoryWatchSubscriptions.delete(webContentsId)
+}
+
 import { getAllToolInfos } from './lib/chat-tool-registry'
 import { updateToolState, updateToolCredentials, getToolCredentials, addCustomTool, deleteCustomTool } from './lib/chat-tool-config'
 import {
@@ -432,6 +450,9 @@ function isPathAllowed(filePath: string, options?: FileAccessOptions): boolean {
   } catch {
     return false
   }
+  // 文件面板应反映 Agent 实际可访问的路径。调用方已明确开启 unrestricted 时，
+  // 保留 realpath 校验以拒绝不存在的目标，但不再按会话附件重复收窄范围。
+  if (options?.unrestricted) return true
   return getAuthorizedRoots(options).some((root) => isUnderRoot(resolved, root))
 }
 
@@ -443,6 +464,7 @@ function normalizeFileAccessOptions(value?: FileAccessOptions | string[]): FileA
     candidateBasePaths: Array.isArray(value.candidateBasePaths)
       ? value.candidateBasePaths.filter((p): p is string => typeof p === 'string' && p.length > 0)
       : undefined,
+    unrestricted: value.unrestricted === true,
   }
 }
 
@@ -990,6 +1012,19 @@ export function registerIpcHandlers(): void {
       const allowedExtraPaths = extraPaths?.filter((p) => isPathAllowed(p, access))
       return getUnstagedChanges(dirPath, allowedSessionPath, allowedWorkspaceFilesPath, allowedExtraPaths)
     }
+  )
+
+  // Agent 写入、Git 变更及窗口重新聚焦前主动失效，避免长寿命缓存显示旧 Diff。
+  ipcMain.handle(
+    IPC_CHANNELS.INVALIDATE_GIT_DIFF_CACHE,
+    async (_, changedPath?: string) => {
+      if (changedPath && typeof changedPath === 'string') {
+        // 仅影响进程内缓存，不读写目标路径；允许刚删除的文件路径参与失效。
+        invalidateGitDiffCache(changedPath)
+        return
+      }
+      invalidateGitDiffCache()
+    },
   )
 
   // 获取单个文件的 diff
@@ -2524,7 +2559,77 @@ export function registerIpcHandlers(): void {
     }
   )
 
+  ipcMain.handle(AGENT_IPC_CHANNELS.OPEN_WORKSPACE_MEMORY_WINDOW, async (_, workspaceSlug: string, relativePath?: string): Promise<void> => {
+    // 先经既有受限访问层核验 slug；若指定文件，也用受限路径解析器验证。
+    getWorkspaceMemorySummary(workspaceSlug)
+    if (relativePath !== undefined) {
+      if (typeof relativePath !== 'string' || !relativePath) throw new Error('记忆文件路径非法')
+      readWorkspaceAutoMemoryFile(workspaceSlug, relativePath)
+    }
+    const { showWorkspaceMemoryWindow } = await import('./lib/workspace-memory-window')
+    showWorkspaceMemoryWindow(workspaceSlug, relativePath)
+  })
+
+  ipcMain.handle(
+    AGENT_IPC_CHANNELS.WORKSPACE_MEMORY_WINDOW_READY,
+    async (event, workspaceSlug: string): Promise<void> => {
+      if (!markWorkspaceMemoryWindowReady(workspaceSlug, event.sender.id)) {
+        throw new Error('记忆窗口不存在或不属于当前渲染进程')
+      }
+    },
+  )
+
+  ipcMain.handle(
+    AGENT_IPC_CHANNELS.CONFIRM_WORKSPACE_MEMORY_WINDOW_CLOSE,
+    async (event, workspaceSlug: string): Promise<void> => {
+      if (!confirmWorkspaceMemoryWindowClose(workspaceSlug, event.sender.id)) {
+        throw new Error('记忆窗口不存在或不属于当前渲染进程')
+      }
+    },
+  )
+
+  ipcMain.handle(
+    AGENT_IPC_CHANNELS.START_WORKSPACE_MEMORY_WATCH,
+    async (event, workspaceSlug: string): Promise<void> => {
+      const webContents = event.sender
+      stopWorkspaceMemoryWatch(webContents.id, workspaceSlug)
+      const unsubscribe = subscribeWorkspaceMemoryChanges(workspaceSlug, (change) => {
+        if (!webContents.isDestroyed()) {
+          webContents.send(AGENT_IPC_CHANNELS.WORKSPACE_MEMORY_FILE_CHANGED, { workspaceSlug, change })
+        }
+      })
+      const subscriptions = workspaceMemoryWatchSubscriptions.get(webContents.id) ?? new Map<string, () => void>()
+      subscriptions.set(workspaceSlug, unsubscribe)
+      workspaceMemoryWatchSubscriptions.set(webContents.id, subscriptions)
+      if (!workspaceMemoryWatchDestroyedListeners.has(webContents.id)) {
+        workspaceMemoryWatchDestroyedListeners.add(webContents.id)
+        webContents.once('destroyed', () => {
+          const active = workspaceMemoryWatchSubscriptions.get(webContents.id)
+          if (active) {
+            for (const stop of active.values()) stop()
+            workspaceMemoryWatchSubscriptions.delete(webContents.id)
+          }
+          workspaceMemoryWatchDestroyedListeners.delete(webContents.id)
+        })
+      }
+    },
+  )
+
+  ipcMain.handle(
+    AGENT_IPC_CHANNELS.STOP_WORKSPACE_MEMORY_WATCH,
+    async (event, workspaceSlug: string): Promise<void> => {
+      stopWorkspaceMemoryWatch(event.sender.id, workspaceSlug)
+    },
+  )
+
   // 发送 Agent 消息（触发 Agent SDK 流式响应）
+  ipcMain.handle(
+    AGENT_IPC_CHANNELS.APPROVE_WORKSPACE_PROJECT_KNOWLEDGE_MAINTENANCE,
+    async (_, workspaceSlug: string): Promise<void> => {
+      approveWorkspaceProjectKnowledgeMaintenance(workspaceSlug)
+    },
+  )
+
   ipcMain.handle(
     AGENT_IPC_CHANNELS.SEND_MESSAGE,
     async (event, input: AgentSendInput): Promise<void> => {
@@ -2747,7 +2852,7 @@ export function registerIpcHandlers(): void {
           return { success: false, message: '请先填写 Tavily API Key' }
         }
         try {
-          const response = await fetch('https://api.tavily.com/search', {
+          const response = await getFetchFn(await getEffectiveProxyUrl())('https://api.tavily.com/search', {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -3220,11 +3325,11 @@ export function registerIpcHandlers(): void {
   // 使用 macOS 系统 Terminal 在指定工作目录打开会话/工作区文件夹
   ipcMain.handle(
     AGENT_IPC_CHANNELS.OPEN_FOLDER_IN_TERMINAL,
-    async (_, folderPath: string): Promise<void> => {
+    async (_, folderPath: string, access?: FileAccessOptions): Promise<void> => {
       if (process.platform !== 'darwin') {
         throw new Error('当前仅支持在 macOS 终端中打开文件夹')
       }
-      if (!isPathAllowed(folderPath)) {
+      if (!isPathAllowed(folderPath, normalizeFileAccessOptions(access))) {
         throw new Error('访问路径超出当前会话的授权范围')
       }
 

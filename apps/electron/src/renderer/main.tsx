@@ -32,6 +32,7 @@ import {
   currentAgentSessionIdAtom,
   workspaceCapabilitiesVersionAtom,
   workspaceFilesVersionAtom,
+  workspaceGitDiffRefreshVersionAtom,
   agentThinkingAtom,
   agentEffortAtom,
   agentMaxBudgetUsdAtom,
@@ -91,10 +92,11 @@ const isQuickTaskWindow = new URLSearchParams(window.location.search).get('windo
 const isVoiceDictationIndicatorWindow = new URLSearchParams(window.location.search).get('window') === 'voice-dictation-indicator'
 const isDetachedPreviewWindow = new URLSearchParams(window.location.search).get('window') === 'detached-preview'
 const isPlanningWindow = new URLSearchParams(window.location.search).get('window') === 'planning'
-const isMainWindow = !isQuickTaskWindow && !isVoiceDictationIndicatorWindow && !isDetachedPreviewWindow && !isPlanningWindow
+const isWorkspaceMemoryWindow = new URLSearchParams(window.location.search).get('window') === 'workspace-memory'
+const isMainWindow = !isQuickTaskWindow && !isVoiceDictationIndicatorWindow && !isDetachedPreviewWindow && !isPlanningWindow && !isWorkspaceMemoryWindow
 
 // 主窗口和独立规划窗口均由内部面板管理滚动，避免页面本身出现第二层滚动。
-if (isMainWindow || isPlanningWindow) {
+if (isMainWindow || isPlanningWindow || isWorkspaceMemoryWindow) {
   document.documentElement.classList.add('proma-main-window')
 }
 
@@ -172,6 +174,7 @@ function AgentSettingsInitializer(): null {
   const setCurrentWorkspaceId = useSetAtom(currentAgentWorkspaceIdAtom)
   const bumpCapabilities = useSetAtom(workspaceCapabilitiesVersionAtom)
   const bumpFiles = useSetAtom(workspaceFilesVersionAtom)
+  const bumpGitDiffRefresh = useSetAtom(workspaceGitDiffRefreshVersionAtom)
   const setThinking = useSetAtom(agentThinkingAtom)
   const setEffort = useSetAtom(agentEffortAtom)
   const setMaxBudget = useSetAtom(agentMaxBudgetUsdAtom)
@@ -313,6 +316,8 @@ function AgentSettingsInitializer(): null {
     })
     const unsubFiles = window.electronAPI.onWorkspaceFilesChanged(() => {
       bumpFiles((v) => v + 1)
+      // watcher 已在主进程失效命中的 repo cache；所有已挂载 Changes 面板由此重新拉取。
+      bumpGitDiffRefresh((v) => v + 1)
       // 外部本地项目目录变动时，主进程在 LIST_WORKSPACES 中重新计算根目录状态。
       // 这里仅响应 watcher 事件刷新一次，避免在侧栏每次渲染时同步访问文件系统。
       window.electronAPI.listAgentWorkspaces().then(setAgentWorkspaces).catch(console.error)
@@ -322,7 +327,7 @@ function AgentSettingsInitializer(): null {
       unsubCapabilities()
       unsubFiles()
     }
-  }, [bumpCapabilities, bumpFiles, currentWorkspaceId, setAgentWorkspaces, workspaces])
+  }, [bumpCapabilities, bumpFiles, bumpGitDiffRefresh, currentWorkspaceId, setAgentWorkspaces, workspaces])
 
   return null
 }
@@ -1092,6 +1097,16 @@ if (isQuickTaskWindow) {
         <AutomationInitializer />
         <PlanningInitializer />
         <PlanningWindowApp />
+        <Toaster position="bottom-right" />
+      </React.StrictMode>
+    )
+  })
+} else if (isWorkspaceMemoryWindow) {
+  import('./components/agent-skills/WorkspaceMemoryWindowApp').then(({ WorkspaceMemoryWindowApp }) => {
+    ReactDOM.createRoot(document.getElementById('root')!).render(
+      <React.StrictMode>
+        <ThemeInitializer />
+        <WorkspaceMemoryWindowApp />
         <Toaster position="bottom-right" />
       </React.StrictMode>
     )
