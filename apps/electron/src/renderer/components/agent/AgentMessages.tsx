@@ -35,12 +35,14 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { groupIntoTurns, MessageGroupRenderer, getGroupId, getGroupPreview, extractUserText, parseAttachedFiles as sdkParseAttachedFiles, isImageFile as sdkIsImageFile, buildTaskProgressDataForTurn, type MessageGroup } from './SDKMessageRenderer'
 import { buildLiveGroupSet } from './live-group-set'
 import { ContentBlock } from './ContentBlock'
+import { AgentBrowserLinkProvider } from '@/components/browser/AgentBrowserLinkProvider'
 import { parseThinkTagsFromText } from './thinking-tag-parser'
 import { AgentHistorySelectionLayer } from './AgentHistorySelectionLayer'
 import { TaskProgressOverlay, type ContextCompactionProgress } from './TaskProgressOverlay'
 import type { AgentEventUsage, RetryAttempt, SDKMessage, SDKSystemMessage } from '@proma/shared'
 import { getSDKCompactStatus } from '@proma/shared'
 import type { AgentStreamState } from '@/atoms/agent-atoms'
+import type { QuotedSelection } from '@/atoms/preview-atoms'
 
 function stableStringify(value: unknown): string {
   if (value == null || typeof value !== 'object') return JSON.stringify(value) ?? String(value)
@@ -176,6 +178,12 @@ export function getContextCompactionProgress(
   return undefined
 }
 
+export interface AgentHistoryQuoteNavigationRequest {
+  sessionId: string
+  quote: QuotedSelection
+  requestId: number
+}
+
 /** AgentMessages 属性接口 */
 interface AgentMessagesProps {
   sessionId: string
@@ -203,6 +211,87 @@ interface AgentMessagesProps {
   onRewind?: (assistantMessageUuid: string) => void
   onCreateTodo?: (text: string) => void
   onCompact?: () => void
+  /** 将单条 Agent 历史选区写为当前 RichTextInput 的内联 mention。 */
+  onAddHistoryQuote?: (quote: QuotedSelection) => boolean
+  /** 已发送的 Agent 历史引用 chip 点击后请求定位与高亮。 */
+  onAgentHistoryQuoteClick?: (quote: QuotedSelection) => void
+  /** 输入框 quote chip 请求定位时的精确范围。 */
+  historyQuoteNavigation?: AgentHistoryQuoteNavigationRequest | null
+}
+
+const AGENT_HISTORY_QUOTE_HIGHLIGHT_NAME = 'proma-agent-history-quote'
+
+interface TextPosition {
+  node: Node
+  offset: number
+}
+
+interface CustomHighlightRegistry {
+  set: (name: string, highlight: unknown) => void
+  delete: (name: string) => boolean
+}
+
+type HighlightConstructor = new (...ranges: Range[]) => unknown
+
+function getMessageTextPosition(messageElement: HTMLElement, offset: number): TextPosition | null {
+  if (!Number.isInteger(offset) || offset < 0) return null
+
+  const walker = document.createTreeWalker(messageElement, NodeFilter.SHOW_TEXT)
+  let consumed = 0
+  let lastTextNode: Node | null = null
+  let node = walker.nextNode()
+  while (node) {
+    const length = node.textContent?.length ?? 0
+    if (offset <= consumed + length) {
+      return { node, offset: offset - consumed }
+    }
+    consumed += length
+    lastTextNode = node
+    node = walker.nextNode()
+  }
+
+  if (offset === consumed && lastTextNode) {
+    return { node: lastTextNode, offset: lastTextNode.textContent?.length ?? 0 }
+  }
+  return null
+}
+
+function getAgentHistoryQuoteRange(messageElement: HTMLElement, quote: QuotedSelection): Range | null {
+  if (
+    quote.sourceType !== 'agent-history'
+    || quote.selectionStart == null
+    || quote.selectionEnd == null
+    || quote.selectionEnd <= quote.selectionStart
+  ) {
+    return null
+  }
+
+  const start = getMessageTextPosition(messageElement, quote.selectionStart)
+  const end = getMessageTextPosition(messageElement, quote.selectionEnd)
+  if (!start || !end) return null
+
+  const range = document.createRange()
+  range.setStart(start.node, start.offset)
+  range.setEnd(end.node, end.offset)
+  return range
+}
+
+function getCustomHighlightRegistry(): CustomHighlightRegistry | undefined {
+  return (globalThis.CSS as unknown as { highlights?: CustomHighlightRegistry }).highlights
+}
+
+function applyAgentHistoryQuoteHighlight(range: Range): boolean {
+  const registry = getCustomHighlightRegistry()
+  const Highlight = (globalThis as unknown as { Highlight?: HighlightConstructor }).Highlight
+  if (registry && Highlight) {
+    registry.set(AGENT_HISTORY_QUOTE_HIGHLIGHT_NAME, new Highlight(range))
+    return false
+  }
+
+  const selection = window.getSelection()
+  selection?.removeAllRanges()
+  selection?.addRange(range)
+  return true
 }
 
 /** 空状态引导 — 使用 WelcomeEmptyState */
@@ -496,11 +585,41 @@ function AgentRunningIndicator({ startedAt }: { startedAt?: number }): React.Rea
   )
 }
 
-export function AgentMessages({ sessionId, sessionModelId, messagesLoaded, persistedSDKMessages, streaming, streamState, liveMessages, sessionPath, attachedDirs, stoppedByUser, onRetry, onRetryInNewSession, onRelinkProjectRoot, onRestoreProjectRoot, onFork, onRewind, onCreateTodo, onCompact }: AgentMessagesProps): React.ReactElement {
+export const AgentMessages = React.memo(function AgentMessages({
+  sessionId,
+  sessionModelId,
+  messagesLoaded,
+  persistedSDKMessages,
+  streaming,
+  streamState,
+  liveMessages,
+  sessionPath,
+  attachedDirs,
+  stoppedByUser,
+  onRetry,
+  onRetryInNewSession,
+  onRelinkProjectRoot,
+  onRestoreProjectRoot,
+  onFork,
+  onRewind,
+  onCreateTodo,
+  onCompact,
+  onAddHistoryQuote,
+  onAgentHistoryQuoteClick,
+  historyQuoteNavigation,
+}: AgentMessagesProps): React.ReactElement {
   const userProfile = useAtomValue(userProfileAtom)
   const setMinimapCache = useSetAtom(tabMinimapCacheAtom)
   const channels = useAtomValue(channelsAtom)
   const historySelectionRootRef = React.useRef<HTMLDivElement>(null)
+  const selectionHighlightUsesBrowserSelectionRef = React.useRef(false)
+  const clearHistoryQuoteHighlight = React.useCallback((): void => {
+    getCustomHighlightRegistry()?.delete(AGENT_HISTORY_QUOTE_HIGHLIGHT_NAME)
+    if (selectionHighlightUsesBrowserSelectionRef.current) {
+      window.getSelection()?.removeAllRanges()
+      selectionHighlightUsesBrowserSelectionRef.current = false
+    }
+  }, [])
   /** 淡入控制：切换会话时先隐藏，等布局完成后再显示。 */
   const [ready, setReady] = React.useState(false)
   // 空会话无需淡入过渡（无消息则无滚动位置问题）
@@ -514,6 +633,46 @@ export function AgentMessages({ sessionId, sessionModelId, messagesLoaded, persi
       setSkipFadeIn(false)
     }
   }, [sessionId])
+
+  React.useEffect(() => {
+    const clearOnPointerDown = (): void => {
+      clearHistoryQuoteHighlight()
+    }
+    document.addEventListener('pointerdown', clearOnPointerDown, true)
+    return () => {
+      document.removeEventListener('pointerdown', clearOnPointerDown, true)
+      clearHistoryQuoteHighlight()
+    }
+  }, [clearHistoryQuoteHighlight])
+
+  React.useEffect(() => {
+    clearHistoryQuoteHighlight()
+    if (
+      !historyQuoteNavigation
+      || historyQuoteNavigation.sessionId !== sessionId
+      || historyQuoteNavigation.quote.sourceType !== 'agent-history'
+      || !historyQuoteNavigation.quote.messageId
+    ) {
+      return
+    }
+
+    const navigation = historyQuoteNavigation
+    const frame = window.requestAnimationFrame(() => {
+      const root = historySelectionRootRef.current
+      if (!root) return
+      const target = Array.from(root.querySelectorAll<HTMLElement>('[data-message-id]')).find(
+        (element) => element.dataset.messageId === navigation.quote.messageId,
+      )
+      if (!target) return
+
+      const range = getAgentHistoryQuoteRange(target, navigation.quote)
+      if (!range) return
+      target.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' })
+      selectionHighlightUsesBrowserSelectionRef.current = applyAgentHistoryQuoteHighlight(range)
+    })
+
+    return () => window.cancelAnimationFrame(frame)
+  }, [clearHistoryQuoteHighlight, historyQuoteNavigation, sessionId])
 
   React.useEffect(() => {
     if (ready) return
@@ -729,6 +888,12 @@ export function AgentMessages({ sessionId, sessionModelId, messagesLoaded, persi
   return (
     <BasePathsProvider basePaths={messageBasePaths}>
     <div ref={historySelectionRootRef} className="relative flex min-h-0 flex-1 flex-col">
+      <style>{`
+        ::highlight(${AGENT_HISTORY_QUOTE_HIGHLIGHT_NAME}) {
+          background-color: hsl(var(--primary) / 0.28);
+          color: inherit;
+        }
+      `}</style>
       <Conversation resize={ready && !transitioning ? 'smooth' : 'instant'} className={ready ? (skipFadeIn ? 'opacity-100' : 'opacity-100 transition-opacity duration-200') : 'opacity-0'}>
         <ScrollPositionManager id={sessionId} ready={ready} />
         <ConversationContent>
@@ -746,14 +911,14 @@ export function AgentMessages({ sessionId, sessionModelId, messagesLoaded, persi
                 const isLastAssistantTurn = !streaming && stoppedByUser
                   && group.type === 'assistant-turn'
                   && idx === visibleGroups.findLastIndex((g) => g.type === 'assistant-turn')
-                return (
+                const renderer = (
                   <MessageGroupRenderer
-                    key={getGroupId(group)}
                     group={group}
                     allMessages={allSDKMessages}
                     basePath={sessionPath || undefined}
                     onFork={shouldDisableActions ? undefined : onFork}
                     onRewind={shouldDisableActions ? undefined : onRewind}
+                    onAgentHistoryQuoteClick={onAgentHistoryQuoteClick}
                     onCreateTodo={shouldDisableActions ? undefined : onCreateTodo}
                     onRetry={shouldDisableActions ? undefined : onRetry}
                     onRetryInNewSession={shouldDisableActions ? undefined : onRetryInNewSession}
@@ -765,6 +930,9 @@ export function AgentMessages({ sessionId, sessionModelId, messagesLoaded, persi
                     sessionModelId={sessionModelId}
                   />
                 )
+                return group.type === 'assistant-turn'
+                  ? <AgentBrowserLinkProvider key={getGroupId(group)} sessionId={sessionId}>{renderer}</AgentBrowserLinkProvider>
+                  : <React.Fragment key={getGroupId(group)}>{renderer}</React.Fragment>
               })}
 
               {/* 有实时助手内容时：显示运行指示器或占位（防止 streaming 结束到 Actions Bar 出现之间的高度跳动） */}
@@ -780,6 +948,7 @@ export function AgentMessages({ sessionId, sessionModelId, messagesLoaded, persi
               {/* 无实时助手内容时：显示完整气泡（含头像/名称/时间） */}
               {/* 注意：工具活动已通过 SDK 渲染路径（liveGroups）展示 */}
               {!hasLiveAssistantContent && !suppressAgentRunning && (streaming || smoothContent || retrying) && (
+                <AgentBrowserLinkProvider sessionId={sessionId}>
                 <Message from="assistant">
                   <MessageHeader
                     model={agentStreamingModel}
@@ -811,6 +980,7 @@ export function AgentMessages({ sessionId, sessionModelId, messagesLoaded, persi
                     )}
                   </MessageContent>
                 </Message>
+                </AgentBrowserLinkProvider>
               )}
 
             </>
@@ -827,8 +997,12 @@ export function AgentMessages({ sessionId, sessionModelId, messagesLoaded, persi
           <StickyUserMessage userMessages={allUserMessagesData} />
         )}
       </Conversation>
-      <AgentHistorySelectionLayer sessionId={sessionId} rootRef={historySelectionRootRef} />
+      <AgentHistorySelectionLayer
+        sessionId={sessionId}
+        rootRef={historySelectionRootRef}
+        onAddToAgent={onAddHistoryQuote}
+      />
     </div>
     </BasePathsProvider>
   )
-}
+})
