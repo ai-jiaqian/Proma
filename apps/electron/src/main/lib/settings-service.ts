@@ -35,7 +35,6 @@ export function getSettings(): AppSettings {
       richTextRenderingEnabled: false,
       feishuSessionMirror: { mode: 'off' },
       visionRelay: { enabled: false },
-      builtinMcpDisabledIds: [],
       windowsShellPreference: 'auto',
       agentThinking: { type: 'adaptive' },
     }
@@ -47,12 +46,14 @@ export function getSettings(): AppSettings {
       experimentalAgentRuntimeSwitchEnabled?: boolean
       agentRuntime?: unknown
       agentChannelIds?: unknown
+      builtinMcpDisabledIds?: unknown
     }
     // Pi-only：读取时丢弃旧 runtime selector/Claude 白名单，避免下次写回复活。
     const {
       experimentalAgentRuntimeSwitchEnabled: _legacyRuntimeSwitch,
       agentRuntime: _legacyAgentRuntime,
       agentChannelIds: _legacyAgentChannelIds,
+      builtinMcpDisabledIds: _legacyBuiltinMcpDisabledIds,
       ...settings
     } = data
     return {
@@ -66,7 +67,6 @@ export function getSettings(): AppSettings {
       richTextRenderingEnabled: data.richTextRenderingEnabled ?? false,
       feishuSessionMirror: data.feishuSessionMirror ?? { mode: 'off' },
       visionRelay: data.visionRelay ?? { enabled: false },
-      builtinMcpDisabledIds: settings.builtinMcpDisabledIds ?? [],
       windowsShellPreference: settings.windowsShellPreference ?? 'auto',
       agentThinking: settings.agentThinking ?? { type: 'adaptive' },
       // 仅保留 macOS 原生 Island 开关；清理旧非原生 surface 的持久化残留字段。
@@ -84,7 +84,6 @@ export function getSettings(): AppSettings {
       richTextRenderingEnabled: false,
       feishuSessionMirror: { mode: 'off' },
       visionRelay: { enabled: false },
-      builtinMcpDisabledIds: [],
       windowsShellPreference: 'auto',
       agentThinking: { type: 'adaptive' },
     }

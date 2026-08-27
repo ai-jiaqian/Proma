@@ -6,7 +6,15 @@ import {
   agentStreamingStatesAtom,
   applyAgentEvent,
   clearAgentStreamError,
+  getDelegationTabLabel,
   isRetryEventForCurrentStream,
+  isWorkspaceComponentTab,
+  sanitizeWorkspaceComponentTabs,
+  agentSessionComponentTabsAtomFamily,
+  agentDiffPanelTabAtom,
+  agentSidePanelOpenAtomFamily,
+  revealChangedWorkspaceComponentAtom,
+  skillDetailNavigationAtomFamily,
   type AgentStreamState,
 } from './agent-atoms'
 
@@ -21,6 +29,56 @@ function createStreamState(overrides: Partial<AgentStreamState> = {}): AgentStre
     ...overrides,
   }
 }
+
+describe('右侧工作区组件', () => {
+  test('工作区组件 Tab 按 session 隔离，不会影响同一 workspace 的其他会话', () => {
+    const store = createStore()
+    const sourceSessionTabs = agentSessionComponentTabsAtomFamily('session-a')
+
+    store.set(sourceSessionTabs, ['skills', 'memory'])
+
+    expect(store.get(sourceSessionTabs)).toEqual(['skills', 'memory'])
+    expect(store.get(agentSessionComponentTabsAtomFamily('session-b'))).toEqual([])
+  })
+
+  test('Agent 变更只打开来源 session 的对应 Tab', () => {
+    const store = createStore()
+
+    store.set(revealChangedWorkspaceComponentAtom, { sessionId: 'source-session', component: 'memory' })
+
+    expect(store.get(agentSessionComponentTabsAtomFamily('source-session'))).toEqual(['memory'])
+    expect(store.get(agentSessionComponentTabsAtomFamily('other-session'))).toEqual([])
+    expect(store.get(agentSidePanelOpenAtomFamily('source-session'))).toBe(true)
+    expect(store.get(agentDiffPanelTabAtom).get('source-session')).toBe('memory')
+    expect(store.get(agentDiffPanelTabAtom).get('other-session')).toBeUndefined()
+  })
+
+  test('Skill 历史引用导航状态按会话隔离', () => {
+    const store = createStore()
+
+    store.set(skillDetailNavigationAtomFamily('session-a'), { skillSlug: 'skill-a', workspaceSlug: 'workspace-a' })
+
+    expect(store.get(skillDetailNavigationAtomFamily('session-a'))).toEqual({ skillSlug: 'skill-a', workspaceSlug: 'workspace-a' })
+    expect(store.get(skillDetailNavigationAtomFamily('session-b'))).toBeNull()
+  })
+
+  test('只接受已注册的项目级组件类型', () => {
+    expect(isWorkspaceComponentTab('todos')).toBe(true)
+    expect(isWorkspaceComponentTab('memory')).toBe(true)
+    expect(isWorkspaceComponentTab('browser:tab-1')).toBe(false)
+    expect(isWorkspaceComponentTab('files')).toBe(false)
+  })
+
+  test('过滤旧版本或异常持久化的项目级 Tab', () => {
+    expect(sanitizeWorkspaceComponentTabs(['todos', '', 'legacy-memory', 'memory'])).toEqual(['todos', 'memory'])
+  })
+
+  test('委派子 Agent 标题为空时使用可见的默认 Tab 标签', () => {
+    expect(getDelegationTabLabel('  ')).toBe('委派任务')
+    expect(getDelegationTabLabel(undefined)).toBe('委派任务')
+    expect(getDelegationTabLabel('整理 PR')).toBe('整理 PR')
+  })
+})
 
 describe('Agent 上下文压缩状态', () => {
   test('given Pi 手动压缩提供预估 token when 压缩完成 then 显示预估值并清除旧明细', () => {

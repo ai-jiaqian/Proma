@@ -10,7 +10,7 @@
 
 import * as React from 'react'
 import { useAtom, useAtomValue, useSetAtom, useStore } from 'jotai'
-import { HelpCircle, Keyboard, Globe2, PanelRight } from 'lucide-react'
+import { HelpCircle, Keyboard, Globe, PanelRight } from 'lucide-react'
 import {
   tabsAtom,
   activeTabIdAtom,
@@ -26,6 +26,8 @@ import {
   agentWorkspacesAtom,
   currentAgentSessionIdAtom,
   currentAgentWorkspaceIdAtom,
+  agentDiffPanelTabAtom,
+  getBrowserSidePanelTab,
   unviewedCompletedSessionIdsAtom,
 } from '@/atoms/agent-atoms'
 import { appModeAtom } from '@/atoms/app-mode'
@@ -37,12 +39,10 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { TabBarItem } from './TabBarItem'
 import { getTabBarActionLayout } from './tab-bar-action-layout'
 import { useCloseTab } from '@/hooks/useCloseTab'
-import { detectIsWindows, WINDOW_CONTROLS_INSET_RIGHT } from '@/lib/platform'
-import { registerShortcut } from '@/lib/shortcut-registry'
 import { cn } from '@/lib/utils'
 import { shortcutGuideOpenAtom } from '@/atoms/shortcut-guide'
 import { faqDialogOpenAtom } from '@/atoms/faq-dialog'
-import { browserFilePanelManualRestoreSessionIdsAtom, browserPanelMinimizedMapAtom, browserPanelOpenMapAtom, browserStateMapAtom } from '@/atoms/browser-atoms'
+import { browserPanelMinimizedMapAtom, browserPanelOpenMapAtom, browserStateMapAtom } from '@/atoms/browser-atoms'
 // 浏览器入口对所有 Agent 会话开放；来源限制由主进程浏览器策略处理。
 
 export function TabBar(): React.ReactElement {
@@ -230,7 +230,6 @@ function TabBarInner({
   const enterTimerRef = React.useRef<ReturnType<typeof setTimeout>>()
   const leaveTimerRef = React.useRef<ReturnType<typeof setTimeout>>()
   const fadeTimerRef = React.useRef<ReturnType<typeof setTimeout>>()
-  const isWindows = React.useMemo(() => detectIsWindows(), [])
 
   // 文件面板按会话独立保存；Agent 会话及其归属的预览 Tab 都可切换面板；
   // 仅 Agent 会话 Tab 在面板关闭时展示右上角"打开"按钮。
@@ -251,21 +250,14 @@ function TabBarInner({
   const setBrowserMinimizedMap = useSetAtom(browserPanelMinimizedMapAtom)
   const browserStateMap = useAtomValue(browserStateMapAtom)
   const setBrowserStateMap = useSetAtom(browserStateMapAtom)
-  const [browserFilePanelManualRestoreSessionIds, setBrowserFilePanelManualRestoreSessionIds] = useAtom(browserFilePanelManualRestoreSessionIdsAtom)
-  const activeBrowserIsOpen = activeAgentSession ? browserOpenMap.get(activeAgentSession.id) === true : false
+  const setSidePanelTabMap = useSetAtom(agentDiffPanelTabAtom)
   const hasMinimizedBrowser = Boolean(activeAgentSession && browserStateMap.has(activeAgentSession.id) && browserMinimizedMap.get(activeAgentSession.id) === true)
-  const priorBrowserStateRef = React.useRef<{ sessionId: string | null; open: boolean }>({ sessionId: null, open: false })
-  const actionLayout = getTabBarActionLayout(isWindows, showOpenPanelButton, showBrowserButton)
+  const actionLayout = getTabBarActionLayout(showOpenPanelButton, showBrowserButton)
 
   const togglePanel = React.useCallback(() => {
     if (!isAgentContextTab(activeTab)) return
-    if (!isPanelOpen && activeAgentSession && browserOpenMap.get(activeAgentSession.id)) {
-      setBrowserFilePanelManualRestoreSessionIds((previous) => (
-        previous.includes(activeAgentSession.id) ? previous : [...previous, activeAgentSession.id]
-      ))
-    }
     setSidePanelOpen(!isPanelOpen)
-  }, [activeAgentSession, activeTab, browserOpenMap, isPanelOpen, setBrowserFilePanelManualRestoreSessionIds, setSidePanelOpen])
+  }, [activeTab, isPanelOpen, setSidePanelOpen])
 
   const openBrowser = React.useCallback(async () => {
     if (!activeAgentSession) return
@@ -275,24 +267,13 @@ function TabBarInner({
     setBrowserStateMap((previous) => { const next = new Map(previous); next.set(activeAgentSession.id, state); return next })
     setBrowserMinimizedMap((previous) => { const next = new Map(previous); next.delete(activeAgentSession.id); return next })
     setBrowserOpenMap((previous) => { const next = new Map(previous); next.set(activeAgentSession.id, true); return next })
-  }, [activeAgentSession, setBrowserMinimizedMap, setBrowserOpenMap, setBrowserStateMap])
-
-  React.useEffect(() => {
-    const sessionId = activeAgentSession?.id ?? null
-    const previous = priorBrowserStateRef.current
-    const shouldAutoCollapse = Boolean(
-      sessionId &&
-      previous.sessionId === sessionId &&
-      !previous.open &&
-      activeBrowserIsOpen &&
-      isPanelOpen &&
-      !browserFilePanelManualRestoreSessionIds.includes(sessionId),
-    )
-    priorBrowserStateRef.current = { sessionId, open: activeBrowserIsOpen }
-
-    if (!shouldAutoCollapse) return
-    setSidePanelOpen(false)
-  }, [activeAgentSession?.id, activeBrowserIsOpen, browserFilePanelManualRestoreSessionIds, isPanelOpen, setSidePanelOpen])
+    setSidePanelOpen(true)
+    setSidePanelTabMap((previous) => {
+      const next = new Map(previous)
+      next.set(activeAgentSession.id, getBrowserSidePanelTab(state.activeTabId))
+      return next
+    })
+  }, [activeAgentSession, setBrowserMinimizedMap, setBrowserOpenMap, setBrowserStateMap, setSidePanelOpen, setSidePanelTabMap])
 
   const openShortcutGuide = React.useCallback(() => {
     setShortcutGuideOpen(true)
@@ -301,10 +282,6 @@ function TabBarInner({
   const openFaqDialog = React.useCallback(() => {
     setFaqDialogOpen(true)
   }, [setFaqDialogOpen])
-
-  React.useEffect(() => {
-    return registerShortcut('toggle-right-panel', togglePanel)
-  }, [togglePanel])
 
   // 滚动容器 ref
   const scrollRef = React.useRef<HTMLDivElement>(null)
@@ -433,11 +410,10 @@ function TabBarInner({
 
   return (
     <div ref={barRef} className="main-tabbar flex items-end h-[34px] tabbar-bg relative">
-      {/* 顶部 TabBar 的空白区域必须保持可拖拽，尤其是 macOS/Windows 自定义标题栏。
-          注意：不要把 titlebar-no-drag 加到下面的整条 flex 容器上，否则标签右侧空白会再次失去拖拽能力。
-          Windows 上背景拖拽层避开右上角 WindowControls 区域（126px），防止 hitmask 重叠。
+      {/* 顶部 TabBar 的空白区域保持可拖拽；系统控制按钮由窗口顶部的统一标题栏承载。
+          不要把 titlebar-no-drag 加到下面的整条 flex 容器上，否则标签右侧空白会失去拖拽能力。
           需要交互的单个 Tab 会在 TabBarItem 内部自己声明 titlebar-no-drag。 */}
-      <div className={cn("absolute inset-0 titlebar-drag-region", isWindows && WINDOW_CONTROLS_INSET_RIGHT)} />
+      <div className="pointer-events-none absolute inset-0 titlebar-drag-region" />
 
       {/* Tear-off 提示遮罩：拖出 TabBar 区域时，让 TabBar 下方出现一条高亮分割线 */}
       {tearingOff && (
@@ -549,7 +525,7 @@ function ShortcutGuideButton({
               )}
               onClick={() => void onOpenBrowser()}
             >
-              <Globe2 className="size-3.5" />
+              <Globe className="size-3.5" />
               <span className="sr-only">打开受管浏览器</span>
             </Button>
           </TooltipTrigger>

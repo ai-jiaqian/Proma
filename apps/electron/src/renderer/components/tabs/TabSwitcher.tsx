@@ -95,6 +95,7 @@ export function TabSwitcher(): ReactElement | null {
   const setActiveView = useSetAtom(activeViewAtom)
   const setAutomationForm = useSetAtom(automationFormAtom)
   const setCurrentConversationId = useSetAtom(currentConversationIdAtom)
+  const currentAgentSessionId = useAtomValue(currentAgentSessionIdAtom)
   const setCurrentAgentSessionId = useSetAtom(currentAgentSessionIdAtom)
   const setCurrentAgentWorkspaceId = useSetAtom(currentAgentWorkspaceIdAtom)
   const setUnviewedCompleted = useSetAtom(unviewedCompletedSessionIdsAtom)
@@ -330,6 +331,7 @@ export function TabSwitcher(): ReactElement | null {
     },
     [
       appMode,
+      currentAgentSessionId,
       setActiveTabId,
       setActiveView,
       setScratchPadPanelOpen,

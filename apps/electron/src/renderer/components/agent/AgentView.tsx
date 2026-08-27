@@ -40,6 +40,7 @@ import {
   inputToolbarDisabledButtonClass,
   inputToolbarSendButtonClass,
 } from '@/components/ai-elements/input-toolbar-styles'
+import { preventHoverPopoverFocusRestore } from '@/components/ai-elements/input-toolbar-popover-focus'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
@@ -61,7 +62,12 @@ import { cn } from '@/lib/utils'
 import { getActiveAccelerator, getAcceleratorDisplay } from '@/lib/shortcut-registry'
 import { registerShortcut } from '@/lib/shortcut-registry'
 import { supportsChannelPlanQuota } from '@/lib/channel-plan-quota'
-import { previewPanelOpenMapAtom, quotedSelectionMapAtom, currentQuotedSelectionAtom } from '@/atoms/preview-atoms'
+import {
+  clearStopGenerationTarget,
+  getStopGenerationTarget,
+  rememberStopGenerationTarget,
+} from '@/lib/stop-generation-target'
+import { previewFileMapAtom, previewPanelOpenMapAtom, quotedSelectionMapAtom, currentQuotedSelectionAtom } from '@/atoms/preview-atoms'
 import type { QuotedSelection } from '@/atoms/preview-atoms'
 import {
   agentStreamingStatesAtom,
@@ -105,6 +111,10 @@ import {
   allPendingAskUserRequestsAtom,
   allPendingPermissionRequestsAtom,
   allPendingExitPlanRequestsAtom,
+  agentDiffPanelTabAtom,
+  agentSidePanelOpenAtomFamily,
+  agentSideTemporaryAgentMapAtom,
+  getExplorationSidePanelTab,
 } from '@/atoms/agent-atoms'
 import { settingsOpenAtom } from '@/atoms/settings-tab'
 import { longTextPasteAsAttachmentEnabledAtom } from '@/atoms/ui-preferences'
@@ -318,6 +328,7 @@ interface AgentThinkingPopoverProps {
 function AgentThinkingPopover({ agentThinking, onToggle, codexConfig }: AgentThinkingPopoverProps): React.ReactElement {
   const [open, setOpen] = React.useState(false)
   const hoverTimeout = React.useRef<ReturnType<typeof setTimeout> | null>(null)
+  const popoverReceivedFocusRef = React.useRef(false)
   const isCodex = Boolean(codexConfig)
   const thinkingLevels = codexConfig?.levels ?? OPENAI_STANDARD_THINKING_LEVELS
   const normalizedLevel = normalizeOpenAIThinkingLevel(
@@ -374,7 +385,14 @@ function AgentThinkingPopover({ agentThinking, onToggle, codexConfig }: AgentThi
         className="w-64 p-3"
         onMouseEnter={handleMouseEnter}
         onMouseLeave={handleMouseLeave}
+        onFocusCapture={() => {
+          popoverReceivedFocusRef.current = true
+        }}
         onOpenAutoFocus={(e) => e.preventDefault()}
+        onCloseAutoFocus={(event) => {
+          preventHoverPopoverFocusRestore(event, popoverReceivedFocusRef.current)
+          popoverReceivedFocusRef.current = false
+        }}
       >
         <div className="flex flex-col gap-3">
           {codexConfig ? (
@@ -415,8 +433,23 @@ function AgentThinkingPopover({ agentThinking, onToggle, codexConfig }: AgentThi
   )
 }
 
-export function AgentView({ sessionId }: { sessionId: string }): React.ReactElement {
+interface AgentViewProps {
+  sessionId: string
+  /** 右侧临时 Agent Tab：保留完整对话与输入能力，但不重复渲染全局会话标题栏。 */
+  embedded?: boolean
+}
+
+export function AgentView({ sessionId, embedded = false }: AgentViewProps): React.ReactElement {
   const store = useStore()
+  const stopShortcutTarget = React.useMemo(() => ({ kind: 'agent' as const, sessionId }), [sessionId])
+  const markStopShortcutTarget = React.useCallback(() => {
+    rememberStopGenerationTarget(stopShortcutTarget)
+  }, [stopShortcutTarget])
+
+  React.useEffect(() => {
+    return () => clearStopGenerationTarget(stopShortcutTarget)
+  }, [stopShortcutTarget])
+
   const initialCachedMessages = store.get(agentSDKMessagesCacheAtom).get(sessionId)
   const [persistedSDKMessages, setPersistedSDKMessages] = React.useState<SDKMessage[]>(
     () => initialCachedMessages ?? [],
@@ -561,6 +594,9 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
   const suggestion = suggestionsMap.get(sessionId) ?? null
   const setPromptSuggestions = useSetAtom(agentPromptSuggestionsAtom)
   const setAgentSessions = useSetAtom(agentSessionsAtom)
+  const setSidePanelTabMap = useSetAtom(agentDiffPanelTabAtom)
+  const setSidePanelOpen = useSetAtom(agentSidePanelOpenAtomFamily(sessionId))
+  const setSideTemporaryAgentMap = useSetAtom(agentSideTemporaryAgentMapAtom)
   const openSession = useOpenSession()
   const setAttachedDirsMap = useSetAtom(agentAttachedDirectoriesMapAtom)
   const attachedDirsMap = useAtomValue(agentAttachedDirectoriesMapAtom)
@@ -2483,43 +2519,42 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
     }
   }, [sessionId, agentChannelId, agentModelId, currentWorkspaceId, openSession, setAgentSessions, setStreamingStates, permissionMode])
 
-  /** 分叉会话：从指定消息处创建新会话并自动切换 */
+  /** 从回复节点创建 Pi `/tree` 探索分支，并在当前主线的右侧工作区继续。 */
   const handleFork = React.useCallback(async (upToMessageUuid: string): Promise<void> => {
-    if (agentModelId && agentChannelId && sessionMetaChannelId && agentChannelId !== sessionMetaChannelId) {
-      toast.error('分叉会话失败', {
-        description: '分叉只能使用源会话同一渠道下的模型，请切回当前会话渠道后再试。',
-      })
-      return
-    }
-    const forkModelId = agentChannelId === sessionMetaChannelId ? agentModelId || undefined : undefined
-
     try {
+      // 不传 modelId：探索必须继承分叉点的渠道与模型，不受当前全局选择器影响。
       const meta = await window.electronAPI.forkAgentSession({
         sessionId,
         upToMessageUuid,
-        modelId: forkModelId,
+        explorationSourceLabel: '这条 Agent 回复',
       })
-      setAgentSessions((prev) => [meta, ...prev])
-
-      // 切换到新会话 tab
-      openSession('agent', meta.id, meta.title)
-
-      toast.success('已创建分叉会话', {
-        description: meta.title,
+      setAgentSessions((prev) => prev.some((item) => item.id === meta.id) ? prev : [meta, ...prev])
+      setSideTemporaryAgentMap((prev) => {
+        const openBranches = prev.get(sessionId) ?? []
+        const next = new Map(prev)
+        next.set(sessionId, openBranches.some((item) => item.sessionId === meta.id)
+          ? openBranches
+          : [...openBranches, {
+              sessionId: meta.id,
+              sourceMessageId: upToMessageUuid,
+              sourceLabel: '这条 Agent 回复',
+            }])
+        return next
+      })
+      setSidePanelOpen(true)
+      setSidePanelTabMap((prev) => new Map(prev).set(sessionId, getExplorationSidePanelTab(meta.id)))
+      toast.success('已创建探索分支', {
+        description: '分支继承此处之前的完整上下文；结论可带回主线。',
       })
     } catch (error) {
-      console.error('[AgentView] 分叉会话失败:', error)
+      console.error('[AgentView] 创建探索分支失败:', error)
       const rawMsg = error instanceof Error ? error.message : '未知错误'
-      // SDK 偶尔会因为 sidechain/消息归属问题抛 "not found in session"，
-      // 这里给出更可操作的中文提示，而不是把 SDK 内部英文报错直接透传给用户
       const friendlyDesc = /not found in session/i.test(rawMsg)
-        ? '该消息无法作为分叉起点（可能属于子代理执行过程或已被清理）。请选择主对话中的其他消息再试。'
+        ? '该消息无法作为探索起点（可能属于子代理执行过程或已被清理）。请选择主对话中的其他回复再试。'
         : rawMsg
-      toast.error('分叉会话失败', {
-        description: friendlyDesc,
-      })
+      toast.error('创建探索分支失败', { description: friendlyDesc })
     }
-  }, [sessionId, agentChannelId, agentModelId, sessionMetaChannelId, openSession, setAgentSessions])
+  }, [sessionId, setAgentSessions, setSidePanelOpen, setSidePanelTabMap, setSideTemporaryAgentMap])
 
   /** 快照回退：同一会话内回退到指定消息点，恢复文件 + 截断对话 */
   const [rewindTargetUuid, setRewindTargetUuid] = React.useState<string | null>(null)
@@ -2571,14 +2606,15 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
     }
   }, [rewindTargetUuid, sessionId, store])
 
-  // 监听快捷键系统分发的 stop-generation 事件
+  // 仅处理全局快捷键明确指向本会话的停止事件；父/子会话可同时挂载。
   React.useEffect(() => {
-    const handler = (): void => {
-      if (streaming) handleStop()
+    const handler = (event: Event): void => {
+      const target = getStopGenerationTarget(event)
+      if (target?.kind === 'agent' && target.sessionId === sessionId && streaming) handleStop()
     }
     window.addEventListener('proma:stop-generation', handler)
     return () => window.removeEventListener('proma:stop-generation', handler)
-  }, [streaming, handleStop])
+  }, [sessionId, streaming, handleStop])
 
   // 监听快捷键系统分发的 focus-input 事件（Cmd+L）
   React.useEffect(() => {
@@ -2715,17 +2751,28 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
     setQueuedMessages((prev) => moveQueuedMessage(prev, sourceId, targetId, placement))
   }, [sessionId, setQueuedMessages])
 
-  // ===== 预览面板状态（toggle 快捷键，分屏布局在 MainArea） =====
+  // ===== 预览 Tab 快捷键 =====
   const setPreviewOpenMap = useSetAtom(previewPanelOpenMapAtom)
 
   const togglePreviewPanel = React.useCallback(() => {
-    setPreviewOpenMap((prev) => {
-      const m = new Map(prev)
-      const current = m.get(sessionId) ?? false
-      m.set(sessionId, !current)
-      return m
+    const nextOpen = !(store.get(previewPanelOpenMapAtom).get(sessionId) ?? false)
+    const currentPreviewFile = store.get(previewFileMapAtom).get(sessionId) ?? null
+    if (nextOpen && currentPreviewFile) {
+      // 统一交给 opener：会复用/激活对应的动态预览 Tab，而非写入旧的 `preview` 状态。
+      openPreview(sessionId, currentPreviewFile)
+      return
+    }
+    setPreviewOpenMap((previous) => {
+      const next = new Map(previous)
+      next.set(sessionId, false)
+      return next
     })
-  }, [sessionId, setPreviewOpenMap])
+    setSidePanelTabMap((tabs) => {
+      const nextTabs = new Map(tabs)
+      nextTabs.set(sessionId, 'files')
+      return nextTabs
+    })
+  }, [openPreview, sessionId, setPreviewOpenMap, setSidePanelTabMap, store])
 
   React.useEffect(() => {
     return registerShortcut('toggle-preview-panel', togglePreviewPanel)
@@ -2893,7 +2940,9 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
           externalSelectedModel={externalSelectedModel}
           onModelSelect={handleModelSelect}
           showChannelInTrigger
-          useSharedOpenState
+          // 全局打开状态只供主会话的“选择模型”引导使用；右侧嵌入会话必须保持独立，
+          // 否则任一触发器打开时会同时挂载两侧的 Popover，遮挡并阻断模型切换。
+          useSharedOpenState={!embedded}
         />
       </div>
       {sendControl}
@@ -2916,10 +2965,18 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
 
   return (
     <>
-      <div className="flex h-full min-h-0 flex-1 min-w-0 max-w-[min(72rem,100%)] flex-col overflow-hidden mx-auto">
-        {/* Agent Header */}
-        <AgentHeader sessionId={sessionId} />
+      <div
+        className="flex h-full min-h-0 flex-1 min-w-0 flex-col overflow-hidden"
+        onFocusCapture={markStopShortcutTarget}
+        onPointerDownCapture={markStopShortcutTarget}
+      >
+        {/* 临时 Agent 已由右侧 Tab 表明归属，避免在窄面板重复渲染全局标题栏。 */}
+        {!embedded && <AgentHeader sessionId={sessionId} />}
 
+        <div className={cn(
+          'flex min-h-0 flex-1 w-full flex-col overflow-hidden',
+          embedded ? 'max-w-none' : 'max-w-[min(72rem,100%)] mx-auto',
+        )}>
         {/* 消息区域 */}
         <AgentMessages
           sessionId={sessionId}
@@ -2933,11 +2990,12 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
           onRetryInNewSession={handleRetryInNewSession}
           onRelinkProjectRoot={handleRelinkProjectRoot}
           onRestoreProjectRoot={handleOpenRestoreProjectRootDialog}
-          onFork={isLegacyTranscript ? undefined : handleFork}
+          onFork={embedded || isLegacyTranscript ? undefined : handleFork}
           onRewind={isLegacyTranscript ? undefined : handleRewindRequest}
           onCreateTodo={handleOpenReplyTodoDialog}
           onCompact={handleCompact}
           onAddHistoryQuote={handleAddHistoryQuote}
+          explorationEnabled={!embedded}
           onAgentHistoryQuoteClick={handleAgentHistoryQuoteClick}
           historyQuoteNavigation={historyQuoteNavigation}
         />
@@ -3089,6 +3147,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
           </div>
         </div>
         )}
+        </div>
       </div>
 
     <Dialog open={todoDialogOpen} onOpenChange={setTodoDialogOpen}>
