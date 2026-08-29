@@ -6,7 +6,7 @@
  */
 
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
-import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, AUTOMATION_IPC_CHANNELS, PLANNING_IPC_CHANNELS, AGENT_ISLAND_IPC_CHANNELS, TERMINAL_IPC_CHANNELS } from '@proma/shared'
+import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, AUTOMATION_IPC_CHANNELS, PLANNING_IPC_CHANNELS, VAULT_IPC_CHANNELS, AGENT_ISLAND_IPC_CHANNELS, TERMINAL_IPC_CHANNELS } from '@proma/shared'
 import { USER_PROFILE_IPC_CHANNELS, SETTINGS_IPC_CHANNELS, SCRATCH_PAD_IPC_CHANNELS, APP_ICON_IPC_CHANNELS, DOCK_BADGE_IPC_CHANNELS, STORAGE_IPC_CHANNELS } from '../types'
 import type {
   RuntimeStatus,
@@ -115,6 +115,15 @@ import type {
   AgentMoveQueuedMessageInput,
   AgentQueuedMessageStatus,
   PendingRequestsSnapshot,
+  VaultCandidate,
+  VaultDeleteInput,
+  VaultFileEntry,
+  VaultFocus,
+  VaultReadResult,
+  VaultRenameInput,
+  VaultSummary,
+  VaultWriteInput,
+  VaultWriteResult,
   NativeAgentIslandSnapshot,
   Automation,
   CreateAutomationInput,
@@ -262,6 +271,7 @@ export interface ElectronAPI {
   reloadAgentBrowser: (sessionId: string) => Promise<import('@proma/shared').BrowserViewState>
   closeAgentBrowser: (sessionId: string) => Promise<void>
   onAgentBrowserStateChanged: (callback: (state: import('@proma/shared').BrowserStateChange) => void) => () => void
+  onAgentBrowserTabFocused: (callback: (change: import('@proma/shared').BrowserTabFocusChange) => void) => () => void
 
   // ===== 通用工具 =====
 
@@ -443,7 +453,7 @@ export interface ElectronAPI {
   onSystemThemeChanged: (callback: (isDark: boolean) => void) => () => void
 
   /** 订阅用户手动切换主题事件（跨窗口同步，返回清理函数） */
-  onThemeSettingsChanged: (callback: (payload: { themeMode: string; themeStyle: string; interfaceVariant?: string }) => void) => () => void
+  onThemeSettingsChanged: (callback: (payload: { themeMode: string; themeStyle: string }) => void) => () => void
 
   // ===== Scratch Pad =====
 
@@ -464,6 +474,23 @@ export interface ElectronAPI {
 
   /** 将图片 data URL 写入系统剪贴板 */
   copyImageToClipboard: (dataUrl: string) => Promise<{ success: boolean; message?: string }>
+
+  // ===== 用户授权的 Markdown Vault =====
+
+  getVaultConfig: () => Promise<VaultSummary | null>
+  selectDefaultVault: () => Promise<VaultSummary>
+  listVaultCandidates: () => Promise<VaultCandidate[]>
+  selectVault: (options?: { inboxPath?: string; allowAgentWrites?: boolean }) => Promise<VaultSummary | null>
+  authorizeDiscoveredVault: (rootPath: string, options?: { inboxPath?: string; allowAgentWrites?: boolean }) => Promise<VaultSummary>
+  listVaultFiles: () => Promise<VaultFileEntry[]>
+  readVaultFile: (relativePath: string) => Promise<VaultReadResult>
+  writeVaultFile: (input: VaultWriteInput) => Promise<VaultWriteResult>
+  createUntitledVaultFile: () => Promise<VaultWriteResult>
+  createUntitledVaultFileInFolder: (folderPath: string) => Promise<VaultWriteResult>
+  createVaultFolder: (relativePath: string) => Promise<void>
+  renameVaultFile: (input: VaultRenameInput) => Promise<VaultReadResult>
+  deleteVaultFile: (input: VaultDeleteInput) => Promise<void>
+  setVaultUserContext: (sessionId: string, focus: VaultFocus | null, open?: boolean) => Promise<void>
 
   // ===== 应用图标切换 =====
 
@@ -539,8 +566,8 @@ export interface ElectronAPI {
   /** 获取归档会话数量，不返回归档元数据 */
   countArchivedAgentSessions: () => Promise<number>
 
-  /** 创建 Agent 会话 */
-  createAgentSession: (title?: string, channelId?: string, workspaceId?: string, modelId?: string) => Promise<AgentSessionMeta>
+  /** 创建 Agent 会话；草稿会话在首条消息发送前不会出现在侧栏。 */
+  createAgentSession: (title?: string, channelId?: string, workspaceId?: string, modelId?: string, isDraft?: boolean) => Promise<AgentSessionMeta>
 
   /** 获取当前主进程仍在执行的 Agent 会话，供 renderer 重载后恢复运行态 */
   listActiveAgentSessionSnapshots: () => Promise<AgentActiveSessionSnapshot[]>
@@ -656,11 +683,33 @@ export interface ElectronAPI {
   /** 获取工作区 MCP 配置 */
   getWorkspaceMcpConfig: (workspaceSlug: string) => Promise<WorkspaceMcpConfig>
 
-  /** 保存工作区 MCP 配置 */
-  saveWorkspaceMcpConfig: (workspaceSlug: string, config: WorkspaceMcpConfig) => Promise<void>
+  /** 保存工作区 MCP 配置；显式关闭的条目会取消进行中的验证。 */
+  saveWorkspaceMcpConfig: (workspaceSlug: string, config: WorkspaceMcpConfig, options?: import('@proma/shared').SaveWorkspaceMcpConfigOptions) => Promise<void>
+
+  /** 刷新并持久化工作区 MCP 真实连接状态 */
+  refreshMcpConnections: (workspaceSlug: string) => Promise<WorkspaceMcpConfig>
+
+  /** 原子切换 MCP 启用状态，并在启用时条件持久化验证结果。 */
+  setMcpEnabledAndValidate: (workspaceSlug: string, name: string, enabled: boolean) => Promise<import('@proma/shared').McpConnectionMutationResult>
+
+  /** 原子新增 MCP，并在初始启用时条件持久化验证结果。 */
+  installMcpAndValidate: (workspaceSlug: string, name: string, entry: import('@proma/shared').McpServerEntry) => Promise<import('@proma/shared').McpInstallMutationResult>
+  startMcpOAuth: (input: import('@proma/shared').StartMcpOAuthInput) => Promise<import('@proma/shared').McpOAuthStartResult>
+
+  /** 将静态 MCP API Key / Token 加密保存到系统 Keychain。 */
+  saveMcpApiKey: (input: import('@proma/shared').SaveMcpApiKeyInput) => Promise<void>
+
+  /** 删除工作区 MCP 对应的系统安全凭据；不返回任何认证值。 */
+  deleteMcpCredential: (workspaceSlug: string, serverName: string) => Promise<void>
+
+  /** 查询本机 CLI 集成状态；不返回任何认证值。 */
+  getCliIntegrationStatuses: (workspaceSlug: string) => Promise<import('@proma/shared').CliIntegrationStatus[]>
+
+  /** 仅切换 Proma 对工作区 CLI 集成的使用权限；绝不登出或撤销第三方授权。 */
+  setCliIntegrationEnabled: (workspaceSlug: string, id: string, enabled: boolean) => Promise<import('@proma/shared').CliIntegrationStatus[]>
 
   /** 测试 MCP 服务器连接 */
-  testMcpServer: (name: string, entry: import('@proma/shared').McpServerEntry) => Promise<{ success: boolean; message: string }>
+  testMcpServer: (workspaceSlug: string, name: string, entry: import('@proma/shared').McpServerEntry) => Promise<{ success: boolean; message: string }>
 
   /** 启用或关闭 Proma 内置 MCP */
   setBuiltinMcpEnabled: (workspaceSlug: string, id: string, enabled: boolean) => Promise<WorkspaceCapabilities>
@@ -926,10 +975,7 @@ export interface ElectronAPI {
   /** 读取文件为 base64（带路径校验，供内联图片预览等） */
   readBinaryBase64: (filePath: string, access?: import('@proma/shared').FileAccessOptions, maxSize?: number) => Promise<string | null>
 
-  /** DOCX 转 HTML（内联预览） */
-  docxToHtml: (filePath: string, access?: import('@proma/shared').FileAccessOptions) => Promise<{ resolvedPath: string; html: string } | null>
-
-  /** XLSX/PPTX 转 HTML（内联预览） */
+  /** Office 文件转高保真 HTML（内联预览） */
   officeToHtml: (filePath: string, access?: import('@proma/shared').FileAccessOptions) => Promise<import('@proma/shared').OfficePreviewResult | null>
 
   /** 截图导出：将 HTML 渲染为 PNG 并复制到剪贴板或保存文件 */
@@ -996,6 +1042,7 @@ export interface ElectronAPI {
       releaseNotes?: string
       progress?: { percent: number; transferred: number; total: number; bytesPerSecond: number }
       error?: string
+      installScheduled?: boolean
     }>
     onStatusChanged: (callback: (status: {
       status: 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'not-available' | 'error'
@@ -1003,6 +1050,7 @@ export interface ElectronAPI {
       releaseNotes?: string
       progress?: { percent: number; transferred: number; total: number; bytesPerSecond: number }
       error?: string
+      installScheduled?: boolean
     }) => void) => () => void
     /** 在所有运行中的 Agent 结束后重启并安装更新 */
     installWhenIdle: () => Promise<boolean>
@@ -1401,6 +1449,11 @@ const electronAPI: ElectronAPI = {
     ipcRenderer.on(AGENT_IPC_CHANNELS.BROWSER_STATE_CHANGED, listener)
     return () => ipcRenderer.removeListener(AGENT_IPC_CHANNELS.BROWSER_STATE_CHANGED, listener)
   },
+  onAgentBrowserTabFocused: (callback: (change: import('@proma/shared').BrowserTabFocusChange) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, change: import('@proma/shared').BrowserTabFocusChange) => callback(change)
+    ipcRenderer.on(AGENT_IPC_CHANNELS.BROWSER_TAB_FOCUSED, listener)
+    return () => ipcRenderer.removeListener(AGENT_IPC_CHANNELS.BROWSER_TAB_FOCUSED, listener)
+  },
 
   // 通用工具
   openExternal: (url: string) => {
@@ -1644,8 +1697,8 @@ const electronAPI: ElectronAPI = {
     return () => { ipcRenderer.removeListener(SETTINGS_IPC_CHANNELS.ON_SYSTEM_THEME_CHANGED, listener) }
   },
 
-  onThemeSettingsChanged: (callback: (payload: { themeMode: string; themeStyle: string; interfaceVariant?: string }) => void) => {
-    const listener = (_: unknown, payload: { themeMode: string; themeStyle: string; interfaceVariant?: string }): void => callback(payload)
+  onThemeSettingsChanged: (callback: (payload: { themeMode: string; themeStyle: string }) => void) => {
+    const listener = (_: unknown, payload: { themeMode: string; themeStyle: string }): void => callback(payload)
     ipcRenderer.on(SETTINGS_IPC_CHANNELS.ON_THEME_SETTINGS_CHANGED, listener)
     return () => { ipcRenderer.removeListener(SETTINGS_IPC_CHANNELS.ON_THEME_SETTINGS_CHANGED, listener) }
   },
@@ -1674,6 +1727,22 @@ const electronAPI: ElectronAPI = {
   copyImageToClipboard: (dataUrl: string) => {
     return ipcRenderer.invoke(SCRATCH_PAD_IPC_CHANNELS.COPY_IMAGE, dataUrl)
   },
+
+  // 用户授权的 Markdown Vault
+  getVaultConfig: () => ipcRenderer.invoke(VAULT_IPC_CHANNELS.GET_CONFIG),
+  selectDefaultVault: () => ipcRenderer.invoke(VAULT_IPC_CHANNELS.SELECT_DEFAULT),
+  listVaultCandidates: () => ipcRenderer.invoke(VAULT_IPC_CHANNELS.LIST_CANDIDATES),
+  selectVault: (options?: { inboxPath?: string; allowAgentWrites?: boolean }) => ipcRenderer.invoke(VAULT_IPC_CHANNELS.SELECT, options),
+  authorizeDiscoveredVault: (rootPath: string, options?: { inboxPath?: string; allowAgentWrites?: boolean }) => ipcRenderer.invoke(VAULT_IPC_CHANNELS.AUTHORIZE_CANDIDATE, rootPath, options),
+  listVaultFiles: () => ipcRenderer.invoke(VAULT_IPC_CHANNELS.LIST_FILES),
+  readVaultFile: (relativePath: string) => ipcRenderer.invoke(VAULT_IPC_CHANNELS.READ_FILE, relativePath),
+  writeVaultFile: (input: VaultWriteInput) => ipcRenderer.invoke(VAULT_IPC_CHANNELS.WRITE_FILE, input),
+  createUntitledVaultFile: () => ipcRenderer.invoke(VAULT_IPC_CHANNELS.CREATE_UNTITLED_FILE),
+  createUntitledVaultFileInFolder: (folderPath: string) => ipcRenderer.invoke(VAULT_IPC_CHANNELS.CREATE_UNTITLED_FILE_IN_FOLDER, folderPath),
+  createVaultFolder: (relativePath: string) => ipcRenderer.invoke(VAULT_IPC_CHANNELS.CREATE_FOLDER, relativePath),
+  renameVaultFile: (input: VaultRenameInput) => ipcRenderer.invoke(VAULT_IPC_CHANNELS.RENAME_FILE, input),
+  deleteVaultFile: (input: VaultDeleteInput) => ipcRenderer.invoke(VAULT_IPC_CHANNELS.DELETE_FILE, input),
+  setVaultUserContext: (sessionId: string, focus: VaultFocus | null, open = true) => ipcRenderer.invoke(VAULT_IPC_CHANNELS.SET_USER_CONTEXT, sessionId, focus, open),
 
   // 应用图标切换
   setAppIcon: (variantId: string) => {
@@ -1770,8 +1839,8 @@ const electronAPI: ElectronAPI = {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.COUNT_ARCHIVED_SESSIONS)
   },
 
-  createAgentSession: (title?: string, channelId?: string, workspaceId?: string, modelId?: string) => {
-    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.CREATE_SESSION, title, channelId, workspaceId, modelId)
+  createAgentSession: (title?: string, channelId?: string, workspaceId?: string, modelId?: string, isDraft?: boolean) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.CREATE_SESSION, title, channelId, workspaceId, modelId, isDraft)
   },
 
   listActiveAgentSessionSnapshots: () => {
@@ -1928,12 +1997,44 @@ const electronAPI: ElectronAPI = {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.GET_MCP_CONFIG, workspaceSlug)
   },
 
-  saveWorkspaceMcpConfig: (workspaceSlug: string, config: WorkspaceMcpConfig) => {
-    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.SAVE_MCP_CONFIG, workspaceSlug, config)
+  saveWorkspaceMcpConfig: (workspaceSlug: string, config: WorkspaceMcpConfig, options?: import('@proma/shared').SaveWorkspaceMcpConfigOptions) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.SAVE_MCP_CONFIG, workspaceSlug, config, options)
   },
 
-  testMcpServer: (name: string, entry: import('@proma/shared').McpServerEntry) => {
-    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.TEST_MCP_SERVER, name, entry) as Promise<{ success: boolean; message: string }>
+  refreshMcpConnections: (workspaceSlug: string) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.REFRESH_MCP_CONNECTIONS, workspaceSlug) as Promise<WorkspaceMcpConfig>
+  },
+
+  setMcpEnabledAndValidate: (workspaceSlug: string, name: string, enabled: boolean) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.SET_MCP_ENABLED_AND_VALIDATE, workspaceSlug, name, enabled) as Promise<import('@proma/shared').McpConnectionMutationResult>
+  },
+
+  installMcpAndValidate: (workspaceSlug: string, name: string, entry: import('@proma/shared').McpServerEntry) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.INSTALL_MCP_AND_VALIDATE, workspaceSlug, name, entry) as Promise<import('@proma/shared').McpInstallMutationResult>
+  },
+
+  startMcpOAuth: (input: import('@proma/shared').StartMcpOAuthInput) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.START_MCP_OAUTH, input)
+  },
+
+  saveMcpApiKey: (input: import('@proma/shared').SaveMcpApiKeyInput) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.SAVE_MCP_API_KEY, input)
+  },
+
+  deleteMcpCredential: (workspaceSlug: string, serverName: string) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.DELETE_MCP_CREDENTIAL, workspaceSlug, serverName) as Promise<void>
+  },
+
+  getCliIntegrationStatuses: (workspaceSlug: string) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.GET_CLI_INTEGRATION_STATUSES, workspaceSlug) as Promise<import('@proma/shared').CliIntegrationStatus[]>
+  },
+
+  setCliIntegrationEnabled: (workspaceSlug: string, id: string, enabled: boolean) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.SET_CLI_INTEGRATION_ENABLED, workspaceSlug, id, enabled) as Promise<import('@proma/shared').CliIntegrationStatus[]>
+  },
+
+  testMcpServer: (workspaceSlug: string, name: string, entry: import('@proma/shared').McpServerEntry) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.TEST_MCP_SERVER, workspaceSlug, name, entry) as Promise<{ success: boolean; message: string }>
   },
 
   setBuiltinMcpEnabled: (workspaceSlug: string, id: string, enabled: boolean) => {
@@ -2346,10 +2447,6 @@ const electronAPI: ElectronAPI = {
 
   readBinaryBase64: (filePath: string, access?: import('@proma/shared').FileAccessOptions, maxSize?: number) => {
     return ipcRenderer.invoke('file:read-binary-base64', filePath, access, maxSize) as Promise<string | null>
-  },
-
-  docxToHtml: (filePath: string, access?: import('@proma/shared').FileAccessOptions) => {
-    return ipcRenderer.invoke('file:docx-to-html', filePath, access) as Promise<{ resolvedPath: string; html: string } | null>
   },
 
   officeToHtml: (filePath: string, access?: import('@proma/shared').FileAccessOptions) => {

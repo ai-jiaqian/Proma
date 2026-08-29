@@ -52,6 +52,7 @@ import { getFetchFn } from './proxy-fetch'
 import { getEffectiveProxyUrl } from './proxy-settings-service'
 import { appendSDKMessages, updateAgentSessionMeta, getAgentSessionMeta, getAgentSessionMessages, removeSDKErrorMessage, updateSDKUserMessageSkillActivations, rewindPiAgentSession, resolveAgentCwd, getActiveWorktreePath, getAgentCwdMode, getSessionWorkbenchLayout } from './agent-session-manager'
 import { getAgentWorkspace, getLocalProjectRootStatus, getProjectFilesPath, getWorkspaceMcpConfig, getWorkspaceAttachedDirectories, getWorkspaceAttachedFiles, getWorkspaceAgentsMdPath, readWorkspaceAgentsMd, getWorkspaceMemoryGuidance, isWorkspaceProjectKnowledgeMaintenanceApproved } from './agent-workspace-manager'
+import { getMcpOAuthHeaders } from './mcp-oauth-service'
 import { getAgentWorkspacePath, getAgentSessionWorkspacePath, getSdkConfigDir, getWorkspaceSkillsDir } from './config-paths'
 import { getRuntimeStatus } from './runtime-init'
 import { getSettings } from './settings-service'
@@ -68,6 +69,7 @@ import { exitPlanService, type ExitPlanPermissionResult } from './agent-exit-pla
 import { validateToolInput } from './agent-tool-input-validator'
 import { estimateTokenCount, WRITE_CONTENT_TOKEN_THRESHOLD } from './agent-tool-token-estimator'
 import { buildPiBuiltinTools } from './adapters/pi-builtin-tools'
+import { getAgentVaultRoots, getVaultUserContext } from './vault-service'
 import { buildPiMcpTools } from './adapters/pi-mcp-tools'
 import { buildAgentRuntimeEnv, type AgentRuntimeEnv } from './agent-runtime-env'
 import { isVisibleRunMessage } from './agent-run-message-visibility'
@@ -77,6 +79,7 @@ import { generateCodexTitle } from './adapters/pi-codex-title-generator'
 import { createFallbackTitle, sanitizeGeneratedTitle, TITLE_PROMPT } from './title-generation'
 import { claimWorkspaceMemoryRefreshOpportunity } from './agent-memory-refresh-service'
 import { browserController } from './browser-controller'
+import { resolveRuntimeAdditionalDirectories } from './agent-orchestrator-vault-access'
 
 // ===== 类型定义 =====
 
@@ -265,7 +268,7 @@ export class AgentOrchestrator {
   /**
    * 构建工作区 MCP 服务器配置
    */
-  private buildMcpServers(workspaceSlug: string | undefined): Record<string, Record<string, unknown>> {
+  private async buildMcpServers(workspaceSlug: string | undefined, proxyUrl?: string): Promise<Record<string, Record<string, unknown>>> {
     const mcpServers: Record<string, Record<string, unknown>> = {}
     if (!workspaceSlug) return mcpServers
 
@@ -288,10 +291,19 @@ export class AgentOrchestrator {
           startup_timeout_sec: entry.timeout ?? 30,
         }
       } else if ((type === 'http' || type === 'sse') && entry.url) {
+        let oauthHeaders: Record<string, string> | undefined
+        try {
+          oauthHeaders = await getMcpOAuthHeaders(workspaceSlug, name, entry.url)
+        } catch (error) {
+          console.warn(`[Agent 编排] MCP OAuth 凭据不可用：${name}`, error instanceof Error ? error.message : error)
+          continue
+        }
+        const headers = { ...entry.headers, ...oauthHeaders }
         mcpServers[name] = {
           type,
           url: entry.url,
-          ...(entry.headers && Object.keys(entry.headers).length > 0 && { headers: entry.headers }),
+          ...(Object.keys(headers).length > 0 && { headers }),
+          ...(proxyUrl && { proxyUrl }),
           required: false,
         }
       } else {
@@ -577,6 +589,7 @@ export class AgentOrchestrator {
     userMessage: string,
     createdAt = Date.now(),
     uuid?: string,
+    vaultFocus?: import('@proma/shared').VaultFocusAttribution,
   ): string {
     const persistedUuid = uuid ?? randomUUID()
     const userSDKMsg: SDKMessage = {
@@ -587,6 +600,7 @@ export class AgentOrchestrator {
       },
       parent_tool_use_id: null,
       _createdAt: createdAt,
+      ...(vaultFocus ? { _vaultFocus: vaultFocus } : {}),
     } as unknown as SDKMessage
     appendSDKMessages(sessionId, [userSDKMsg])
     return persistedUuid
@@ -681,6 +695,8 @@ export class AgentOrchestrator {
     extensions: { piCustomTools?: ToolDefinition[] } = {},
   ): Promise<void> {
     const { sessionId, userMessage, rawUserMessage, userMessageUuid, channelId, modelId, workspaceId: requestedWorkspaceId, additionalDirectories, permissionModeOverride, mentionedSkills, mentionedMcpServers, mentionedSessionIds, mentionedTodoIds, mentionedCalendarEventIds, automationContext, retryOfErrorUuid } = input
+    // Capture the focus once per turn. Later UI focus changes must not rewrite this reply's attribution.
+    const initialVaultFocus = getVaultUserContext(sessionId)
     const streamStartedAt = input.startedAt ?? Date.now()
     let userMessagePersisted = false
     let initialUserMessageUuid: string | undefined
@@ -707,6 +723,11 @@ export class AgentOrchestrator {
         rawUserMessage ?? userMessage,
         Date.now(),
         userMessageUuid,
+        initialVaultFocus ? {
+          displayName: initialVaultFocus.displayName,
+          rootPath: initialVaultFocus.rootPath,
+          focus: initialVaultFocus.focus,
+        } : undefined,
       )
       userMessagePersisted = true
     }
@@ -997,11 +1018,17 @@ export class AgentOrchestrator {
       // 从源会话继承并持久化，避免历史相对路径在恢复时切换到另一文件根。
 
       // 必须与 runtime 接收的附加目录保持一致；视觉助手据此限制允许外发的图片路径。
-      const allAdditionalDirectories = collectAttachedDirectories({
+      const productivityTools = appSettings.productivityTools
+      const vaultUserContext = productivityTools.obsidianEnabled ? getVaultUserContext(sessionId) : null
+      const attachedDirectories = collectAttachedDirectories({
         extraDirs: additionalDirectories,
         sessionMeta,
         workspaceSlug,
       })
+      const allAdditionalDirectories = resolveRuntimeAdditionalDirectories(
+        attachedDirectories,
+        productivityTools.obsidianEnabled ? getAgentVaultRoots() : [],
+      )
       const browserAllowedRoots = [...new Set([
         workspaceId ? agentCwd : undefined,
         workspaceSlug ? getProjectFilesPath(workspaceSlug) : undefined,
@@ -1016,7 +1043,7 @@ export class AgentOrchestrator {
       }
 
       // 10. 构建 MCP 服务器配置 + 记忆工具 + 生图工具 + 自定义工具
-      const mcpServers = this.buildMcpServers(workspaceSlug)
+      const mcpServers = await this.buildMcpServers(workspaceSlug, proxyUrl)
       let piBuiltinTools: unknown[] = []
       let piMcpTools: unknown[] = []
       const piSdk = await import('@earendil-works/pi-coding-agent')
@@ -1031,6 +1058,8 @@ export class AgentOrchestrator {
         permissionMode: permissionModeOverride ?? sessionMeta?.permissionMode ?? PROMA_DEFAULT_PERMISSION_MODE,
         triggeredBy: input.triggeredBy,
         windowsShellAvailable: process.platform !== 'win32' || runtimeEnv.shellKind != null,
+        lastWindowsTerminalProfile: appSettings.lastWindowsTerminalProfile,
+        productivityTools,
       })
       piBuiltinTools = builtinMcpResult.tools
       const collaborationAvailable = builtinMcpResult.collaborationAvailable
@@ -1052,6 +1081,7 @@ export class AgentOrchestrator {
         workspaceSlug,
         agentCwd,
         userBrowserContext: browserController.getUserContext(sessionId),
+        userVaultContext: vaultUserContext,
       })
       // 11.5 注入 mention 引用指令（Skill/MCP/会话）— 仅影响 prompt，不影响持久化
       let enrichedMessage = userMessage
@@ -1075,8 +1105,8 @@ export class AgentOrchestrator {
         console.log(`[Agent 编排] 注入 mentioned_tools: ${mentionedSkills?.length ?? 0} skills, ${mentionedMcpServers?.length ?? 0} MCP`)
       }
       const referencedPlanningBlock = buildReferencedPlanningPrompt(
-        mentionedTodoIds,
-        mentionedCalendarEventIds,
+        productivityTools.todosEnabled ? mentionedTodoIds : undefined,
+        productivityTools.calendarEnabled ? mentionedCalendarEventIds : undefined,
         { requireToolRead: true },
       )
       if (referencedPlanningBlock) {
@@ -1160,6 +1190,27 @@ export class AgentOrchestrator {
         // 脚本执行（具有潜在副作用，如 node script.js / python main.py）
         if (/\b(node|python[23]?|ruby|perl|php)\s+[^-]/.test(command)) return false
         return true
+      }
+
+      /**
+       * 判断 PowerShell 命令是否可在计划模式只读执行。
+       * 为避免管道、重定向与别名隐含副作用，仅允许显式的只读 cmdlet，或沿用
+       * Bash 策略验证的 Git / JavaScript 工具链探索命令。
+       */
+      const isPowerShellCommandReadOnly = (command: string): boolean => {
+        const trimmed = command.trim()
+        if (!trimmed || /[;`|<>]/.test(trimmed) || /&&|\|\|/.test(trimmed)) return false
+
+        const [commandName] = trimmed.split(/\s+/, 1)
+        const normalizedName = commandName?.toLowerCase()
+        const readOnlyCmdlets = new Set([
+          'get-childitem', 'get-content', 'get-item', 'get-location', 'get-command', 'get-help',
+          'get-process', 'get-date', 'get-culture', 'get-module', 'measure-object',
+          'resolve-path', 'select-string', 'test-path',
+        ])
+        if (normalizedName && readOnlyCmdlets.has(normalizedName)) return true
+
+        return /^(git|bun|npm|pnpm|yarn)\s/.test(trimmed) && isBashCommandReadOnly(trimmed)
       }
 
       // Plan 模式下允许的只读工具（不包含 Write/Edit/Bash 等写操作）
@@ -1328,6 +1379,21 @@ export class AgentOrchestrator {
           })
         }
 
+        // Pi 的原生 PowerShell 尚未具备 Proma Bash 等价的命令级安全分类和白名单。
+        // 在需确认的权限模式中，每条命令都必须显示并单次确认；bypassPermissions
+        // 则遵从其既有语义，允许用户显式跳过所有工具确认。
+        if (toolName === 'PowerShell' && currentMode !== 'bypassPermissions') {
+          if (currentMode === 'plan') {
+            const command = typeof input.command === 'string' ? input.command : ''
+            return isPowerShellCommandReadOnly(command)
+              ? { behavior: 'allow' as const, updatedInput: input }
+              : { behavior: 'deny' as const, message: '计划模式下只允许只读 PowerShell 探索命令，请在计划审批通过后再执行写操作' }
+          }
+          return permissionService.requestSingleApproval(sessionId, toolName, input, options, (request) => {
+            this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'permission_request', request } })
+          })
+        }
+
         // ── 普通工具的权限分派 ──
 
         switch (currentMode) {
@@ -1434,6 +1500,7 @@ export class AgentOrchestrator {
         currentModelId: selectedModelId,
         projectInstructions,
         projectKnowledgeMaintenanceApproved,
+        productivityTools,
         memoryGuidance,
         memoryRefreshOpportunity,
       }) + (automationContext ? `\n\n## 定时任务执行上下文\n\n${automationContext}` : '')
@@ -2306,10 +2373,11 @@ export class AgentOrchestrator {
       : undefined
 
     const userBrowserContext = browserController.getUserContext(sessionId)
+    const userVaultContext = getVaultUserContext(sessionId)
     // 运行中的 Agent 收到队列消息时也必须看到用户刚刚主动打开的页面。
     // 未打开浏览器时保持既有消息形态，避免给每条插队消息重复注入无关环境块。
-    let enrichedText = userBrowserContext
-      ? `${buildDynamicContext({ userBrowserContext })}\n\n${text}`
+    let enrichedText = userBrowserContext || userVaultContext
+      ? `${buildDynamicContext({ userBrowserContext, userVaultContext })}\n\n${text}`
       : text
     const referencedSessionsBlock = buildReferencedSessionsPrompt(sessionId, mentionedSessionIds, workspaceSlug)
     if (referencedSessionsBlock) {
@@ -2371,6 +2439,13 @@ export class AgentOrchestrator {
         },
         parent_tool_use_id: null,
         _createdAt: Date.now(),
+        ...(userVaultContext ? {
+          _vaultFocus: {
+            displayName: userVaultContext.displayName,
+            rootPath: userVaultContext.rootPath,
+            focus: userVaultContext.focus,
+          },
+        } : {}),
       } as unknown as SDKMessage
       appendSDKMessages(sessionId, [persistMsg])
       this.flushPendingUserSkillActivations(sessionId, uuid)

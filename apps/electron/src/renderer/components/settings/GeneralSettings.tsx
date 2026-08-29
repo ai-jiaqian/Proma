@@ -40,17 +40,17 @@ import {
 import {
   longTextPasteAsAttachmentEnabledAtom,
   richTextRenderingEnabledAtom,
-  stickyUserMessageEnabledAtom,
   sessionHoverPreviewEnabledAtom,
+  productivityToolsAtom,
+  updateProductivityTools,
   updateLongTextPasteAsAttachmentEnabled,
   updateRichTextRenderingEnabled,
-  updateStickyUserMessageEnabled,
   updateSessionHoverPreviewEnabled,
 } from '@/atoms/ui-preferences'
 import { cn } from '@/lib/utils'
 import { detectIsMac, detectIsWindows } from '@/lib/platform'
 import { getEffectiveSoundPackId } from '@/lib/notification-sound-selection'
-import type { NotificationSoundId, NotificationSoundType, NotificationSoundSettings } from '@/types/settings'
+import type { NotificationSoundId, NotificationSoundType, NotificationSoundSettings, ProductivityToolsSettings } from '@/types/settings'
 
 /** emoji-mart 选择回调的 emoji 对象类型 */
 interface EmojiMartEmoji {
@@ -67,10 +67,10 @@ export function GeneralSettings(): React.ReactElement {
   const [notificationsEnabled, setNotificationsEnabled] = useAtom(notificationsEnabledAtom)
   const [notificationSoundEnabled, setNotificationSoundEnabled] = useAtom(notificationSoundEnabledAtom)
   const [notificationSounds, setNotificationSounds] = useAtom(notificationSoundsAtom)
-  const [stickyUserMessageEnabled, setStickyUserMessageEnabled] = useAtom(stickyUserMessageEnabledAtom)
   const [longTextPasteAsAttachmentEnabled, setLongTextPasteAsAttachmentEnabled] = useAtom(longTextPasteAsAttachmentEnabledAtom)
   const [richTextRenderingEnabled, setRichTextRenderingEnabled] = useAtom(richTextRenderingEnabledAtom)
   const [sessionHoverPreviewEnabled, setSessionHoverPreviewEnabled] = useAtom(sessionHoverPreviewEnabledAtom)
+  const [productivityTools, setProductivityTools] = useAtom(productivityToolsAtom)
   const [isEditingName, setIsEditingName] = React.useState(false)
   const [nameInput, setNameInput] = React.useState(userProfile.userName)
   const [showEmojiPicker, setShowEmojiPicker] = React.useState(false)
@@ -87,6 +87,18 @@ export function GeneralSettings(): React.ReactElement {
       setAgentIslandEnabled(settings.agentIsland?.enabled ?? true)
     }).catch(console.error)
   }, [])
+
+  /** 更新生产力工具开关；失败时回滚，避免界面和持久化设置不一致。 */
+  const handleProductivityToolsChange = async (updates: Partial<ProductivityToolsSettings>): Promise<void> => {
+    const previous = productivityTools
+    const next = { ...previous, ...updates }
+    setProductivityTools(next)
+    try {
+      await updateProductivityTools(next)
+    } catch {
+      setProductivityTools(previous)
+    }
+  }
 
   /** 更新灵动岛开关 */
   const handleAgentIslandChange = async (checked: boolean): Promise<void> => {
@@ -270,6 +282,24 @@ export function GeneralSettings(): React.ReactElement {
             <span className="text-[13px] text-foreground/40">简体中文</span>
           </SettingsRow>
           <SettingsToggle
+            label="Todo"
+            description="显示 Todo 入口，并允许 Agent 使用 Todo 相关工具"
+            checked={productivityTools.todosEnabled}
+            onCheckedChange={(checked) => { void handleProductivityToolsChange({ todosEnabled: checked }) }}
+          />
+          <SettingsToggle
+            label="日程"
+            description="显示日程入口，并允许 Agent 使用日程相关工具"
+            checked={productivityTools.calendarEnabled}
+            onCheckedChange={(checked) => { void handleProductivityToolsChange({ calendarEnabled: checked }) }}
+          />
+          <SettingsToggle
+            label="Obsidian"
+            description="显示 Obsidian 入口，并允许 Agent 使用已配置的 Vault"
+            checked={productivityTools.obsidianEnabled}
+            onCheckedChange={(checked) => { void handleProductivityToolsChange({ obsidianEnabled: checked }) }}
+          />
+          <SettingsToggle
             label="桌面通知"
             description="Agent 完成任务或需要操作时发送通知"
             checked={notificationsEnabled}
@@ -342,15 +372,6 @@ export function GeneralSettings(): React.ReactElement {
               </SelectContent>
             </Select>
           </SettingsRow>
-          <SettingsToggle
-            label="消息悬浮置顶条"
-            description="滚动浏览对话时，在顶部显示最近的用户消息摘要"
-            checked={stickyUserMessageEnabled}
-            onCheckedChange={(checked) => {
-              setStickyUserMessageEnabled(checked)
-              updateStickyUserMessageEnabled(checked)
-            }}
-          />
           <SettingsToggle
             label="长文本粘贴转附件"
             description="开启后，输入框粘贴超过 2000 字的文本会自动生成可预览编辑的附件"

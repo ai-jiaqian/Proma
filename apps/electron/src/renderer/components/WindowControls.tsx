@@ -1,14 +1,14 @@
 import * as React from 'react'
-import { useAtomValue } from 'jotai'
 import { detectIsWindows } from '@/lib/platform'
-import { interfaceVariantAtom } from '@/atoms/theme'
-import { cn } from '@/lib/utils'
-import { getWindowTitlebarDragInsetClass } from '@/lib/window-titlebar-layout'
+import {
+  getWindowTitlebarDragInsetStyle,
+  WINDOW_TITLEBAR_CONTROL_WIDTH_PX,
+  WINDOW_TITLEBAR_CONTROLS_WIDTH_PX,
+  WINDOW_TITLEBAR_HEIGHT_PX,
+} from '@/lib/window-titlebar-layout'
 
 export function WindowControls(): React.ReactElement | null {
   const isWindows = React.useMemo(() => detectIsWindows(), [])
-  const interfaceVariant = useAtomValue(interfaceVariantAtom)
-  const isClassic = interfaceVariant === 'classic'
   const [isMaximized, setIsMaximized] = React.useState(false)
 
   React.useEffect(() => {
@@ -25,15 +25,26 @@ export function WindowControls(): React.ReactElement | null {
   if (!isWindows) return null
 
   return (
-    <div className={cn(
-      'window-titlebar fixed inset-x-0 top-0 z-[100] flex h-8 select-none',
-      isClassic && 'window-titlebar-classic',
-    )}>
-      <div aria-hidden="true" className={cn('titlebar-drag-region absolute inset-y-0 left-0', getWindowTitlebarDragInsetClass(isWindows))} />
-      <div className="window-controls relative ml-auto flex">
+    <div
+      className="window-titlebar fixed inset-x-0 top-0 z-[100] flex select-none"
+      style={{
+        height: WINDOW_TITLEBAR_HEIGHT_PX,
+        '--window-titlebar-controls-width': `${WINDOW_TITLEBAR_CONTROLS_WIDTH_PX}px`,
+      } as React.CSSProperties}
+    >
+      <div
+        aria-hidden="true"
+        className="titlebar-drag-region pointer-events-none absolute inset-y-0 left-0"
+        style={getWindowTitlebarDragInsetStyle(isWindows)}
+      />
+      <div
+        className="window-controls relative ml-auto flex"
+        style={{ width: WINDOW_TITLEBAR_CONTROLS_WIDTH_PX }}
+      >
         <button
           type="button"
           className="window-control-btn"
+          style={{ width: WINDOW_TITLEBAR_CONTROL_WIDTH_PX }}
           aria-label="最小化"
           onClick={() => window.electronAPI.windowMinimize()}
         >
@@ -45,6 +56,7 @@ export function WindowControls(): React.ReactElement | null {
         <button
           type="button"
           className="window-control-btn"
+          style={{ width: WINDOW_TITLEBAR_CONTROL_WIDTH_PX }}
           aria-label={isMaximized ? '还原' : '最大化'}
           onClick={() => window.electronAPI.windowMaximize()}
         >
@@ -63,6 +75,7 @@ export function WindowControls(): React.ReactElement | null {
         <button
           type="button"
           className="window-control-btn window-control-close"
+          style={{ width: WINDOW_TITLEBAR_CONTROL_WIDTH_PX }}
           aria-label="关闭"
           onClick={() => window.electronAPI.windowClose()}
         >
