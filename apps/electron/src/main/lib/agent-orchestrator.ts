@@ -15,12 +15,12 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
-import { accessSync, constants, existsSync, mkdirSync, realpathSync } from 'node:fs'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import { app } from 'electron'
-import type { AgentSendInput, AgentMessage, AgentGenerateTitleInput, AgentProviderAdapter, AgentSessionMeta, AgentActiveSessionSnapshot, CodexOAuthCredentials, XaiOAuthCredentials, TypedError, SDKMessage, SDKAssistantMessage, AgentStreamPayload, AgentAssistantDeltaPayload, RewindSessionResult, SkillActivation } from '@proma/shared'
+import type { AgentSendInput, AgentMessage, AgentGenerateTitleInput, AgentProviderAdapter, AgentSessionMeta, AgentActiveSessionSnapshot, CodexOAuthCredentials, GithubCopilotOAuthCredentials, XaiOAuthCredentials, TypedError, SDKMessage, SDKAssistantMessage, AgentStreamPayload, AgentAssistantDeltaPayload, RewindSessionResult, SkillActivation } from '@proma/shared'
 import {
   PROMA_DEFAULT_PERMISSION_MODE,
   PROMA_PERMISSION_MODE_CONFIG,
@@ -45,14 +45,15 @@ import { getActiveRunRejectionMessage, shouldPersistInitialUserMessage } from '.
 import { isSessionNotFoundError } from './error-patterns'
 import { AgentEventBus } from './agent-event-bus'
 import { isStaleActiveQueueError } from './agent-queue-routing'
-import { decryptApiKey, getChannelById, listChannels, persistCodexOAuthCredentials, persistXaiOAuthCredentials, resolveChannelRuntimeApiKey, resolveCodexOAuthCredentials, resolveXaiOAuthCredentials } from './channel-manager'
+import { decryptApiKey, getChannelById, listChannels, persistCodexOAuthCredentials, persistGithubCopilotOAuthCredentials, persistXaiOAuthCredentials, resolveChannelRuntimeApiKey, resolveCodexOAuthCredentials, resolveGithubCopilotOAuthCredentials, resolveXaiOAuthCredentials } from './channel-manager'
 import { getAdapter, fetchTitle } from '@proma/core'
 import pkg from '../../../package.json' with { type: 'json' }
 import { getFetchFn } from './proxy-fetch'
 import { getEffectiveProxyUrl } from './proxy-settings-service'
-import { appendSDKMessages, updateAgentSessionMeta, getAgentSessionMeta, getAgentSessionMessages, removeSDKErrorMessage, updateSDKUserMessageSkillActivations, rewindPiAgentSession, resolveAgentCwd, getActiveWorktreePath, getAgentCwdMode, getSessionWorkbenchLayout } from './agent-session-manager'
-import { getAgentWorkspace, getLocalProjectRootStatus, getProjectFilesPath, getWorkspaceMcpConfig, getWorkspaceAttachedDirectories, getWorkspaceAttachedFiles, getWorkspaceAgentsMdPath, readWorkspaceAgentsMd, getWorkspaceMemoryGuidance, isWorkspaceProjectKnowledgeMaintenanceApproved } from './agent-workspace-manager'
-import { getMcpOAuthHeaders } from './mcp-oauth-service'
+import { appendSDKMessages, updateAgentSessionMeta, getAgentSessionMeta, getAgentSessionMessages, removeSDKErrorMessage, updateSDKUserMessageSkillActivations, rewindPiAgentSession, resolveAgentCwd, getActiveWorktreePath, getAgentCwdMode, getSessionWorkbenchLayout, resolveSessionWorkbenchContextDir } from './agent-session-manager'
+import { getAgentWorkspace, getProjectFilesPath, getWorkspaceMcpConfig, getWorkspaceAttachedDirectories, getWorkspaceAttachedFiles, getWorkspaceAgentsMdPath, readWorkspaceAgentsMd, getWorkspaceMemoryGuidance, isWorkspaceProjectKnowledgeMaintenanceApproved } from './agent-workspace-manager'
+import { getLocalProjectRootStatus } from './project-root-health'
+import { getMcpApiKeyEnvironment, getMcpOAuthHeaders } from './mcp-oauth-service'
 import { getAgentWorkspacePath, getAgentSessionWorkspacePath, getSdkConfigDir, getWorkspaceSkillsDir } from './config-paths'
 import { getRuntimeStatus } from './runtime-init'
 import { getSettings } from './settings-service'
@@ -67,6 +68,7 @@ import { resolvePlanningDeletionPermission } from './planning-permission-policy'
 import { askUserService } from './agent-ask-user-service'
 import { exitPlanService, type ExitPlanPermissionResult } from './agent-exit-plan-service'
 import { validateToolInput } from './agent-tool-input-validator'
+import { isSessionPlanMarkdownPath } from './agent-plan-file-policy'
 import { estimateTokenCount, WRITE_CONTENT_TOKEN_THRESHOLD } from './agent-tool-token-estimator'
 import { buildPiBuiltinTools } from './adapters/pi-builtin-tools'
 import { getAgentVaultRoots, getVaultUserContext } from './vault-service'
@@ -89,15 +91,17 @@ import { resolveRuntimeAdditionalDirectories } from './agent-orchestrator-vault-
  * 解耦 Electron webContents，使 Orchestrator 可独立测试。
  * agent-service.ts 负责将这些回调绑定到 webContents.send()。
  */
+type AgentRunInput = AgentSendInput & { runGeneration?: number }
+
 export interface SessionCallbacks {
   /** 发送流式错误 */
-  onError: (error: string) => void
+  onError: (error: string, opts?: { runGeneration?: number }) => void
   /** 发送流式完成（携带已持久化的消息列表） */
-  onComplete: (messages?: AgentMessage[], opts?: { stoppedByUser?: boolean; startedAt?: number; resultSubtype?: string; resultErrors?: string[]; backgroundTasksPending?: boolean }) => void
+  onComplete: (messages?: AgentMessage[], opts?: { stoppedByUser?: boolean; startedAt?: number; runGeneration?: number; resultSubtype?: string; resultErrors?: string[]; backgroundTasksPending?: boolean }) => void
   /** 发送标题更新 */
   onTitleUpdated: (title: string) => void
   /** 用户消息已持久化，外部入口可据此通知前端切到实时会话 */
-  onRunStarted?: (opts: { startedAt: number }) => void
+  onRunStarted?: (opts: { startedAt: number; runGeneration: number }) => void
 }
 
 type RecoverableAgentQueryOptions = {
@@ -209,23 +213,6 @@ function createLocalProjectRootUnavailableError(projectRootPath: string, status?
   return error
 }
 
-/** 验证本地项目根，并返回用于跨会话比较的真实规范化路径。 */
-function resolveLocalProjectRootForRewind(projectRootPath: string): string {
-  const status = getLocalProjectRootStatus(projectRootPath)
-  if (status !== 'available') {
-    throw createLocalProjectRootUnavailableError(projectRootPath, status)
-  }
-
-  try {
-    accessSync(projectRootPath, constants.R_OK | constants.W_OK | constants.X_OK)
-    const realRoot = realpathSync(projectRootPath)
-    const normalizedRoot = normalizePathForCompare(realRoot) || realRoot
-    return process.platform === 'win32' ? normalizedRoot.toLowerCase() : normalizedRoot
-  } catch {
-    throw createLocalProjectRootUnavailableError(projectRootPath, 'unavailable')
-  }
-}
-
 // ===== AgentOrchestrator =====
 
 export class AgentOrchestrator {
@@ -233,7 +220,7 @@ export class AgentOrchestrator {
   private eventBus: AgentEventBus
   private activeSessions = new Map<string, number>()
   private activeSessionStartedAt = new Map<string, number>()
-  private nextRunGeneration = 0
+  private nextRunGenerationBySession = new Map<string, number>()
 
   /** 队列消息本地记录（sessionId → UUID 集合，用于防重） */
   private queuedMessageUuids = new Map<string, Set<string>>()
@@ -278,16 +265,18 @@ export class AgentOrchestrator {
       const type = normalizeMcpTransportType((entry as { type?: unknown }).type)
 
       if (type === 'stdio' && entry.command) {
+        const credentialEnv = getMcpApiKeyEnvironment(workspaceSlug, name, entry)
         const mergedEnv: Record<string, string> = {
           ...(process.env.PATH && { PATH: process.env.PATH }),
           ...entry.env,
+          ...credentialEnv,
         }
         mcpServers[name] = {
           type: 'stdio',
           command: entry.command,
           ...(entry.args && entry.args.length > 0 && { args: entry.args }),
           ...(Object.keys(mergedEnv).length > 0 && { env: mergedEnv }),
-          required: false,
+          required: true,
           startup_timeout_sec: entry.timeout ?? 30,
         }
       } else if ((type === 'http' || type === 'sse') && entry.url) {
@@ -304,7 +293,7 @@ export class AgentOrchestrator {
           url: entry.url,
           ...(Object.keys(headers).length > 0 && { headers }),
           ...(proxyUrl && { proxyUrl }),
-          required: false,
+          required: true,
         }
       } else {
         console.warn(`[Agent 编排] MCP 服务器 "${name}" 配置不完整，已跳过（type=${entry.type}, command=${entry.command ?? '无'}, url=${entry.url ?? '无'}）`)
@@ -342,8 +331,8 @@ export class AgentOrchestrator {
       return null
     }
 
-    if (channel.provider === 'xai') {
-      // xAI subscription uses Pi's provider-specific OAuth transport; title generation's
+    if (channel.provider === 'xai' || channel.provider === 'github-copilot') {
+      // Subscription providers use Pi's provider-specific OAuth transport; title generation's
       // generic channel adapter only understands API keys, so retain a local deterministic title.
       return createFallbackTitle(userMessage)
     }
@@ -690,7 +679,7 @@ export class AgentOrchestrator {
    * 通过 EventBus 分发 AgentEvent，通过 callbacks 发送控制信号。
    */
   async sendMessage(
-    input: AgentSendInput,
+    input: AgentRunInput,
     callbacks: SessionCallbacks,
     extensions: { piCustomTools?: ToolDefinition[] } = {},
   ): Promise<void> {
@@ -710,6 +699,7 @@ export class AgentOrchestrator {
       callbacks.onComplete([], {
         ...options,
         startedAt: options.startedAt ?? streamStartedAt,
+        ...(input.runGeneration != null ? { runGeneration: input.runGeneration } : {}),
         stoppedByUser: options.stoppedByUser === true || stoppedByUser,
       })
     }
@@ -741,7 +731,7 @@ export class AgentOrchestrator {
       // 后续消息会随每次点击重复落盘。
       console.warn(`[Agent 编排] 会话 ${sessionId} 正在处理中，拒绝新请求且不保存用户消息`)
       callbacks.onError(getActiveRunRejectionMessage())
-      callbacks.onComplete([], { startedAt: streamStartedAt })
+      callbacks.onComplete([], { startedAt: streamStartedAt, ...(input.runGeneration != null ? { runGeneration: input.runGeneration } : {}) })
       return
     }
 
@@ -815,7 +805,7 @@ export class AgentOrchestrator {
         return
       }
 
-      const projectRootStatus = getLocalProjectRootStatus(workspace.projectRootPath)
+      const projectRootStatus = await getLocalProjectRootStatus(workspace.projectRootPath)
       if (projectRootStatus && projectRootStatus !== 'available') {
         reportPreflightError({
           code: 'local_project_root_unavailable',
@@ -849,6 +839,7 @@ export class AgentOrchestrator {
 
     let apiKey: string
     let codexOAuthCredentials: CodexOAuthCredentials | undefined
+    let githubCopilotOAuthCredentials: GithubCopilotOAuthCredentials | undefined
     let xaiOAuthCredentials: XaiOAuthCredentials | undefined
     try {
       // 订阅 OAuth 渠道必须保留完整凭据给 Pi runtime，才能在执行中按真实 expires
@@ -856,6 +847,9 @@ export class AgentOrchestrator {
       if (channel.provider === 'openai-codex') {
         codexOAuthCredentials = await resolveCodexOAuthCredentials(channelId)
         apiKey = codexOAuthCredentials.access
+      } else if (channel.provider === 'github-copilot') {
+        githubCopilotOAuthCredentials = await resolveGithubCopilotOAuthCredentials(channelId)
+        apiKey = githubCopilotOAuthCredentials.access
       } else if (channel.provider === 'xai') {
         xaiOAuthCredentials = await resolveXaiOAuthCredentials(channelId)
         apiKey = xaiOAuthCredentials.access
@@ -863,14 +857,17 @@ export class AgentOrchestrator {
         apiKey = decryptApiKey(channelId)
       }
     } catch (err) {
-      if (channel.provider === 'openai-codex' || channel.provider === 'xai') {
+      if (channel.provider === 'openai-codex' || channel.provider === 'github-copilot' || channel.provider === 'xai') {
         const isXai = channel.provider === 'xai'
+        const isGithubCopilot = channel.provider === 'github-copilot'
         reportPreflightError({
           code: 'expired_oauth_token',
-          title: isXai ? 'xAI 登录已失效' : 'ChatGPT 登录已失效',
+          title: isXai ? 'xAI 登录已失效' : isGithubCopilot ? 'GitHub Copilot 登录已失效' : 'ChatGPT 登录已失效',
           message: isXai
             ? '无法刷新 xAI 登录凭据，登录可能已过期或被撤销。请在设置中重新登录 xAI。'
-            : '无法刷新 ChatGPT 登录凭据，登录可能已过期或被撤销。请在设置中重新登录 ChatGPT。',
+            : isGithubCopilot
+              ? '无法刷新 GitHub Copilot 登录凭据，登录可能已过期、被撤销或不再拥有 Copilot 订阅。请在设置中重新登录。'
+              : '无法刷新 ChatGPT 登录凭据，登录可能已过期或被撤销。请在设置中重新登录 ChatGPT。',
           actions: [
             { key: 's', label: '打开渠道设置', action: 'open_channel_settings' },
           ],
@@ -910,10 +907,10 @@ export class AgentOrchestrator {
       completeBeforeRun({ stoppedByUser: true })
       return
     }
-    const runGeneration = ++this.nextRunGeneration
+    const runGeneration = input.runGeneration ?? this.reserveRunGeneration(sessionId)
     this.activeSessions.set(sessionId, runGeneration)
     this.activeSessionStartedAt.set(sessionId, streamStartedAt)
-    callbacks.onRunStarted?.({ startedAt: streamStartedAt })
+    callbacks.onRunStarted?.({ startedAt: streamStartedAt, runGeneration })
 
     const releaseActiveRun = (): void => {
       // 在发送 STREAM_COMPLETE 前释放 active slot，避免渲染进程已进入空闲态、
@@ -931,7 +928,7 @@ export class AgentOrchestrator {
       opts?: { stoppedByUser?: boolean; startedAt?: number; resultSubtype?: string; resultErrors?: string[] },
     ): void => {
       releaseActiveRun()
-      callbacks.onComplete(messages, opts)
+      callbacks.onComplete(messages, { ...opts, runGeneration })
     }
     const failRun = (
       error: string,
@@ -939,8 +936,8 @@ export class AgentOrchestrator {
       opts?: { stoppedByUser?: boolean; startedAt?: number; resultSubtype?: string; resultErrors?: string[] },
     ): void => {
       releaseActiveRun()
-      callbacks.onError(error)
-      callbacks.onComplete(messages, opts)
+      callbacks.onError(error, { runGeneration })
+      callbacks.onComplete(messages, { ...opts, runGeneration })
     }
 
     // 3. 构建 Pi runtime 环境（代理与 Windows shell 配置）。
@@ -1042,7 +1039,7 @@ export class AgentOrchestrator {
         console.log(`[Agent 编排] 将直接使用已保存的 sdkSessionId 进行 resume: ${existingSdkSessionId}`)
       }
 
-      // 10. 构建 MCP 服务器配置 + 记忆工具 + 生图工具 + 自定义工具
+      // 10. 构建工作区 MCP 配置与 Pi 基础运行时工具
       const mcpServers = await this.buildMcpServers(workspaceSlug, proxyUrl)
       let piBuiltinTools: unknown[] = []
       let piMcpTools: unknown[] = []
@@ -1154,6 +1151,29 @@ export class AgentOrchestrator {
       const getPermissionMode = (): PromaPermissionMode =>
         this.sessionPermissionModes.get(sessionId) ?? initialPermissionMode
 
+      // 计划工件只允许来自当前会话的工作台 plan/ 目录；ExitPlanMode 服务会做 realpath + 哈希复核。
+      const sessionPlanDirectory = (() => {
+        const sessionContextDirectory = resolveSessionWorkbenchContextDir(
+          workspace,
+          sessionId,
+          getSessionWorkbenchLayout(sessionMeta),
+        )
+        return sessionContextDirectory ? join(sessionContextDirectory, 'plan') : undefined
+      })()
+      // 计划目录由 Proma 创建，确保后续路径策略不需要为首次写入放宽符号链接校验。
+      // 运行中切换到 Plan 模式时，也会在首次写入前调用此函数。
+      const ensureSessionPlanDirectory = (): boolean => {
+        if (!sessionPlanDirectory) return false
+        try {
+          mkdirSync(sessionPlanDirectory, { recursive: true })
+          return true
+        } catch (error) {
+          console.warn(`[Agent 编排] 创建计划目录失败: ${sessionPlanDirectory}`, error)
+          return false
+        }
+      }
+      if (initialPermissionMode === 'plan') ensureSessionPlanDirectory()
+
       // ExitPlanMode 拦截器：plan 模式下走 UI 审批流程
       const handleExitPlanMode = (toolInput: Record<string, unknown>, signal: AbortSignal): Promise<ExitPlanPermissionResult> => {
         return exitPlanService.handleExitPlanMode(
@@ -1163,6 +1183,7 @@ export class AgentOrchestrator {
           (request: ExitPlanModeRequest) => {
             this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'exit_plan_mode_request', request } })
           },
+          { planDirectory: sessionPlanDirectory },
         )
       }
 
@@ -1215,7 +1236,7 @@ export class AgentOrchestrator {
 
       // Plan 模式下允许的只读工具（不包含 Write/Edit/Bash 等写操作）
       const PLAN_MODE_ALLOWED_TOOLS = new Set([
-        'Read', 'Glob', 'Grep', 'WebSearch', 'WebFetch',
+        'Read', 'Glob', 'Grep',
         'TodoRead', 'TaskOutput',
         'TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet',
         'ListMcpResourcesTool', 'ReadMcpResourceTool',
@@ -1311,6 +1332,7 @@ export class AgentOrchestrator {
 
         // EnterPlanMode：标记进入状态，通知渲染进程
         if (toolName === 'EnterPlanMode') {
+          ensureSessionPlanDirectory()
           planModeEntered = true
           emitPlanModeChanged(true, 'tool')
           this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'enter_plan_mode', sessionId } })
@@ -1401,16 +1423,17 @@ export class AgentOrchestrator {
             return { behavior: 'allow' as const, updatedInput: input }
 
           case 'plan': {
-            // Plan 模式：只允许只读工具 + Write/Edit 任意 .md 文件（计划文档）
+            // Plan 模式：只允许只读工具，以及当前会话 plan/ 目录中的 Markdown 计划文档。
             if (PLAN_MODE_ALLOWED_TOOLS.has(toolName)) {
               return { behavior: 'allow' as const, updatedInput: input }
             }
-            // 允许 Write/Edit 到任意 .md 文件（计划文档一定是 markdown；非 .md 仍被拒）
+            // 计划文档必须位于会话私有 plan/ 目录，避免以 Markdown 名义修改项目或用户文档。
             if (toolName === 'Write' || toolName === 'Edit') {
               const filePath = typeof input.file_path === 'string' ? input.file_path : ''
-              if (filePath.toLowerCase().endsWith('.md')) {
+              if (ensureSessionPlanDirectory() && isSessionPlanMarkdownPath(filePath, sessionPlanDirectory)) {
                 return { behavior: 'allow' as const, updatedInput: input }
               }
+              return { behavior: 'deny' as const, message: '计划模式下只能在当前会话的 plan/ 目录中写入 Markdown 计划文档，请在计划审批通过后再修改其他文件' }
             }
             // Bash 工具：只读命令（find、grep、cat 等）允许执行，写操作拒绝
             if (toolName === 'Bash') {
@@ -1559,6 +1582,7 @@ export class AgentOrchestrator {
         })
       }
       const piCustomTools = [...piBuiltinTools, ...piMcpTools, ...(extensions.piCustomTools ?? [])]
+      let githubCopilotCredentialsSnapshot = githubCopilotOAuthCredentials
       const queryOptions: PiAgentQueryOptions = {
         sessionId,
         prompt: finalPrompt,
@@ -1602,6 +1626,15 @@ export class AgentOrchestrator {
           codexOAuthCredentials,
           onCodexOAuthCredentialsRefreshed: (credentials: CodexOAuthCredentials) => {
             persistCodexOAuthCredentials(channelId, credentials)
+          },
+        }),
+        ...(githubCopilotOAuthCredentials && {
+          githubCopilotOAuthCredentials,
+          onGithubCopilotOAuthCredentialsRefreshed: (credentials: GithubCopilotOAuthCredentials) => {
+            const expectedCredentials = githubCopilotCredentialsSnapshot
+            if (expectedCredentials && persistGithubCopilotOAuthCredentials(channelId, credentials, expectedCredentials)) {
+              githubCopilotCredentialsSnapshot = credentials
+            }
           },
         }),
         ...(xaiOAuthCredentials && {
@@ -1720,6 +1753,7 @@ export class AgentOrchestrator {
                   deltas: [msg.delta],
                   session_id: msg.session_id,
                   runStartedAt: streamStartedAt,
+                  runGeneration,
                   _channelModelId: msg._channelModelId,
                 },
               })
@@ -2023,8 +2057,9 @@ export class AgentOrchestrator {
             return
           }
 
-          // Plan 模式：Agent 完成规划后注入"接受计划"建议
-          if (initialPermissionMode === 'plan' && planModeEntered && this.activeSessions.has(sessionId)) {
+          // Plan 模式：仅本地会话在规划完成后注入“接受计划”建议。
+          // 外部 Bridge（例如 Slack）已在其所属渠道提供审批交互，不能在桌面输入框留下残留草稿。
+          if (input.triggeredBy !== 'external' && initialPermissionMode === 'plan' && planModeEntered && this.activeSessions.has(sessionId)) {
             this.eventBus.emit(sessionId, {
               kind: 'sdk_message',
               message: { type: 'prompt_suggestion', suggestion: '请执行该计划' } as unknown as SDKMessage,
@@ -2224,6 +2259,13 @@ export class AgentOrchestrator {
     console.log(`[Agent 编排] 已中止会话: ${sessionId}`)
   }
 
+  /** 为一个会话预留下一次运行身份。所有 run lifecycle 事件都必须复用该值。 */
+  reserveRunGeneration(sessionId: string): number {
+    const runGeneration = (this.nextRunGenerationBySession.get(sessionId) ?? 0) + 1
+    this.nextRunGenerationBySession.set(sessionId, runGeneration)
+    return runGeneration
+  }
+
   /** 检查指定会话是否正在处理中 */
   isActive(sessionId: string): boolean {
     return this.activeSessions.has(sessionId)
@@ -2234,35 +2276,13 @@ export class AgentOrchestrator {
     return [...this.activeSessions.keys()].map((sessionId) => ({
       sessionId,
       startedAt: this.activeSessionStartedAt.get(sessionId) ?? Date.now(),
+      runGeneration: this.activeSessions.get(sessionId),
     }))
   }
 
   /** 是否存在任意运行中 Agent（含后台运行与外部触发的会话）。 */
   hasActiveSessions(): boolean {
     return this.activeSessions.size > 0
-  }
-
-  /** 同一个真实本地项目根只能由一个运行中会话执行文件回退。 */
-  private hasOtherActiveSessionForLocalProjectRoot(sessionId: string, localProjectRoot: string): boolean {
-    for (const activeSessionId of this.activeSessions.keys()) {
-      if (activeSessionId === sessionId) continue
-
-      const activeSessionMeta = getAgentSessionMeta(activeSessionId)
-      if (!activeSessionMeta?.workspaceId) continue
-
-      const activeWorkspace = getAgentWorkspace(activeSessionMeta.workspaceId)
-      if (!activeWorkspace?.projectRootPath) continue
-
-      try {
-        if (resolveLocalProjectRootForRewind(activeWorkspace.projectRootPath) === localProjectRoot) {
-          return true
-        }
-      } catch {
-        // 运行中的会话已通过启动时校验；若其根后来不可用，无法安全比较，跳过即可。
-      }
-    }
-
-    return false
   }
 
   /**
@@ -2290,8 +2310,9 @@ export class AgentOrchestrator {
   /**
    * 回退 Pi 会话到指定消息点。
    *
-   * Pi 可安全回退其对话树；文件快照不属于 Pi runtime，因此明确告知用户
-   * 当前不会修改工作区文件。退役 Claude 会话仅可查看，不允许回退或继续。
+   * Pi 可安全回退其对话树；文件快照不属于 Pi runtime，当前不会修改工作区文件。
+   * 未提供文件回退能力是正常状态，不作为回退错误返回。
+   * 退役 Claude 会话仅可查看，不允许回退或继续。
    */
   async rewindSession(
     sessionId: string,
@@ -2315,7 +2336,6 @@ export class AgentOrchestrator {
       remainingMessages,
       fileRewind: {
         canRewind: false,
-        error: '已回退 Pi 对话；Pi 文件回退尚未启用，当前未修改任何文件。',
       },
     }
   }

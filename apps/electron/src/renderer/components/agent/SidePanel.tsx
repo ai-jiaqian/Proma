@@ -18,6 +18,9 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/utils'
+import { getAttachedDirectoryStateKey } from '@/components/file-browser/file-browser-roots'
+import { useFileTreeExpanded } from '@/components/file-browser/use-file-tree-expanded'
+import { useAttachedDirectoryChildren } from '@/components/file-browser/use-attached-directory-children'
 import { productivityToolsAtom } from '@/atoms/ui-preferences'
 import { markdownToHtml } from '@/lib/markdown-rich-text'
 import { FileBrowser, FileDropZone, FileTypeIcon, FileSearchBar, computeRevealAncestors, isPathUnderRoot, computeTreeRowLayout, AncestorGuides, STICKY_ROW_BASE_CLASS, canBeSticky } from '@/components/file-browser'
@@ -45,6 +48,8 @@ import {
   agentFileChangesCurrentRunAtom,
   agentSessionComponentTabsAtomFamily,
   agentSessionStreamingStateAtomFamily,
+  agentSessionIndicatorMapAtom,
+  unviewedCompletedDelegatedSessionIdsAtom,
   isWorkspaceComponentTab,
   isUserPriorityWorkspaceComponentTab,
   sanitizeWorkspaceComponentTabs,
@@ -68,7 +73,6 @@ import {
 import {
   getBrowserSidePanelTab,
   getBrowserTabIdFromSidePanelTab,
-  getDelegationSessionIdFromSidePanelTab,
   getDelegationSidePanelTab,
   getExplorationSessionIdFromSidePanelTab,
   getExplorationSidePanelTab,
@@ -101,6 +105,7 @@ import {
   previewPanelOpenMapAtom,
 } from '@/atoms/preview-atoms'
 import { PreviewPanel } from '@/components/diff/PreviewPanel'
+import { clearPreviewContentCacheForFile } from '@/lib/preview-content-cache'
 import { useOpenPreview } from '@/components/diff/preview-opener'
 import type { FileEntry, AgentPendingFile, AgentSessionMeta, SDKMessage, WorktreeInfo } from '@proma/shared'
 import { setFilePanelDragData, getMediaTypeFromFilename, dispatchInsertFileMention } from '@/lib/file-panel-drag'
@@ -110,6 +115,8 @@ import {
   recordRightPanelTabVisit,
   removeRightPanelTabFromHistory,
 } from '@/lib/right-panel-tab-history'
+import { getDelegatedChildSessionStatus, getDelegationStatusIconClass } from '@/lib/agent-session-list'
+import { markSessionCompletionViewed } from '@/lib/agent-completion-presence'
 import { rememberStopGenerationTarget } from '@/lib/stop-generation-target'
 import { TerminalTabContent } from '@/components/tabs/TerminalTabContent'
 import { shouldShowBothFileSources } from './file-panel-layout'
@@ -336,12 +343,29 @@ function getLatestExplorationConclusion(messages: SDKMessage[], sourceMessageId:
  * 右侧嵌入 Agent 在切换时轻微淡入并横移 1px，缓和不同消息高度瞬间替换的视觉跳变。
  * 首次打开不播放，且尊重系统的减少动态效果偏好。
  */
-function SideAgentSessionContent({ contentKey, children }: { contentKey: string; children: React.ReactNode }): React.ReactElement {
+function SideAgentSessionContent({
+  contentKey,
+  children,
+  onView,
+}: {
+  contentKey: string
+  children: React.ReactNode
+  onView?: () => void
+}): React.ReactElement {
   const previousContentKeyRef = React.useRef<string | null>(null)
+  const onViewRef = React.useRef(onView)
+  onViewRef.current = onView
   const shouldAnimate = previousContentKeyRef.current !== null && previousContentKeyRef.current !== contentKey
 
   React.useEffect(() => {
     previousContentKeyRef.current = contentKey
+  }, [contentKey])
+
+  // A delegated child may finish while hidden, then become visible simply because its parent
+  // session is reopened. Rendering the visible content itself is a view acknowledgement; do not
+  // require a second pointer or focus event inside the child pane to clear its completion state.
+  React.useEffect(() => {
+    onViewRef.current?.()
   }, [contentKey])
 
   return (
@@ -351,6 +375,8 @@ function SideAgentSessionContent({ contentKey, children }: { contentKey: string;
         'min-h-0 flex-1 overflow-hidden',
         shouldAnimate && 'animate-in fade-in-0 slide-in-from-right-1 duration-150 motion-reduce:animate-none',
       )}
+      onFocusCapture={onView}
+      onPointerDownCapture={onView}
     >
       {children}
     </div>
@@ -490,6 +516,8 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     openPreview(sessionId, {
       filePath,
       previewOnly: true,
+      // 文件面板是用户主动选择的入口，保留任意本地路径预览能力。
+      unrestricted: true,
       basePaths: bp.length > 0 ? bp : undefined,
     })
   }, [sessionId, openPreview])
@@ -833,14 +861,18 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
   const sideTemporaryAgents = sideTemporaryAgentMap.get(sessionId) ?? []
   const sideDelegationMap = useAtomValue(agentSideDelegationMapAtom)
   const setSideDelegationMap = useSetAtom(agentSideDelegationMapAtom)
-  const sideDelegationSessionIds = sideDelegationMap.get(sessionId) ?? []
+  const setUnviewedDelegatedCompleted = useSetAtom(unviewedCompletedDelegatedSessionIdsAtom)
+  const sideDelegationSessionId = sideDelegationMap.get(sessionId) ?? null
+  const agentIndicatorMap = useAtomValue(agentSessionIndicatorMapAtom)
   const terminalTabsMap = useAtomValue(agentTerminalTabsAtom)
   const setTerminalTabsMap = useSetAtom(agentTerminalTabsAtom)
   const terminalTabs = terminalTabsMap.get(sessionId) ?? []
   const activeTerminalId = getTerminalIdFromSidePanelTab(activeTab)
-  const activeDelegationSessionId = getDelegationSessionIdFromSidePanelTab(activeTab)
-  const activeDelegationSession = activeDelegationSessionId
-    ? sessions.find((item) => item.id === activeDelegationSessionId && item.parentSessionId === sessionId && !!item.sourceDelegationId) ?? null
+  const selectedDelegationSession = sideDelegationSessionId
+    ? sessions.find((item) => item.id === sideDelegationSessionId && item.parentSessionId === sessionId && !!item.sourceDelegationId) ?? null
+    : null
+  const selectedDelegationStatus = selectedDelegationSession
+    ? getDelegatedChildSessionStatus(selectedDelegationSession, agentIndicatorMap)
     : null
   const activeExplorationSessionId = getExplorationSessionIdFromSidePanelTab(activeTab)
   const activeExplorationBranch = activeExplorationSessionId
@@ -873,7 +905,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
   const effectiveActiveTab: AgentSidePanelTab = activeTab === 'chat' && !sideChatConversationId
     ? 'files'
     // `temporary-agent` 是旧的单分支内存状态；新状态使用 exploration:<sessionId>。
-    : activeTab === 'temporary-agent' || (activeExplorationSessionId !== null && !activeExplorationBranch) || (activeDelegationSessionId !== null && !activeDelegationSession) || (activeTerminalId !== null && !terminalTabs.some((terminal) => terminal.terminalId === activeTerminalId))
+    : activeTab === 'temporary-agent' || (activeExplorationSessionId !== null && !activeExplorationBranch) || (activeTab === 'delegation' && !selectedDelegationSession) || (activeTerminalId !== null && !terminalTabs.some((terminal) => terminal.terminalId === activeTerminalId))
       ? 'files'
       : isWorkspaceComponentTab(activeTab) && (!workspaceSlug || !workspaceComponentTabs.includes(activeTab) || !isWorkspaceComponentEnabled(activeTab))
         ? 'files'
@@ -915,6 +947,9 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
   }, [agentStreamState?.running, agentStreamState?.startedAt, effectiveActiveTab, isOpen, latestMemoryChange, onTabChange, setIsOpen, setMemoryNavigationRequest, setWorkspaceComponentTabs, workspaceSlug])
 
   const handleClosePreviewTab = React.useCallback((previewId: string) => {
+    const closingFile = previewFiles.find((file) => getPreviewFileId(file) === previewId)
+    // 关闭代表结束这次预览生命周期；下次打开必须重新读盘，不能回落到旧 v0 缓存。
+    if (closingFile?.previewOnly) clearPreviewContentCacheForFile(sessionId, closingFile.filePath)
     const remaining = previewFiles.filter((file) => getPreviewFileId(file) !== previewId)
     setPreviewFilesMap((previous) => {
       const next = new Map(previous)
@@ -975,18 +1010,15 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     }
   }, [activeTab, returnToPreviousTabAfterClose, sessionId, setSideTemporaryAgentMap])
 
-  const handleCloseDelegationTab = React.useCallback((childSessionId: string) => {
+  const handleCloseDelegationTab = React.useCallback(() => {
     setSideDelegationMap((prev) => {
-      const openChildIds = prev.get(sessionId) ?? []
-      const remaining = openChildIds.filter((id) => id !== childSessionId)
-      if (remaining.length === openChildIds.length) return prev
+      if (!prev.has(sessionId)) return prev
       const next = new Map(prev)
-      if (remaining.length > 0) next.set(sessionId, remaining)
-      else next.delete(sessionId)
+      next.delete(sessionId)
       return next
     })
-    if (getDelegationSessionIdFromSidePanelTab(activeTab) === childSessionId) {
-      returnToPreviousTabAfterClose(getDelegationSidePanelTab(childSessionId))
+    if (activeTab === 'delegation') {
+      returnToPreviousTabAfterClose(getDelegationSidePanelTab())
     }
   }, [activeTab, returnToPreviousTabAfterClose, sessionId, setSideDelegationMap])
 
@@ -1011,24 +1043,21 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
 
   // 子 Agent 被从左侧删除后，同样移除右侧的悬空观察 Tab；不改变左侧树的现有渲染与排序。
   React.useEffect(() => {
+    if (!sideDelegationSessionId) return
     const validChildIds = new Set(sessions
       .filter((item) => item.parentSessionId === sessionId && !!item.sourceDelegationId)
       .map((item) => item.id))
-    const remaining = sideDelegationSessionIds.filter((id) => validChildIds.has(id))
-    if (remaining.length === sideDelegationSessionIds.length) return
+    if (validChildIds.has(sideDelegationSessionId)) return
     setSideDelegationMap((prev) => {
-      const current = prev.get(sessionId) ?? []
-      const nextRemaining = current.filter((id) => validChildIds.has(id))
-      if (nextRemaining.length === current.length) return prev
+      if (prev.get(sessionId) !== sideDelegationSessionId) return prev
       const next = new Map(prev)
-      if (nextRemaining.length > 0) next.set(sessionId, nextRemaining)
-      else next.delete(sessionId)
+      next.delete(sessionId)
       return next
     })
-    if (activeDelegationSessionId && !validChildIds.has(activeDelegationSessionId)) {
-      returnToPreviousTabAfterClose(getDelegationSidePanelTab(activeDelegationSessionId))
+    if (activeTab === 'delegation') {
+      returnToPreviousTabAfterClose(getDelegationSidePanelTab())
     }
-  }, [activeDelegationSessionId, returnToPreviousTabAfterClose, sessionId, sessions, setSideDelegationMap, sideDelegationSessionIds])
+  }, [activeTab, returnToPreviousTabAfterClose, sessionId, sessions, setSideDelegationMap, sideDelegationSessionId])
 
   // 浏览器状态由 MainArea 的全局订阅同步到 atom；右侧工作区只负责呈现和显式打开。
   // 这样切换文件/改动时 BrowserSlot 会正确隐藏原生 WebContentsView，而不会销毁网页会话。
@@ -1114,12 +1143,20 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     })()
   }, [publishBrowserState, sessionId])
 
+  const markDelegationSessionViewed = React.useCallback((childSessionId: string) => {
+    setUnviewedDelegatedCompleted((prev) => markSessionCompletionViewed(prev, childSessionId))
+  }, [setUnviewedDelegatedCompleted])
+
+  const handleCloseSidePanel = React.useCallback(() => {
+    // Closing the whole right workspace hides every auxiliary conversation.
+    rememberStopGenerationTarget({ kind: 'agent', sessionId })
+    setIsOpen(false)
+  }, [sessionId, setIsOpen])
+
   const handleWorkspaceTabChange = React.useCallback((tab: AgentSidePanelTab) => {
-    // 点击会话类右侧 Tab 本身即代表用户将停止目标切换到其可见会话；
-    // 否则父会话的旧交互记录会抢在当前右侧会话之前被快捷键使用。
-    const delegatedSessionId = getDelegationSessionIdFromSidePanelTab(tab)
-    if (delegatedSessionId && sideDelegationSessionIds.includes(delegatedSessionId)) {
-      rememberStopGenerationTarget({ kind: 'agent', sessionId: delegatedSessionId })
+    if (tab === 'delegation' && sideDelegationSessionId) {
+      rememberStopGenerationTarget({ kind: 'agent', sessionId: sideDelegationSessionId })
+      markDelegationSessionViewed(sideDelegationSessionId)
     } else {
       const explorationSessionId = getExplorationSessionIdFromSidePanelTab(tab)
       if (explorationSessionId && sideTemporaryAgents.some((branch) => branch.sessionId === explorationSessionId)) {
@@ -1149,7 +1186,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     if (queue.sessionId !== sessionId) return
     queue.desiredTabId = browserTabId
     flushBrowserTabSelection()
-  }, [flushBrowserTabSelection, onTabChange, previewFiles, sessionId, setPreviewFileMap, sideChatConversationId, sideDelegationSessionIds, sideTemporaryAgents, split, updateSplit])
+  }, [flushBrowserTabSelection, markDelegationSessionViewed, onTabChange, previewFiles, sessionId, setPreviewFileMap, sideChatConversationId, sideDelegationSessionId, sideTemporaryAgents, split, updateSplit])
 
   // Agent/浏览器等外部事件仍只更新兼容 activeTab；分屏时把新目标落到当前焦点 Pane。
   React.useEffect(() => {
@@ -1278,17 +1315,13 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
       icon: <Split className="size-3.5" />,
       closable: true,
     })),
-    ...sideDelegationSessionIds.flatMap((childSessionId) => {
-      const child = sessions.find((item) => (
-        item.id === childSessionId && item.parentSessionId === sessionId && !!item.sourceDelegationId
-      ))
-      return child ? [{
-        id: getDelegationSidePanelTab(child.id),
-        label: getDelegationTabLabel(child.title),
-        icon: <GitBranch className="size-3.5" />,
-        closable: true,
-      }] : []
-    }),
+    ...(selectedDelegationSession && selectedDelegationStatus ? [{
+      id: getDelegationSidePanelTab(),
+      label: getDelegationTabLabel(selectedDelegationSession.title),
+      icon: <GitBranch className={cn('size-3.5', getDelegationStatusIconClass(selectedDelegationStatus))} />,
+      status: selectedDelegationStatus,
+      closable: true,
+    }] : []),
     ...(browserState?.tabs.map((tab) => ({
       id: getBrowserSidePanelTab(tab.tabId),
       label: tab.title || '新建标签页',
@@ -1297,7 +1330,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
       closable: true,
       activity: showBrowserActivity && activeBrowserTabId !== tab.tabId && browserState.activeTabId === tab.tabId,
     })) ?? []),
-  ], [activeBrowserTabId, browserState, previewFiles, sessions, sessionId, showBrowserActivity, sideChatConversationId, sideDelegationSessionIds, sideTemporaryAgents, terminalTabs, workspaceComponentTabs])
+  ], [activeBrowserTabId, browserState, previewFiles, selectedDelegationSession, selectedDelegationStatus, sessions, showBrowserActivity, sideChatConversationId, sideTemporaryAgents, terminalTabs, workspaceComponentTabs])
   workspaceTabsRef.current = workspaceTabs
 
   React.useEffect(() => {
@@ -1345,8 +1378,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     if (tab === 'chat') { handleCloseChatTab(); return }
     const explorationSessionId = getExplorationSessionIdFromSidePanelTab(tab)
     if (explorationSessionId) { handleCloseExplorationTab(explorationSessionId); return }
-    const delegationSessionId = getDelegationSessionIdFromSidePanelTab(tab)
-    if (delegationSessionId) { handleCloseDelegationTab(delegationSessionId); return }
+    if (tab === 'delegation') { handleCloseDelegationTab(); return }
     const browserTabId = getBrowserTabIdFromSidePanelTab(tab)
     if (browserTabId) void handleCloseBrowserTab(browserTabId)
   }, [exitSplitInsteadOfClosingBoundTab, handleCloseBrowserTab, handleCloseChatTab, handleCloseDelegationTab, handleCloseExplorationTab, handleClosePreviewTab, returnToPreviousTabAfterClose, sessionId, setTerminalTabsMap, setWorkspaceComponentTabs])
@@ -1521,7 +1553,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     const paneExplorationBranch = paneExplorationSessionId
       ? sideTemporaryAgents.find((branch) => branch.sessionId === paneExplorationSessionId) ?? null
       : null
-    const paneDelegationSessionId = getDelegationSessionIdFromSidePanelTab(paneTab)
+    const paneDelegationSessionId = paneTab === 'delegation' ? sideDelegationSessionId : null
     const paneDelegationSession = paneDelegationSessionId
       ? sessions.find((item) => item.id === paneDelegationSessionId && item.parentSessionId === sessionId && !!item.sourceDelegationId) ?? null
       : null
@@ -1579,7 +1611,10 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
         <AgentView sessionId={paneExplorationBranch.sessionId} embedded />
       </SideAgentSessionContent>
     ) : paneDelegationSession ? (
-      <SideAgentSessionContent contentKey={`delegation:${paneDelegationSession.id}`}>
+      <SideAgentSessionContent
+        contentKey={`delegation:${paneDelegationSession.id}`}
+        onView={() => markDelegationSessionViewed(paneDelegationSession.id)}
+      >
         <AgentView sessionId={paneDelegationSession.id} embedded />
       </SideAgentSessionContent>
     ) : paneTab === 'todos' ? (
@@ -1779,7 +1814,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
             activeTabAction={activeExplorationBranch ? (
               <ExplorationBringBackAction parentSessionId={sessionId} branch={activeExplorationBranch} sessions={sessions} />
             ) : undefined}
-            onClose={() => setIsOpen(false)}
+            onClose={handleCloseSidePanel}
           />
 
           <div ref={splitContentRef} className="relative flex min-h-0 flex-1 overflow-hidden">
@@ -1967,7 +2002,7 @@ function AttachedDirsSection({ title, scope = 'project', showSessionBadge = true
 
   // ===== 接入搜索点击触发的 reveal：附加目录文件搜到后，需要展开/选中目标 =====
   const autoReveal = useAtomValue(fileBrowserAutoRevealAtom)
-  const activeAutoReveal = isFileBrowserAutoRevealActive(autoReveal) ? autoReveal : null
+  const activeAutoReveal = autoReveal?.sessionId === sessionId && isFileBrowserAutoRevealActive(autoReveal) ? autoReveal : null
   // 找到 reveal target 命中的那个附加目录根。如果用户附加了嵌套目录（如同时附加 /a 和 /a/b），
   // 取"最深匹配"——只让真正包含该文件的最近一棵树展开，避免外层 /a 树被无谓打开。
   const revealRoot = React.useMemo(() => {
@@ -2016,7 +2051,7 @@ function AttachedDirsSection({ title, scope = 'project', showSessionBadge = true
         const isRevealRoot = dir === revealRoot
         return (
           <AttachedDirTree
-            key={dir}
+            key={getAttachedDirectoryStateKey(sessionId, scope, dir)}
             dirPath={dir}
             onDetach={() => onDetach(dir)}
             selectedPaths={selectedPaths}
@@ -2060,9 +2095,12 @@ interface AttachedDirTreeProps {
 }
 
 function AttachedDirTree({ dirPath, onDetach, selectedPaths, onSelect, refreshVersion, onAddToChat, onFilePreview, onOpenDirectoryTerminal, allowedPaths, sessionId, scope, showSessionBadge, revealTarget = null, revealTs = 0 }: AttachedDirTreeProps): React.ReactElement {
-  const [expanded, setExpanded] = React.useState(false)
-  const [children, setChildren] = React.useState<FileEntry[]>([])
-  const [loaded, setLoaded] = React.useState(false)
+  const expandedStateKey = getAttachedDirectoryStateKey(sessionId, scope, dirPath)
+  const [expanded, setExpanded] = useFileTreeExpanded(expandedStateKey, dirPath)
+  const { children, loaded, error } = useAttachedDirectoryChildren({
+    stateKey: expandedStateKey, path: dirPath, sessionId, allowedPaths,
+    expanded, isDirectory: true, refreshVersion,
+  })
 
   const dirName = dirPath.split(/[\\/]/).filter(Boolean).pop() || dirPath
 
@@ -2072,50 +2110,12 @@ function AttachedDirTree({ dirPath, onDetach, selectedPaths, onSelect, refreshVe
     [dirPath, revealTarget],
   )
 
-  // 当 refreshVersion 变化时，已展开的目录自动重新加载
+  // 定位只发出展开意图；加载完成不得覆盖此后用户的收起操作。
   React.useEffect(() => {
-    if (expanded && loaded) {
-      window.electronAPI.listAttachedDirectory(dirPath, { sessionId, candidateBasePaths: allowedPaths })
-        .then((items) => setChildren(items))
-        .catch((err) => console.error('[AttachedDirTree] 刷新失败:', err))
-    }
-  }, [refreshVersion]) // eslint-disable-line react-hooks/exhaustive-deps
+    if (revealTs !== 0 && revealTarget) setExpanded(true)
+  }, [revealTs, setExpanded]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ===== 自动定位：reveal target 命中时自动加载子项 + 展开 =====
-  React.useEffect(() => {
-    if (revealTs === 0 || !revealTarget) return
-    let cancelled = false
-    const run = async (): Promise<void> => {
-      if (!loaded) {
-        try {
-          const items = await window.electronAPI.listAttachedDirectory(dirPath, { sessionId, candidateBasePaths: allowedPaths })
-          if (!cancelled) {
-            setChildren(items)
-            setLoaded(true)
-          }
-        } catch (err) {
-          console.error('[AttachedDirTree] reveal 加载失败:', err)
-          return
-        }
-      }
-      if (!cancelled) setExpanded(true)
-    }
-    void run()
-    return () => { cancelled = true }
-  }, [revealTs]) // eslint-disable-line react-hooks/exhaustive-deps
-
-  const toggleExpand = async (): Promise<void> => {
-    if (!expanded && !loaded) {
-      try {
-        const items = await window.electronAPI.listAttachedDirectory(dirPath, { sessionId, candidateBasePaths: allowedPaths })
-        setChildren(items)
-        setLoaded(true)
-      } catch (err) {
-        console.error('[AttachedDirTree] 加载失败:', err)
-      }
-    }
-    setExpanded(!expanded)
-  }
+  const toggleExpand = (): void => { setExpanded((previous) => !previous) }
 
   // depth=0 的根行，与 FileBrowser 保持一致的布局：铺满、无外边距、可 sticky
   const { paddingLeft, guideLeft } = computeTreeRowLayout(0)
@@ -2205,16 +2205,16 @@ function AttachedDirTree({ dirPath, onDetach, selectedPaths, onSelect, refreshVe
             className="file-tree-guide pointer-events-none absolute bottom-1 top-0 w-px bg-border/70"
             style={{ left: guideLeft }}
           />
-          {children.length === 0 && loaded && (
+          {(error || (children.length === 0 && loaded)) && (
             <div
               className="text-[11px] text-muted-foreground/50 py-1"
               style={{ paddingLeft: paddingLeft + 24 }}
             >
-              空文件夹
+              {error ?? '空文件夹'}
             </div>
           )}
           {children.map((child) => (
-            <AttachedDirItem key={child.path} entry={child} depth={1} selectedPaths={selectedPaths} onSelect={onSelect} refreshVersion={refreshVersion} onAddToChat={onAddToChat} onFilePreview={onFilePreview} onOpenDirectoryTerminal={onOpenDirectoryTerminal} allowedPaths={allowedPaths} sessionId={sessionId} scope={scope} revealTarget={revealTarget} revealTs={revealTs} revealAncestors={revealAncestors} />
+            <AttachedDirItem key={child.path} expandedStateKey={expandedStateKey} entry={child} depth={1} selectedPaths={selectedPaths} onSelect={onSelect} refreshVersion={refreshVersion} onAddToChat={onAddToChat} onFilePreview={onFilePreview} onOpenDirectoryTerminal={onOpenDirectoryTerminal} allowedPaths={allowedPaths} sessionId={sessionId} scope={scope} revealTarget={revealTarget} revealTs={revealTs} revealAncestors={revealAncestors} />
           ))}
         </div>
       )}
@@ -2223,6 +2223,7 @@ function AttachedDirTree({ dirPath, onDetach, selectedPaths, onSelect, refreshVe
 }
 
 interface AttachedDirItemProps {
+  expandedStateKey: string
   entry: FileEntry
   depth: number
   selectedPaths: Set<string>
@@ -2242,10 +2243,7 @@ interface AttachedDirItemProps {
   revealAncestors?: Set<string>
 }
 
-function AttachedDirItem({ entry, depth, selectedPaths, onSelect, refreshVersion, onAddToChat, onFilePreview, onOpenDirectoryTerminal, allowedPaths, sessionId, scope, revealTarget = null, revealTs = 0, revealAncestors }: AttachedDirItemProps): React.ReactElement {
-  const [expanded, setExpanded] = React.useState(false)
-  const [children, setChildren] = React.useState<FileEntry[]>([])
-  const [loaded, setLoaded] = React.useState(false)
+function AttachedDirItem({ expandedStateKey, entry, depth, selectedPaths, onSelect, refreshVersion, onAddToChat, onFilePreview, onOpenDirectoryTerminal, allowedPaths, sessionId, scope, revealTarget = null, revealTs = 0, revealAncestors }: AttachedDirItemProps): React.ReactElement {
   // 重命名状态
   const [isRenaming, setIsRenaming] = React.useState(false)
   const [renameValue, setRenameValue] = React.useState(entry.name)
@@ -2253,75 +2251,34 @@ function AttachedDirItem({ entry, depth, selectedPaths, onSelect, refreshVersion
   // 当前显示的名称和路径（重命名后更新）
   const [currentName, setCurrentName] = React.useState(entry.name)
   const [currentPath, setCurrentPath] = React.useState(entry.path)
+  const [expanded, setExpanded, relocateExpandedPath] = useFileTreeExpanded(expandedStateKey, currentPath)
+  const { children, loaded, error } = useAttachedDirectoryChildren({
+    stateKey: expandedStateKey, path: currentPath, sessionId, allowedPaths,
+    expanded, isDirectory: entry.isDirectory, refreshVersion,
+  })
   const rowRef = React.useRef<HTMLDivElement>(null)
 
   const isSelected = selectedPaths.has(currentPath)
 
-  // 当 refreshVersion 变化时，已展开的文件夹自动重新加载子项
+  // 同一个定位脉冲只展开一次，目录加载与用户手动折叠不重放定位。
   React.useEffect(() => {
-    if (expanded && loaded && entry.isDirectory) {
-      window.electronAPI.listAttachedDirectory(currentPath, { sessionId, candidateBasePaths: allowedPaths })
-        .then((items) => setChildren(items))
-        .catch((err) => console.error('[AttachedDirItem] 刷新子目录失败:', err))
-    }
-  }, [refreshVersion]) // eslint-disable-line react-hooks/exhaustive-deps
+    if (revealTs === 0 || !revealTarget || !entry.isDirectory) return
+    if (revealAncestors?.has(currentPath) || currentPath === revealTarget) setExpanded(true)
+  }, [revealTs, currentPath, setExpanded]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ===== 自动定位：祖先目录自动展开 + 目标行滚动到中心 =====
+  const scrolledRevealTsRef = React.useRef(0)
   React.useEffect(() => {
-    if (revealTs === 0 || !revealTarget) return
+    if (revealTs === 0 || currentPath !== revealTarget || scrolledRevealTsRef.current === revealTs) return
+    if (entry.isDirectory && (!expanded || !loaded)) return
+    const frame = requestAnimationFrame(() => {
+      rowRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      scrolledRevealTsRef.current = revealTs
+    })
+    return () => { cancelAnimationFrame(frame) }
+  }, [revealTs, revealTarget, currentPath, entry.isDirectory, expanded, loaded])
 
-    const isAncestor = !!revealAncestors && revealAncestors.has(currentPath)
-    const isTarget = currentPath === revealTarget
-
-    const scrollToTarget = (): void => {
-      requestAnimationFrame(() => {
-        rowRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
-      })
-    }
-
-    // 自身需要展开：祖先目录 OR 目标本身就是目录
-    const willExpand = entry.isDirectory && (isAncestor || isTarget) && !expanded
-    if (willExpand) {
-      let cancelled = false
-      const run = async (): Promise<void> => {
-        if (!loaded) {
-          try {
-            const items = await window.electronAPI.listAttachedDirectory(currentPath, { sessionId, candidateBasePaths: allowedPaths })
-            if (!cancelled) {
-              setChildren(items)
-              setLoaded(true)
-            }
-          } catch (err) {
-            console.error('[AttachedDirItem] reveal 加载子目录失败:', err)
-            return
-          }
-        }
-        if (cancelled) return
-        setExpanded(true)
-        // 目标自身就是这个目录时，等展开成功后再滚动，避免子项渲染改变行高使
-        // smooth scroll 偏离；加载失败路径自然跳过滚动。
-        if (isTarget) scrollToTarget()
-      }
-      void run()
-      return () => { cancelled = true }
-    }
-
-    // 目标行：滚动到可视区中心（不打 flash，直接靠选中态高亮）
-    if (isTarget) scrollToTarget()
-  }, [revealTs]) // eslint-disable-line react-hooks/exhaustive-deps
-
-  const toggleDir = async (): Promise<void> => {
-    if (!entry.isDirectory) return
-    if (!expanded && !loaded) {
-      try {
-        const items = await window.electronAPI.listAttachedDirectory(currentPath, { sessionId, candidateBasePaths: allowedPaths })
-        setChildren(items)
-        setLoaded(true)
-      } catch (err) {
-        console.error('[AttachedDirItem] 加载子目录失败:', err)
-      }
-    }
-    setExpanded(!expanded)
+  const toggleDir = (): void => {
+    if (entry.isDirectory) setExpanded((previous) => !previous)
   }
 
   const handleClick = (e: React.MouseEvent): void => {
@@ -2355,6 +2312,8 @@ function AttachedDirItem({ entry, depth, selectedPaths, onSelect, refreshVersion
       // 更新本地显示
       const parentDir = getPathDirname(currentPath)
       const newPath = joinPath(parentDir, newName)
+      // 先迁移展开记录，再切换路径；子目录由新 identity 重新加载。
+      if (entry.isDirectory) relocateExpandedPath(newPath)
       // 更新选中状态中的路径
       onSelect(newPath, false)
       setCurrentName(newName)
@@ -2379,6 +2338,7 @@ function AttachedDirItem({ entry, depth, selectedPaths, onSelect, refreshVersion
       await window.electronAPI.moveAttachedFile(currentPath, result.path, { sessionId, candidateBasePaths: allowedPaths })
       // 移动后更新路径
       const newPath = joinPath(result.path, currentName)
+      if (entry.isDirectory) relocateExpandedPath(newPath)
       setCurrentPath(newPath)
     } catch (err) {
       console.error('[AttachedDirItem] 移动失败:', err)
@@ -2570,16 +2530,16 @@ function AttachedDirItem({ entry, depth, selectedPaths, onSelect, refreshVersion
             className="file-tree-guide pointer-events-none absolute bottom-1 top-0 w-px bg-border/70"
             style={{ left: guideLeft }}
           />
-          {children.length === 0 && loaded && (
+          {(error || (children.length === 0 && loaded)) && (
             <div
               className="text-[11px] text-muted-foreground/50 py-1"
               style={{ paddingLeft: paddingLeft + 24 }}
             >
-              空文件夹
+              {error ?? '空文件夹'}
             </div>
           )}
           {children.map((child) => (
-            <AttachedDirItem key={child.path} entry={child} depth={depth + 1} selectedPaths={selectedPaths} onSelect={onSelect} refreshVersion={refreshVersion} onAddToChat={onAddToChat} onFilePreview={onFilePreview} onOpenDirectoryTerminal={onOpenDirectoryTerminal} allowedPaths={allowedPaths} sessionId={sessionId} scope={scope} revealTarget={revealTarget} revealTs={revealTs} revealAncestors={revealAncestors} />
+            <AttachedDirItem key={child.path} expandedStateKey={expandedStateKey} entry={child} depth={depth + 1} selectedPaths={selectedPaths} onSelect={onSelect} refreshVersion={refreshVersion} onAddToChat={onAddToChat} onFilePreview={onFilePreview} onOpenDirectoryTerminal={onOpenDirectoryTerminal} allowedPaths={allowedPaths} sessionId={sessionId} scope={scope} revealTarget={revealTarget} revealTs={revealTs} revealAncestors={revealAncestors} />
           ))}
         </div>
       )}

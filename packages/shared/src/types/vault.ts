@@ -8,6 +8,8 @@ export interface VaultConfig {
 
 /** Renderer-safe summary. The selected root path stays in the main process. */
 export interface VaultSummary {
+  /** Stable opaque identity for scoping renderer-local state to this Vault. */
+  vaultId: string
   displayName: string
   inboxPath: string
   allowAgentWrites: boolean
@@ -22,11 +24,22 @@ export interface VaultCandidate {
 }
 
 export interface VaultFileEntry {
+  kind: 'file'
   relativePath: string
   name: string
   size: number
   modifiedAt: number
 }
+
+/** A visible non-hidden directory within the authorized Vault root. */
+export interface VaultFolderEntry {
+  kind: 'folder'
+  relativePath: string
+  name: string
+}
+
+/** Entries used to build the Vault sidebar tree. */
+export type VaultTreeEntry = VaultFileEntry | VaultFolderEntry
 
 /** A user-selected location in a Vault. Paths are always relative to its authorized root. */
 export interface VaultFocus {

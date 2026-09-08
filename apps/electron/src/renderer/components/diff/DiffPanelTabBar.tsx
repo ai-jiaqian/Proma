@@ -25,8 +25,9 @@ import {
   ContextMenuTrigger,
 } from '@/components/ui/context-menu'
 import { agentDiffUnseenChangesAtom, currentAgentSessionIdAtom } from '@/atoms/agent-atoms'
-import type { AgentSidePanelTab, WorkspaceComponentTab } from '@/atoms/agent-atoms'
+import type { AgentSidePanelTab, SessionIndicatorStatus, WorkspaceComponentTab } from '@/atoms/agent-atoms'
 import { groupRightWorkspaceTabs, type RightWorkspacePane } from '@/lib/right-workspace-split'
+import { getDelegationStatusIconClass } from '@/lib/agent-session-list'
 import type { ProductivityToolsSettings } from '@/types/settings'
 
 export interface RightWorkspaceTabDragState {
@@ -41,6 +42,7 @@ export interface WorkspacePanelTab {
   icon: React.ReactNode
   closable?: boolean
   activity?: boolean
+  status?: SessionIndicatorStatus
 }
 
 interface DiffPanelTabBarProps {
@@ -168,6 +170,20 @@ export function DiffPanelTabBar({
     tabList.addEventListener('scroll', syncScrollbarThumb, { passive: true })
     return () => tabList.removeEventListener('scroll', syncScrollbarThumb)
   }, [syncScrollbarThumb])
+
+  // 右侧 Tab 栏只有横向溢出；让普通滚轮与 Shift + 滚轮都直接横向浏览标签。
+  React.useEffect(() => {
+    const tabList = tabListRef.current
+    if (!tabList) return
+
+    const handleWheel = (event: WheelEvent): void => {
+      event.preventDefault()
+      tabList.scrollLeft += event.deltaY || event.deltaX
+    }
+
+    tabList.addEventListener('wheel', handleWheel, { passive: false })
+    return () => tabList.removeEventListener('wheel', handleWheel)
+  }, [])
 
   const handleScrollbarThumbPointerDown = React.useCallback((event: React.PointerEvent<HTMLDivElement>) => {
     const tabList = tabListRef.current
@@ -342,7 +358,12 @@ export function DiffPanelTabBar({
                   {tab.activity || (isChangesTab && unseenChanges && !selected) ? (
                     <span className="size-1.5 shrink-0 rounded-full bg-primary" aria-label="有未查看更新" />
                   ) : (
-                    <span className={cn('shrink-0', selected ? 'text-foreground' : 'text-muted-foreground/80')}>{tab.icon}</span>
+                    <span className={cn(
+                      'shrink-0',
+                      tab.status
+                        ? getDelegationStatusIconClass(tab.status)
+                        : selected ? 'text-foreground' : 'text-muted-foreground/80',
+                    )}>{tab.icon}</span>
                   )}
                   <span className="truncate">{tab.label}</span>
                 </button>

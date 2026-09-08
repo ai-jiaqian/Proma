@@ -7,7 +7,8 @@
 
 import { atom } from 'jotai'
 import type { Getter } from 'jotai'
-import { atomFamily, atomWithStorage, selectAtom } from 'jotai/utils'
+import { atomWithStorage, selectAtom } from 'jotai/utils'
+import { atomFamily } from 'jotai-family'
 import type { AgentSessionMeta, AgentEvent, AgentWorkspace, AgentPendingFile, RetryAttempt, PromaPermissionMode, PermissionRequest, AskUserRequest, ExitPlanModeRequest, ThinkingConfig, AgentEffort, SDKMessage, UnstagedChangesResult } from '@proma/shared'
 import { PROMA_DEFAULT_PERMISSION_MODE } from '@proma/shared'
 import { calculateDockBadgeCount, countPendingRequests } from '@/lib/dock-badge-count'
@@ -115,6 +116,8 @@ export interface AgentStreamState {
   compactInFlight?: boolean
   /** 流式开始时间戳（用于思考计时持久化） */
   startedAt?: number
+  /** 主进程按 session 单调递增的 run 代际；避免 startedAt 同毫秒碰撞。 */
+  runGeneration?: number
   /** 重试状态 */
   retrying?: AgentRetryState
 }
@@ -628,6 +631,43 @@ export function updateFileBrowserExpandedPath(
   return next
 }
 
+/**
+ * 目录重命名/移动成功后，迁移当前文件树中该目录及后代的显式展开/折叠记录。
+ * 路径按目录边界匹配，不影响同名前缀的兄弟目录或其他文件树；清除目标位置
+ * 可能残留的旧记录，避免新搬来的目录继承之前同名目录的展开状态。
+ */
+export function relocateFileBrowserExpandedPath(
+  state: Map<string, Map<string, boolean>>,
+  stateKey: string,
+  oldPath: string,
+  newPath: string,
+): Map<string, Map<string, boolean>> {
+  const current = state.get(stateKey)
+  if (!current || oldPath === newPath) return state
+
+  const isWithin = (path: string, parent: string): boolean => {
+    // FileEntry 使用绝对路径；仅 Windows 盘符/UNC 路径把反斜杠视为分隔符。
+    // POSIX 文件名可以包含反斜杠，不能误迁移 a\\sibling 这样的兄弟目录。
+    const isWindowsPath = /^[a-z]:[/\\]/i.test(parent) || parent.startsWith('\\\\')
+    return path === parent || path.startsWith(parent + '/') || (isWindowsPath && path.startsWith(parent + '\\'))
+  }
+  const nextPaths = new Map(current)
+  let changed = false
+  for (const path of current.keys()) {
+    if (isWithin(path, oldPath) || isWithin(path, newPath)) {
+      nextPaths.delete(path)
+      changed = true
+    }
+  }
+  if (!changed) return state
+  for (const [path, expanded] of current) {
+    if (isWithin(path, oldPath)) nextPaths.set(newPath + path.slice(oldPath.length), expanded)
+  }
+  const next = new Map(state)
+  next.set(stateKey, nextPaths)
+  return next
+}
+
 /** Files Tab 各滚动视图的 scrollTop，按会话和文件视图隔离。 */
 export const fileBrowserScrollTopMapAtom = atom<Map<string, number>>(new Map())
 
@@ -669,9 +709,9 @@ export function getDelegationTabLabel(title: string | null | undefined): string 
   return title?.trim() || '委派任务'
 }
 
-export type AgentSidePanelBaseTab = 'files' | 'changes' | 'chat' | 'temporary-agent' | WorkspaceComponentTab
+export type AgentSidePanelBaseTab = 'files' | 'changes' | 'chat' | 'temporary-agent' | 'delegation' | WorkspaceComponentTab
 /** 工作区组件、每个 Pi 探索分支、协作子 Agent、浏览器网页和文件预览都处于右侧工作区顶栏。 */
-export type AgentSidePanelTab = AgentSidePanelBaseTab | `exploration:${string}` | `delegation:${string}` | `browser:${string}` | `preview:${string}` | `terminal:${string}`
+export type AgentSidePanelTab = AgentSidePanelBaseTab | `exploration:${string}` | `browser:${string}` | `preview:${string}` | `terminal:${string}`
 
 /** 用户主动进入这些项目级能力时，Agent 后续的改动提示不得抢走当前视图。 */
 export function isUserPriorityWorkspaceComponentTab(
@@ -700,19 +740,11 @@ export function getExplorationSidePanelTab(branchSessionId: string): AgentSidePa
   return `exploration:${branchSessionId}`
 }
 
-/** 已在右侧打开的协作子 Agent：key 为父会话 ID，value 为子会话 ID 列表。 */
-export const agentSideDelegationMapAtom = atom<Map<string, string[]>>(new Map())
+/** 右侧当前观察的协作子 Agent：key 为父会话 ID，value 为唯一子会话 ID。 */
+export const agentSideDelegationMapAtom = atom<Map<string, string>>(new Map())
 
-export function getDelegationSidePanelTab(childSessionId: string): AgentSidePanelTab {
-  return `delegation:${childSessionId}`
-}
-
-export function getDelegationSessionIdFromSidePanelTab(tab: AgentSidePanelTab | 'delegation'): string | null {
-  return tab.startsWith('delegation:') ? tab.slice('delegation:'.length) : null
-}
-
-export function isDelegationSidePanelTab(tab: AgentSidePanelTab | 'delegation'): tab is `delegation:${string}` {
-  return tab.startsWith('delegation:')
+export function getDelegationSidePanelTab(): AgentSidePanelTab {
+  return 'delegation'
 }
 
 export function getExplorationSessionIdFromSidePanelTab(tab: AgentSidePanelTab | 'exploration'): string | null {
@@ -1115,11 +1147,21 @@ export const agentRunningSessionIdsAtom = atom<Set<string>>((get) => {
 /** 侧边栏会话指示点状态 */
 export type SessionIndicatorStatus = 'idle' | 'running' | 'blocked' | 'completed'
 
-/** 已完成但用户尚未查看的会话 ID 集合 */
+/** 已完成但用户尚未查看的顶层会话 ID 集合。参与 Dock/Launcher 角标。 */
 export const unviewedCompletedSessionIdsAtom = atom<Set<string>>(new Set<string>())
+
+/** 刚完成但用户尚未查看的协作子会话 ID 集合。仅驱动父子会话状态颜色。 */
+export const unviewedCompletedDelegatedSessionIdsAtom = atom<Set<string>>(new Set<string>())
 
 let lastIndicatorSignature = ''
 let lastIndicatorMap = new Map<string, SessionIndicatorStatus>()
+
+/** Delegated child IDs only recompute when the session list changes, not on streaming hot paths. */
+const delegatedAgentSessionIdsAtom = atom<Set<string>>((get) => new Set(
+  get(agentSessionsAtom)
+    .filter((session) => !!session.sourceDelegationId)
+    .map((session) => session.id),
+))
 
 function getStableIndicatorMap(entries: Array<[string, SessionIndicatorStatus]>): Map<string, SessionIndicatorStatus> {
   entries.sort(([a], [b]) => a.localeCompare(b))
@@ -1146,10 +1188,12 @@ export const dockBadgeCountAtom = atom<number>((get) => {
  */
 export const agentSessionIndicatorMapAtom = atom<Map<string, SessionIndicatorStatus>>((get) => {
   const streamStates = get(agentStreamingStatesAtom)
+  const delegatedSessionIds = get(delegatedAgentSessionIdsAtom)
   const pendingPerms = get(allPendingPermissionRequestsAtom)
   const pendingAskUser = get(allPendingAskUserRequestsAtom)
   const pendingExitPlan = get(allPendingExitPlanRequestsAtom)
   const unviewedCompleted = get(unviewedCompletedSessionIdsAtom)
+  const unviewedDelegatedCompleted = get(unviewedCompletedDelegatedSessionIdsAtom)
 
   const map = new Map<string, SessionIndicatorStatus>()
 
@@ -1163,8 +1207,10 @@ export const agentSessionIndicatorMapAtom = atom<Map<string, SessionIndicatorSta
     } else if (
       state.contextCompaction?.status === 'running'
       && state.contextCompaction.afterCompletedTurn === true
+      && !delegatedSessionIds.has(id)
     ) {
-      // 主任务已经交付，后续仅在整理上下文时应呈现为可验收的完成态。
+      // 顶层主任务已经交付，后续仅在整理上下文时可呈现为完成态。
+      // 委派 child 的绿色严格保留给“成功完成且未查看”，不能由 compaction 绕过。
       map.set(id, 'completed')
     } else {
       map.set(id, 'running')
@@ -1172,6 +1218,11 @@ export const agentSessionIndicatorMapAtom = atom<Map<string, SessionIndicatorSta
   }
 
   for (const id of unviewedCompleted) {
+    if (!map.has(id)) {
+      map.set(id, 'completed')
+    }
+  }
+  for (const id of unviewedDelegatedCompleted) {
     if (!map.has(id)) {
       map.set(id, 'completed')
     }

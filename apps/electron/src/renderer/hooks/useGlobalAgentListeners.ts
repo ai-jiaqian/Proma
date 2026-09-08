@@ -44,6 +44,7 @@ import {
   workspaceAttachedDirectoriesMapAtom,
   workspaceAttachedFilesMapAtom,
   unviewedCompletedSessionIdsAtom,
+  unviewedCompletedDelegatedSessionIdsAtom,
   agentSessionPathMapAtom,
   agentDiffRefreshVersionAtom,
   agentDiffPanelTabAtom,
@@ -53,6 +54,7 @@ import {
   agentSidePanelOpenAtomFamily,
   revealChangedWorkspaceComponentAtom,
   agentSideDelegationMapAtom,
+  agentSidePanelSplitMapAtom,
   getDelegationSidePanelTab,
   askUserDraftsAtom,
 } from '@/atoms/agent-atoms'
@@ -78,26 +80,36 @@ import {
 } from '@/atoms/preview-atoms'
 import type { NotificationSoundType } from '@/types/settings'
 import { toast } from 'sonner'
-import type { AgentStreamEvent, AgentStreamCompletePayload, AgentEvent, AgentStreamPayload, AgentAssistantDelta, AgentAssistantDeltaPayload, SDKAssistantMessage, SDKMessage, SDKUserMessage, SDKSystemMessage, PromaEvent, AgentSessionMeta, ProviderType, SDKContentBlock, SDKUserContentBlock } from '@proma/shared'
+import type { AgentStreamEvent, AgentStreamCompletePayload, AgentEvent, AgentStreamPayload, AgentAssistantDelta, AgentAssistantDeltaPayload, AgentStreamErrorPayload, SDKAssistantMessage, SDKMessage, SDKUserMessage, SDKSystemMessage, PromaEvent, AgentSessionMeta, ProviderType, SDKContentBlock, SDKUserContentBlock } from '@proma/shared'
 import { inferContextWindow } from '@proma/shared'
 import {
   buildExternalAgentRunActivation,
   shouldActivateExternalAgentRun,
   shouldRevealDelegatedSession,
 } from '@/lib/external-agent-run'
-import { upsertAgentSession, mergeFetchedAgentSessions } from '@/lib/agent-session-list'
+import { upsertAgentSession, mergeFetchedAgentSessions, selectDelegatedSession } from '@/lib/agent-session-list'
 import {
   getAgentCompletionMarkers,
+  getDelegatedCompletionAttention,
+  markSessionCompletionUnviewed,
+  markSessionCompletionViewed,
   notifyAgentCompletion,
 } from '@/lib/agent-completion-presence'
 import { getPlanModeChangeFromToolName, updatePlanModeSessionSet } from '@/lib/agent-plan-mode'
 import { detectIsWindows } from '@/lib/platform'
-import { getSessionFileChangeKind, getOwnedSessionWatcherPaths, upsertSessionFileChange } from '@/lib/session-file-changes'
+import { arePathsEqual, getInactiveSessionFileChangePaths, getSessionFileChangeKind, getOwnedSessionWatcherPaths, removeSessionFileChange, upsertSessionFileChange, type SessionFileChange } from '@/lib/session-file-changes'
+import { rememberStopGenerationTarget } from '@/lib/stop-generation-target'
 import { doesWorkspaceChangeAffectPreview } from '@/components/diff/preview-open-path'
-import { removeQueuedMessage, createQueuedAgentStreamState } from '@/lib/agent-message-queue'
+import { openPreviewInStore } from '@/components/diff/preview-opener'
+import { removeQueuedMessage, createQueuedAgentStreamState, createAgentQueuedMessage } from '@/lib/agent-message-queue'
 import { createAgentStreamEventBatcher } from '@/lib/agent-stream-event-batcher'
 import { getChangedWorkspaceComponentFromSdkMessage, shouldRevealChangedWorkspaceComponentImmediately } from '@/lib/agent-component-activation'
-import { mergeActiveAgentSessionSnapshot } from '@/lib/agent-active-session-snapshot'
+import {
+  isSameOrNewerRun,
+  isTerminalEventForCurrentRun,
+  mergeActiveAgentSessionSnapshot,
+  type AgentRunMarker,
+} from '@/lib/agent-active-session-snapshot'
 
 /** 触发右侧文件浏览器自动定位的写入类工具集合 */
 const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Update'])
@@ -571,6 +583,20 @@ export function useGlobalAgentListeners(): void {
   const store = useStore()
 
   useEffect(() => {
+    const clearCompletionAttention = (sessionId: string): void => {
+      store.set(unviewedCompletedSessionIdsAtom, (prev) => markSessionCompletionViewed(prev, sessionId))
+      store.set(unviewedCompletedDelegatedSessionIdsAtom, (prev) => markSessionCompletionViewed(prev, sessionId))
+    }
+
+    /** 新一轮启动时立即把 delegated child 提升到所属父会话的子列表首位。 */
+    const promoteDelegatedSessionForRunStart = (sessionId: string, startedAt: number): void => {
+      store.set(agentSessionsAtom, (prev) => {
+        const session = prev.find((item) => item.id === sessionId)
+        if (!session?.parentSessionId || !session.sourceDelegationId || session.updatedAt > startedAt) return prev
+        return upsertAgentSession(prev, { ...session, updatedAt: startedAt })
+      })
+    }
+
     /** 正在执行的写工具；写入前的文件存在性用于区分新建和编辑。 */
     const pendingWriteTools = new Map<string, {
       path: string
@@ -587,14 +613,25 @@ export function useGlobalAgentListeners(): void {
         // 主进程在启动 deferred run 前先发送 started 投影。这里必须先建立完整的
         // 当前 run 状态，否则首个 SDK/tool 事件到达前会被当成空闲；后续事件只能
         // 隐式创建一个没有 startedAt 的状态，导致续跑的运行计时和 run 边界丢失。
+        let acceptedRunStart = false
         store.set(agentStreamingStatesAtom, (prev) => {
           const current = prev.get(status.sessionId)
-          // 不让迟到的队列状态覆盖已经开始的新一轮 run。
-          if (current?.startedAt != null && current.startedAt > status.startedAt) return prev
+          if (
+            current?.runGeneration != null
+            && status.runGeneration != null
+            && current.runGeneration >= status.runGeneration
+          ) return prev
+          // 旧 IPC 事件降级为 startedAt 比较；不让迟到或重复队列状态覆盖当前 run。
+          if (status.runGeneration == null && current?.startedAt != null && current.startedAt >= status.startedAt) return prev
           const map = new Map(prev)
-          map.set(status.sessionId, createQueuedAgentStreamState(current, status.startedAt))
+          map.set(status.sessionId, {
+            ...createQueuedAgentStreamState(current, status.startedAt),
+            ...(status.runGeneration != null ? { runGeneration: status.runGeneration } : {}),
+          })
+          acceptedRunStart = true
           return map
         })
+        if (acceptedRunStart) promoteDelegatedSessionForRunStart(status.sessionId, status.startedAt)
         store.set(agentSessionMessageQueueAtom, (prev) => {
           const current = prev.get(status.sessionId) ?? []
           const next = removeQueuedMessage(current, status.messageId)
@@ -653,7 +690,7 @@ export function useGlobalAgentListeners(): void {
     const activateExternalAgentRun = (event: Extract<PromaEvent, { type: 'external_run_started' }>): void => {
       const applyActivation = (sessions: AgentSessionMeta[]): void => {
         const currentStreamState = store.get(agentStreamingStatesAtom).get(event.sessionId)
-        if (!shouldActivateExternalAgentRun(currentStreamState, event.startedAt)) {
+        if (!shouldActivateExternalAgentRun(currentStreamState, event.startedAt, event.runGeneration)) {
           return
         }
 
@@ -667,6 +704,7 @@ export function useGlobalAgentListeners(): void {
           workspaceId: event.workspaceId,
           modelId: event.modelId,
           startedAt: event.startedAt,
+          runGeneration: event.runGeneration,
           currentStreamState,
         })
 
@@ -692,7 +730,16 @@ export function useGlobalAgentListeners(): void {
           createdAt: event.startedAt,
           updatedAt: event.startedAt,
         }
-        store.set(agentSessionsAtom, (prev) => upsertAgentSession(prev, upserted))
+        const duplicateRunStart = currentStreamState?.runGeneration != null && event.runGeneration != null
+          ? currentStreamState.runGeneration === event.runGeneration
+          : currentStreamState?.startedAt === event.startedAt
+        const knownSession = store.get(agentSessionsAtom).some((item) => item.id === event.sessionId)
+        if (!duplicateRunStart || !knownSession) {
+          store.set(agentSessionsAtom, (prev) => upsertAgentSession(prev, knownSession
+            ? upserted
+            : { ...upserted, updatedAt: Math.max(upserted.updatedAt, event.startedAt) }))
+        }
+        if (!duplicateRunStart) promoteDelegatedSessionForRunStart(event.sessionId, event.startedAt)
         const activationModelId = activation.modelId
         if (activationModelId) {
           store.set(agentSessionModelMapAtom, (prev) => {
@@ -701,12 +748,7 @@ export function useGlobalAgentListeners(): void {
             return map
           })
         }
-        store.set(unviewedCompletedSessionIdsAtom, (prev) => {
-          if (!prev.has(event.sessionId)) return prev
-          const next = new Set(prev)
-          next.delete(event.sessionId)
-          return next
-        })
+        clearCompletionAttention(event.sessionId)
         store.set(agentStreamingStatesAtom, (prev) => {
           const map = new Map(prev)
           map.set(event.sessionId, activation.streamState)
@@ -720,19 +762,18 @@ export function useGlobalAgentListeners(): void {
           && upserted.parentSessionId
           && shouldRevealDelegatedSession(upserted.parentSessionId, store.get(activeSessionIdAtom))
         ) {
-          store.set(agentSideDelegationMapAtom, (previous) => {
-            const openChildIds = previous.get(upserted.parentSessionId!) ?? []
-            if (openChildIds.includes(upserted.id)) return previous
-            const next = new Map(previous)
-            next.set(upserted.parentSessionId!, [...openChildIds, upserted.id])
-            return next
-          })
+          store.set(agentSideDelegationMapAtom, (previous) => (
+            selectDelegatedSession(previous, upserted.parentSessionId!, upserted.id)
+          ))
           store.set(agentSidePanelOpenAtomFamily(upserted.parentSessionId), true)
           store.set(agentDiffPanelTabAtom, (previous) => {
             const next = new Map(previous)
-            next.set(upserted.parentSessionId!, getDelegationSidePanelTab(upserted.id))
+            next.set(upserted.parentSessionId!, getDelegationSidePanelTab())
             return next
           })
+          // The UI has actively replaced the right observation slot with this child. Keep the
+          // global stop shortcut aligned even though no AgentView pointer event has fired yet.
+          rememberStopGenerationTarget({ kind: 'agent', sessionId: upserted.id })
         }
       }
 
@@ -866,7 +907,8 @@ export function useGlobalAgentListeners(): void {
     const isWindows = detectIsWindows()
     // 初始化快照与 STREAM_COMPLETE 可跨 IPC channel 乱序抵达。完成处理回收
     // startedAt 后仍需保留一个短生命周期的终态标记，避免迟到快照复活旧 run。
-    const latestTerminalRunStartedAt = new Map<string, number>()
+    // 新协议用 runGeneration；只有老协议才回退到 startedAt。
+    const latestTerminalRun = new Map<string, AgentRunMarker>()
 
     const bumpPreviewContentRefresh = (sessionId: string, file: PreviewFile): void => {
       const key = getPreviewContentRefreshKey(sessionId, file)
@@ -876,6 +918,64 @@ export function useGlobalAgentListeners(): void {
         return next
       })
     }
+
+    const openPlanDocumentPreview = (sessionId: string, planDocument: NonNullable<import('@proma/shared').ExitPlanModeRequest['planDocument']>): void => {
+      const planPreview: PreviewFile = {
+        filePath: planDocument.filePath,
+        previewOnly: true,
+        readOnly: true,
+      }
+      openPreviewInStore(store, sessionId, planPreview)
+      // 同一路径在反馈后重新提交时必须绕过旧内容缓存，确保审批页重读本次哈希对应的文件版本。
+      bumpPreviewContentRefresh(sessionId, planPreview)
+    }
+
+    // pending 快照与实时事件可以乱序抵达。保留有限的已解决 ID，避免迟到快照复活已处理横幅。
+    const resolvedExitPlanRequestIds = new Set<string>()
+    const markExitPlanRequestResolved = (requestId: string): void => {
+      resolvedExitPlanRequestIds.add(requestId)
+      if (resolvedExitPlanRequestIds.size > 256) {
+        const oldest = resolvedExitPlanRequestIds.values().next().value
+        if (oldest) resolvedExitPlanRequestIds.delete(oldest)
+      }
+      store.set(allPendingExitPlanRequestsAtom, (prev) => {
+        let changed = false
+        const next = new Map(prev)
+        for (const [sessionId, requests] of prev) {
+          const remaining = requests.filter((request) => request.requestId !== requestId)
+          if (remaining.length === requests.length) continue
+          changed = true
+          if (remaining.length > 0) next.set(sessionId, remaining)
+          else next.delete(sessionId)
+        }
+        return changed ? next : prev
+      })
+    }
+
+    const queueExitPlanRequest = (request: import('@proma/shared').ExitPlanModeRequest): boolean => {
+      if (resolvedExitPlanRequestIds.has(request.requestId)) return false
+      let inserted = false
+      store.set(allPendingExitPlanRequestsAtom, (prev) => {
+        const current = prev.get(request.sessionId) ?? []
+        if (current.some((item) => item.requestId === request.requestId)) return prev
+        inserted = true
+        const map = new Map(prev)
+        map.set(request.sessionId, [...current, request])
+        return map
+      })
+      return inserted
+    }
+
+    // renderer 重载后，主进程仍保留未决审批；恢复横幅时同步重建只读计划预览。
+    void window.electronAPI.getPendingRequests()
+      .then(({ exitPlans }) => {
+        for (const request of exitPlans) {
+          if (queueExitPlanRequest(request) && request.planDocument) {
+            openPlanDocumentPreview(request.sessionId, request.planDocument)
+          }
+        }
+      })
+      .catch((error) => console.warn('[GlobalAgentListeners] 恢复待处理审批请求失败', error))
 
     const refreshAffectedPreviews = (filePaths: readonly string[]): void => {
       if (filePaths.length === 0) return
@@ -916,6 +1016,41 @@ export function useGlobalAgentListeners(): void {
         const candidateIds = [...streamingStates.entries()]
           .filter(([, state]) => state.running)
           .map(([sessionId]) => sessionId)
+        const activeSessionIds = new Set(candidateIds)
+
+        // 停止会话不会进入下方的运行中归属流程。若 watcher 明确带回该会话
+        // 已记录路径的变化，则单独确认它是否已经删除，避免面板已打开时被
+        // `existenceCheckedRef` 缓存住的历史记录永久残留。
+        const inactiveChangedPaths = getInactiveSessionFileChangePaths(
+          store.get(agentNonGitFileChangesAtom),
+          filePaths,
+          activeSessionIds,
+          isWindows,
+        )
+        if (inactiveChangedPaths.length > 0) {
+          const existingPaths = await window.electronAPI.filterExistingFilePaths(
+            inactiveChangedPaths,
+            { unrestricted: true },
+          )
+          const deletedPaths = inactiveChangedPaths.filter(
+            (path) => !existingPaths.some((existingPath) => arePathsEqual(existingPath, path, isWindows)),
+          )
+          if (deletedPaths.length > 0) {
+            store.set(agentNonGitFileChangesAtom, (previous) => {
+              let next: Map<string, SessionFileChange[]> | undefined
+              for (const [sessionId, changes] of previous) {
+                if (activeSessionIds.has(sessionId)) continue
+                const filtered = changes.filter(
+                  (change) => !deletedPaths.some((path) => arePathsEqual(change.path, path, isWindows)),
+                )
+                if (filtered.length === changes.length) continue
+                if (!next) next = new Map(previous)
+                next.set(sessionId, filtered)
+              }
+              return next ?? previous
+            })
+          }
+        }
 
         const candidates = await Promise.all(candidateIds.map(async (sessionId) => {
           const session = store.get(agentSessionsAtom).find((item) => item.id === sessionId)
@@ -948,7 +1083,18 @@ export function useGlobalAgentListeners(): void {
           for (const changedPath of uniquelyMatchingPaths) {
             // watcher 现在也会携带删除/目录路径；这些不应进入会话的文件改动记录。
             const existingFile = await window.electronAPI.resolveAndReadFile(changedPath, { sessionId, unrestricted: true })
-            if (!existingFile) continue
+            if (!existingFile) {
+              // 文件已不存在：反向清理该会话的文件改动记录，避免「先创建再删除」的
+              // 残留条目一直留在改动面板中。
+              store.set(agentNonGitFileChangesAtom, (prev) => {
+                const current = prev.get(sessionId)
+                if (!current?.some((change) => arePathsEqual(change.path, changedPath, isWindows))) return prev
+                const map = new Map(prev)
+                map.set(sessionId, removeSessionFileChange(current, changedPath, isWindows))
+                return map
+              })
+              continue
+            }
             const previewFile = await buildWrittenFilePreviewInfo(sessionId, changedPath)
             if (previewFile.previewOnly) {
               store.set(agentNonGitFileChangesAtom, (prev) => {
@@ -968,6 +1114,38 @@ export function useGlobalAgentListeners(): void {
       })().catch(() => { /* 文件监听不应影响会话流 */ })
     })
 
+    // ===== 0. 初始化：恢复 stoppedByUser、主进程真实运行态与 deferred queue 投影 =====
+    // 队列由主进程持有。reload 后只将还在主进程队列中的项合并到本地，
+    // 使用 queueMessageId 去重，绝不覆盖用户在 reload 窗口内刚更新的本地投影。
+    const restoreQueuedMessages = async (): Promise<void> => {
+      const sessionIds = new Set<string>([
+        ...store.get(agentSessionsAtom).map((session) => session.id),
+        ...store.get(agentSessionMessageQueueAtom).keys(),
+      ])
+      for (const sessionId of sessionIds) {
+        const snapshots = await window.electronAPI.getQueuedAgentMessages(sessionId)
+        if (snapshots.length === 0) continue
+        store.set(agentSessionMessageQueueAtom, (previous) => {
+          const current = previous.get(sessionId) ?? []
+          const knownIds = new Set(current.map((message) => message.id))
+          const recovered = snapshots
+            .filter(({ input }) => !knownIds.has(input.queueMessageId))
+            .map(({ input, queuedAt }) => createAgentQueuedMessage(
+              input.rawUserMessage ?? input.userMessage,
+              input.queueMessageId,
+              queuedAt,
+              null,
+              { additionalDirectories: input.additionalDirectories },
+            ))
+          if (recovered.length === 0) return previous
+          const next = new Map(previous)
+          next.set(sessionId, [...current, ...recovered])
+          return next
+        })
+      }
+    }
+    void restoreQueuedMessages().catch(console.error)
+
     // ===== 0. 初始化：恢复 stoppedByUser 与主进程真实运行态 =====
     // 运行态不落盘，窗口重载或 renderer 晚订阅时必须从主进程 activeSessions
     // 补一份快照；快照只提升缺失/更旧的状态，不覆盖已收到的完成态。
@@ -978,7 +1156,7 @@ export function useGlobalAgentListeners(): void {
             return mergeActiveAgentSessionSnapshot(
               existing,
               snapshot,
-              latestTerminalRunStartedAt.get(snapshot.sessionId),
+              latestTerminalRun.get(snapshot.sessionId),
             )
           })
         }
@@ -1008,31 +1186,41 @@ export function useGlobalAgentListeners(): void {
           ? payload.event
           : null
         if (runStartedEvent) {
-          const latestTerminalStartedAt = latestTerminalRunStartedAt.get(sessionId)
-          if (latestTerminalStartedAt != null && runStartedEvent.startedAt > latestTerminalStartedAt) {
-            latestTerminalRunStartedAt.delete(sessionId)
+          const latestTerminal = latestTerminalRun.get(sessionId)
+          if (latestTerminal) {
+            // 同一或更旧代际的迟到启动事件绝不能复活已结束的 run。
+            if (isSameOrNewerRun(latestTerminal, runStartedEvent)) return
+            latestTerminalRun.delete(sessionId)
           }
           // 队列 run 会先通过独立 IPC 发送 started 投影，但该投影可能在窗口
           // 重载或跨 renderer 路由时丢失。run_started 是同一轮的第二个权威启动信号，
           // 必须在首个 SDK/tool 事件之前恢复 running、startedAt 和正常的 live UI。
+          let acceptedRunStart = false
           store.set(agentStreamingStatesAtom, (prev) => {
             const current = prev.get(sessionId)
-            // 迟到的旧 run_started 不能重新激活当前更新的一轮运行；同一 run
-            // 已处于 running 时保留已有模型和上下文数据，避免重复初始化。
-            if (current?.startedAt != null && (
+            if (
+              current?.runGeneration != null
+              && runStartedEvent.runGeneration != null
+            ) {
+              if (current.runGeneration > runStartedEvent.runGeneration) return prev
+              // 重复 start 保留已有 live 状态；已结束 run 更不能被重复 start 复活。
+              if (current.runGeneration === runStartedEvent.runGeneration) return prev
+            }
+            // 旧协议事件没有代际，只能保留 startedAt 回退比较。
+            if (runStartedEvent.runGeneration == null && current?.startedAt != null && (
               current.startedAt > runStartedEvent.startedAt
               || (current.startedAt === runStartedEvent.startedAt && current.running)
             )) return prev
             const map = new Map(prev)
-            map.set(sessionId, createQueuedAgentStreamState(current, runStartedEvent.startedAt))
+            map.set(sessionId, {
+              ...createQueuedAgentStreamState(current, runStartedEvent.startedAt),
+              ...(runStartedEvent.runGeneration != null ? { runGeneration: runStartedEvent.runGeneration } : {}),
+            })
+            acceptedRunStart = true
             return map
           })
-          store.set(unviewedCompletedSessionIdsAtom, (prev) => {
-            if (!prev.has(sessionId)) return prev
-            const next = new Set(prev)
-            next.delete(sessionId)
-            return next
-          })
+          if (acceptedRunStart) promoteDelegatedSessionForRunStart(sessionId, runStartedEvent.startedAt)
+          clearCompletionAttention(sessionId)
         }
 
         // 自动任务会话被用户接管（毕业）：向用户提示，后续定时运行将新建独立会话
@@ -1055,10 +1243,11 @@ export function useGlobalAgentListeners(): void {
         // Phase 2: 直接累积 SDKMessage 到 liveMessagesMapAtom（跳过 replay 消息，避免与持久化消息重复）
         if (payload.kind === 'sdk_delta') {
           const deltaPayload = payload.delta
-          const currentRunStartedAt = store.get(agentSessionStreamingStateAtomFamily(sessionId))?.startedAt
-          // Delta 必须携带产生它的 run 标识。迟到的旧 run Delta 不能借用当前 run，
-          // 否则会被 live-group-set 误判为新一轮消息；无标识的旧协议事件也不强行归类。
-          if (currentRunStartedAt != null && deltaPayload.runStartedAt !== currentRunStartedAt) return
+          const currentRun = store.get(agentSessionStreamingStateAtomFamily(sessionId))
+          // Delta 必须属于当前运行。新协议以 generation 为准，老协议才比较 startedAt。
+          if (currentRun?.runGeneration != null && deltaPayload.runGeneration != null) {
+            if (currentRun.runGeneration !== deltaPayload.runGeneration) return
+          } else if (currentRun?.startedAt != null && deltaPayload.runStartedAt !== currentRun.startedAt) return
           const deltaRunStartedAt = deltaPayload.runStartedAt
           const sessionModelMap = store.get(agentSessionModelMapAtom)
           const defaultModelId = store.get(agentModelIdAtom)
@@ -1212,12 +1401,7 @@ export function useGlobalAgentListeners(): void {
           if (event.type !== 'prompt_suggestion') {
             const prevState = store.get(agentSessionStreamingStateAtomFamily(sessionId))
             if (!prevState || !prevState.running) {
-              store.set(unviewedCompletedSessionIdsAtom, (prev: Set<string>) => {
-                if (!prev.has(sessionId)) return prev
-                const next = new Set(prev)
-                next.delete(sessionId)
-                return next
-              })
+              clearCompletionAttention(sessionId)
             }
           }
 
@@ -1425,13 +1609,11 @@ export function useGlobalAgentListeners(): void {
               return map
             })
           } else if (event.type === 'exit_plan_mode_request') {
-            // ExitPlanMode 请求入队
-            store.set(allPendingExitPlanRequestsAtom, (prev) => {
-              const map = new Map(prev)
-              const current = map.get(sessionId) ?? []
-              map.set(sessionId, [...current, event.request])
-              return map
-            })
+            // 计划文件已由主进程限定在当前会话 plan/ 目录。审批到达时自动以只读 Markdown 打开；
+            // 不切换主会话，因此后台会话不会抢走用户的当前工作。
+            if (queueExitPlanRequest(event.request) && event.request.planDocument) {
+              openPlanDocumentPreview(sessionId, event.request.planDocument)
+            }
             // 退出 Plan 模式指示状态
             store.set(agentPlanModeSessionsAtom, (prev: Set<string>) => {
               if (!prev.has(sessionId)) return prev
@@ -1446,6 +1628,8 @@ export function useGlobalAgentListeners(): void {
               'Agent 已完成计划，等待你的审批',
               'exitPlanMode'
             )
+          } else if (event.type === 'exit_plan_mode_resolved') {
+            markExitPlanRequestResolved(event.requestId)
           } else if (event.type === 'enter_plan_mode') {
             // 进入 Plan 模式
             store.set(agentPlanModeSessionsAtom, (prev: Set<string>) =>
@@ -1486,6 +1670,8 @@ export function useGlobalAgentListeners(): void {
     // ===== 2. 流式完成 =====
     const cleanupComplete = window.electronAPI.onAgentStreamComplete(
       (data: AgentStreamCompletePayload) => {
+        const currentRun = store.get(agentSessionStreamingStateAtomFamily(data.sessionId))
+        if (!isTerminalEventForCurrentRun(currentRun, data)) return
         // 无终态 assistant 的异常路径也不能让等待中的 partial 在完成后倒灌。
         streamEventBatcher.clear(data.sessionId)
         unstable_batchedUpdates(() => {
@@ -1493,10 +1679,11 @@ export function useGlobalAgentListeners(): void {
         // 不发"任务已完成"通知（任务并未真正完成）、不清后台任务列表、不重载消息——
         // 等后台任务完成时 Agent 会自动唤醒续轮。
         const backgroundTasksPending = data.backgroundTasksPending === true
-        if (!backgroundTasksPending && data.startedAt != null) {
-          const previousTerminalStartedAt = latestTerminalRunStartedAt.get(data.sessionId)
-          if (previousTerminalStartedAt == null || data.startedAt > previousTerminalStartedAt) {
-            latestTerminalRunStartedAt.set(data.sessionId, data.startedAt)
+        if (!backgroundTasksPending && (data.runGeneration != null || data.startedAt != null)) {
+          const terminalRun = { startedAt: data.startedAt, runGeneration: data.runGeneration }
+          const previousTerminalRun = latestTerminalRun.get(data.sessionId)
+          if (!previousTerminalRun || !isSameOrNewerRun(previousTerminalRun, terminalRun)) {
+            latestTerminalRun.set(data.sessionId, terminalRun)
           }
         }
         const hasStreamError = store.get(agentStreamErrorsAtom).has(data.sessionId)
@@ -1545,9 +1732,7 @@ export function useGlobalAgentListeners(): void {
           if (!current || (!current.running && !current.backgroundWaiting)) {
             return prev
           }
-          if (current.startedAt != null && (data.startedAt == null || current.startedAt > data.startedAt)) {
-            return prev
-          }
+          if (!isTerminalEventForCurrentRun(current, data)) return prev
           const map = new Map(prev)
           map.set(data.sessionId, {
             ...current,
@@ -1559,7 +1744,60 @@ export function useGlobalAgentListeners(): void {
           return map
         })
 
-        // 只有未激活会话才进入"未查看完成"，避免当前页面完成时出现额外未读提醒。
+        const completionParentSessionId = completionSession?.parentSessionId
+        if (data.triggeredBy === 'delegation' || completionSession?.sourceDelegationId) {
+          // Snapshot renderer layout before resolving native BrowserWindow focus asynchronously.
+          const completionPresence = {
+            activeSessionId: store.get(activeSessionIdAtom),
+            selectedDelegationSessionId: completionParentSessionId
+              ? store.get(agentSideDelegationMapAtom).get(completionParentSessionId) ?? null
+              : null,
+            activeSidePanelTab: completionParentSessionId
+              ? store.get(agentDiffPanelTabAtom).get(completionParentSessionId)
+              : undefined,
+            split: completionParentSessionId
+              ? store.get(agentSidePanelSplitMapAtom).get(completionParentSessionId) ?? null
+              : null,
+            sidePanelOpen: completionParentSessionId
+              ? store.get(agentSidePanelOpenAtomFamily(completionParentSessionId))
+              : false,
+          }
+          const updateDelegatedAttention = (windowHasFocus: boolean): void => {
+            // Do not let an old async completion overwrite a newer run's cleared state.
+            if (!isTerminalEventForCurrentRun(
+              store.get(agentSessionStreamingStateAtomFamily(data.sessionId)),
+              data,
+            )) return
+            const attention = getDelegatedCompletionAttention({
+              completion: data,
+              session: completionSession,
+              hasStreamError,
+              ...completionPresence,
+              windowHasFocus,
+            })
+            if (!attention) return
+            store.set(unviewedCompletedDelegatedSessionIdsAtom, (prev: Set<string>) => (
+              attention === 'unviewed'
+                ? markSessionCompletionUnviewed(prev, data.sessionId)
+                : markSessionCompletionViewed(prev, data.sessionId)
+            ))
+          }
+
+          if (document.hasFocus()) {
+            updateDelegatedAttention(true)
+          } else {
+            const getWindowIsFocused = (window.electronAPI as Partial<typeof window.electronAPI>).windowIsFocused
+            if (typeof getWindowIsFocused === 'function') {
+              void getWindowIsFocused()
+                .then(updateDelegatedAttention)
+                .catch(() => updateDelegatedAttention(false))
+            } else {
+              updateDelegatedAttention(false)
+            }
+          }
+        }
+
+        // 只有未激活的顶层会话才进入全局“未查看完成”；协作子会话使用独立集合，不计入 Dock。
         const currentSessionId = store.get(currentAgentSessionIdAtom)
         const completionMarkers = getAgentCompletionMarkers({
           tabs: store.get(tabsAtom),
@@ -1570,11 +1808,9 @@ export function useGlobalAgentListeners(): void {
           documentHasFocus: document.hasFocus(),
         })
         if (completionMarkers.markUnviewedCompleted && !backgroundTasksPending) {
-          store.set(unviewedCompletedSessionIdsAtom, (prev: Set<string>) => {
-            const next = new Set(prev)
-            next.add(data.sessionId)
-            return next
-          })
+          store.set(unviewedCompletedSessionIdsAtom, (prev: Set<string>) => (
+            markSessionCompletionUnviewed(prev, data.sessionId)
+          ))
         } else if (!backgroundTasksPending) {
           // 当前聚焦会话已在主应用可见；同步确认，避免灵动岛把这次完成继续当未读。
           void window.electronAPI.agentIsland.markSessionViewed(data.sessionId).catch(console.error)
@@ -1712,7 +1948,9 @@ export function useGlobalAgentListeners(): void {
 
     // ===== 3. 流式错误 =====
     const cleanupError = window.electronAPI.onAgentStreamError(
-      (data: { sessionId: string; error: string }) => {
+      (data: AgentStreamErrorPayload) => {
+        const currentRun = store.get(agentSessionStreamingStateAtomFamily(data.sessionId))
+        if (!isTerminalEventForCurrentRun(currentRun, data)) return
         unstable_batchedUpdates(() => {
         console.error('[GlobalAgentListeners] 流式错误:', data.error)
 

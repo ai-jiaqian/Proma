@@ -184,6 +184,8 @@ export interface DetachedPreviewWindowInput {
   readOnly?: boolean
   /** 候选基础目录（previewOnly 模式下用于路径解析） */
   basePaths?: string[]
+  /** 仅由可信 UI 主动选择的外部文件允许超出会话授权根。 */
+  unrestricted?: boolean
   /** Managed Skill workspace slug for a relocatable relative path. */
   workspaceSkillSlug?: string
   /** Original absolute Skill entry path used as a legacy fallback. */
@@ -429,6 +431,8 @@ export const IPC_CHANNELS = {
   WINDOW_CLOSE: 'window:close',
   /** 窗口是否最大化 */
   WINDOW_IS_MAXIMIZED: 'window:is-maximized',
+  /** 宿主 BrowserWindow 是否处于前台（包含焦点位于 WebContentsView 的情况） */
+  WINDOW_IS_FOCUSED: 'window:is-focused',
   /** 在系统剪贴板中写入纯文本 */
   WRITE_CLIPBOARD_TEXT: 'clipboard:write-text',
   /** 截图导出：将 HTML 渲染为 PNG 图片 */

@@ -337,8 +337,6 @@ export interface AppSettings {
   agentMaxBudgetUsd?: number
   /** Agent 最大轮次（0 或 undefined = SDK 默认） */
   agentMaxTurns?: number
-  /** 教程推荐横幅是否已关闭 */
-  tutorialBannerDismissed?: boolean
   /** 自动归档天数（0 = 禁用，默认 7） */
   archiveAfterDays?: number
   /** 发送消息快捷键模式：true = Cmd/Ctrl+Enter 发送，false(默认) = Enter 发送 */
@@ -363,8 +361,6 @@ export interface AppSettings {
   visionRelay?: VisionRelaySettings
   /** 已确认的受管浏览器风险告知版本；低于当前版本时首次使用会再次要求确认。 */
   browserRiskDisclaimerVersion?: number
-  /** 用户手动开启的 Proma 内置能力 ID 列表（默认关闭的 Nano Banana）。 */
-  builtinMcpEnabledIds?: string[]
   /** Todo、日程与 Obsidian 的可见性和 Agent 工具注入开关，默认全部开启。 */
   productivityTools: ProductivityToolsSettings
   /** 启动时自动清理临时文件（proma-preview、proma-installers），默认 true */

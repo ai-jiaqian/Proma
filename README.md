@@ -44,7 +44,7 @@ irm https://raw.githubusercontent.com/ai-jiaqian/Proma/main/scripts/install.ps1 
 
 ### 下载安装
 
-从 [GitHub Releases](https://github.com/ai-jiaqian/Proma/releases) 下载本 fork 的安装包，提供 macOS Apple Silicon、macOS Intel 和 Windows 安装包。
+从 [GitHub Releases](https://github.com/ai-jiaqian/Proma/releases) 下载本 fork 的安装包，提供 macOS Apple Silicon、macOS Intel、Windows、Ubuntu/Debian x86_64 的 `.deb` 安装包和 Linux x86_64 AppImage。Linux 的安装、安全边界和支持范围见 [Linux 说明](./docs/linux.md)。
 
 开源版可独立使用，并支持自行配置 AI 供应商渠道。如果你更希望使用 Proma 提供的内置模型渠道和订阅方案，也可以按需了解 [Proma 商业版](https://proma.cool/download)。两个版本面向不同的使用偏好，你可以自由选择适合自己的版本。
 

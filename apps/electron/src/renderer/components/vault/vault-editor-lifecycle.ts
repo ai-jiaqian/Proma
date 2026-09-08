@@ -3,6 +3,14 @@ export function getVaultEditorKey(relativePath: string, reopenVersion = 0): stri
   return `${relativePath}:${reopenVersion}`
 }
 
-export function shouldAdoptVaultReadContent(localDraft: string, previousReadContent: string): boolean {
-  return localDraft === previousReadContent
+/**
+ * A repeated click on the selected note is normal navigation, not recovery.
+ * Only the explicit conflict-recovery action may recreate its editor instance.
+ */
+export function shouldRemountVaultEditor(
+  currentPath: string | null,
+  targetPath: string,
+  forceReopen: boolean,
+): boolean {
+  return forceReopen && currentPath === targetPath
 }

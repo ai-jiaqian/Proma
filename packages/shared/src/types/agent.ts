@@ -84,6 +84,7 @@ export const CODEX_FAST_MODE_MODEL_IDS = [
   'gpt-5.6-sol',
   'gpt-5.6-terra',
   'gpt-5.6-luna',
+  'gpt-6-astra',
 ] as const
 
 /** 模型 ID 是否可通过 ChatGPT Codex OAuth 使用 Fast Mode。 */
@@ -629,19 +630,21 @@ export type PromaEvent =
   | { type: 'context_window'; contextWindow: number }
   | { type: 'permission_mode_changed'; mode: PromaPermissionMode }
   | { type: 'title_updated'; title: string }
-  | { type: 'external_run_started'; source: AgentExternalRunSource; sessionId: string; title?: string; workspaceId?: string; modelId?: string; startedAt: number; session?: AgentSessionMeta }
-  /** 普通桌面会话已开始执行；startedAt 用于区分同一会话的连续运行。 */
-  | { type: 'run_started'; startedAt: number }
+  | { type: 'external_run_started'; source: AgentExternalRunSource; sessionId: string; title?: string; workspaceId?: string; modelId?: string; startedAt: number; runGeneration?: number; session?: AgentSessionMeta }
+  /** 普通桌面会话已开始执行；startedAt 用于展示，runGeneration 是主进程单调递增的可靠代际。 */
+  | { type: 'run_started'; startedAt: number; runGeneration?: number }
+  /** 普通桌面会话已结束；供已显式配置的外部通知通道发送摘要。 */
+  | { type: 'run_completed'; source: AgentExternalRunSource | 'desktop'; stoppedByUser: boolean; startedAt?: number; runGeneration?: number }
   | { type: 'run_resumed'; sessionId: string }
   /** 用户主动停止当前执行；startedAt 防止旧运行的终态覆盖新一轮执行。 */
-  | { type: 'run_stopped'; startedAt?: number }
+  | { type: 'run_stopped'; startedAt?: number; runGeneration?: number }
   // 协作子会话阻塞事件上浮
   | { type: 'delegation_blocked'; delegationId: string; blockedEvent: unknown }
   // 自动任务会话被用户接管（毕业）
   | { type: 'automation_graduated' }
 
 /** 外部入口触发 Agent 运行的来源 */
-export type AgentExternalRunSource = 'feishu' | 'dingtalk' | 'wechat' | 'bridge' | 'delegation'
+export type AgentExternalRunSource = 'feishu' | 'dingtalk' | 'wechat' | 'slack' | 'bridge' | 'delegation'
 
 /** Pi AssistantMessageEvent 的可序列化增量；不携带累计 partial，避免跨进程复制整段输出。 */
 export type AgentAssistantDelta =
@@ -668,6 +671,8 @@ export interface AgentAssistantDeltaPayload {
   session_id?: string
   /** 产生该 Delta 的 Agent run 起始时间；仅存在于运行时 payload，不写入 JSONL。 */
   runStartedAt?: number
+  /** 主进程为本次运行分配的单调代际，优先于时间戳用于拒绝迟到事件。 */
+  runGeneration?: number
   _channelModelId?: string
 }
 
@@ -1037,6 +1042,10 @@ export interface SaveMcpApiKeyInput {
   serverUrl: string
   headerName: string
   value: string
+  /** stdio MCP 环境变量凭据；远程 HTTP/SSE 凭据留空。 */
+  envName?: string
+  /** stdio MCP 凭据绑定的启动命令；注入前与当前配置比对，防止同名配置被改后泄露密钥。 */
+  stdioBinding?: { command: string; args: string[] }
 }
 
 /** Non-sensitive status for a CLI integration. Secret values are never returned to the renderer. */
@@ -1282,8 +1291,8 @@ export interface AgentSubmitOrEnqueueInput extends AgentDeferredQueueMessageInpu
 }
 
 export interface AgentSubmitOrEnqueueResult {
-  /** injected：已注入当前活跃 Agent；queued：已由主进程接管，等待或启动下一轮。 */
-  disposition: 'injected' | 'queued'
+  /** injected：已注入当前活跃 Agent；started：主进程已启动下一轮；queued：仍在等待。 */
+  disposition: 'injected' | 'started' | 'queued'
 }
 
 /** 流式追加消息的输入参数（Agent 流式中发送新消息） */
@@ -1333,6 +1342,13 @@ export interface AgentQueuedMessageStatus {
   userMessage: string
   rawUserMessage?: string
   startedAt: number
+  runGeneration?: number
+}
+
+/** 主进程 deferred queue 的可恢复展示快照。输入保持原样，以便 renderer 重载后继续取消、移动或显示。 */
+export interface AgentQueuedMessageSnapshot {
+  input: AgentDeferredQueueMessageInput
+  queuedAt: number
 }
 
 // ===== 会话迁移输入 =====
@@ -1399,6 +1415,15 @@ export interface AgentActiveSessionSnapshot {
   sessionId: string
   /** 对应当前运行实例的启动时间，用于拒绝陈旧的 renderer 恢复快照。 */
   startedAt: number
+  /** 主进程按 session 单调递增的 run 代际；避免 startedAt 同毫秒碰撞。 */
+  runGeneration?: number
+}
+
+/** Agent 流式错误事件载荷；运行身份用于拒绝迟到错误污染新一轮 UI。 */
+export interface AgentStreamErrorPayload {
+  sessionId: string
+  error: string
+  runGeneration?: number
 }
 
 /**
@@ -1413,8 +1438,10 @@ export interface AgentStreamCompletePayload {
   messages?: AgentMessage[]
   /** 是否由用户手动中止 */
   stoppedByUser?: boolean
-  /** 本轮流式开始时间戳（用于区分新旧流，防止旧流的 complete 事件重置新流状态） */
+  /** 本轮流式开始时间戳（用于展示与旧协议兼容）。 */
   startedAt?: number
+  /** 主进程按 session 单调递增的 run 代际；完成事件仅能结束同一代运行。 */
+  runGeneration?: number
   /** SDK result 消息的 subtype（success / error_max_turns / error_max_budget_usd / error_during_execution 等） */
   resultSubtype?: string
   /** SDK result 消息携带的错误详情（error_during_execution 等场景下的真实错误原因，用于展示具体错误） */
@@ -1600,6 +1627,16 @@ export interface ExitPlanAllowedPrompt {
   prompt: string
 }
 
+/** 经主进程校验的计划 Markdown 工件，用于审批时的只读预览。 */
+export interface ExitPlanDocument {
+  /** 计划文件的规范化绝对路径；必须位于当前会话的 plan/ 目录。 */
+  filePath: string
+  /** 供右侧预览 Tab 展示的文件名。 */
+  displayName: string
+  /** 提交审批时的内容哈希；批准前若文件变化则要求重新提交。 */
+  contentHash: string
+}
+
 /** ExitPlanMode 请求（主进程 → 渲染进程） */
 export interface ExitPlanModeRequest {
   /** 请求唯一 ID */
@@ -1610,6 +1647,8 @@ export interface ExitPlanModeRequest {
   toolInput: Record<string, unknown>
   /** 解析后的 allowedPrompts 列表 */
   allowedPrompts: ExitPlanAllowedPrompt[]
+  /** 本次待审批的计划文档；未提供或校验失败时省略。 */
+  planDocument?: ExitPlanDocument
 }
 
 /** ExitPlanMode 用户选择行为 */
@@ -1730,6 +1769,8 @@ export const AGENT_IPC_CHANNELS = {
   CREATE_SESSION: 'agent:create-session',
   /** 获取当前主进程仍在执行的 Agent 会话快照 */
   ACTIVE_SESSIONS_SNAPSHOT: 'agent:active-sessions-snapshot',
+  /** 获取指定会话中仍由主进程持有的 deferred queue 快照。 */
+  GET_QUEUED_MESSAGES: 'agent:get-queued-messages',
   /** 获取会话 SDKMessage（Phase 4 新格式） */
   GET_SDK_MESSAGES: 'agent:get-sdk-messages',
   /** 更新会话标题 */
@@ -1815,6 +1856,8 @@ export const AGENT_IPC_CHANNELS = {
   GET_MCP_CONFIG: 'agent:get-mcp-config',
   /** 保存工作区 MCP 配置 */
   SAVE_MCP_CONFIG: 'agent:save-mcp-config',
+  /** 原子删除单个 MCP，保留其他条目的当前状态。 */
+  DELETE_MCP: 'agent:delete-mcp',
   /** 刷新并持久化工作区 MCP 真实连接状态 */
   REFRESH_MCP_CONNECTIONS: 'agent:refresh-mcp-connections',
   /** 原子切换 MCP 启用状态，并在启用时条件持久化真实验证结果。 */
@@ -1833,12 +1876,12 @@ export const AGENT_IPC_CHANNELS = {
   SET_CLI_INTEGRATION_ENABLED: 'agent:set-cli-integration-enabled',
   /** 测试 MCP 服务器连接 */
   TEST_MCP_SERVER: 'agent:test-mcp-server',
-  /** 启用或关闭 Proma 内置 MCP */
-  SET_BUILTIN_MCP_ENABLED: 'agent:set-builtin-mcp-enabled',
   /** 获取工作区 Skill 列表 */
   GET_SKILLS: 'agent:get-skills',
   /** 获取工作区 Skills 目录绝对路径 */
   GET_SKILLS_DIR: 'agent:get-skills-dir',
+  /** 使用系统文件管理器打开指定工作区 Skill 的实际目录 */
+  OPEN_SKILL_FOLDER: 'agent:open-skill-folder',
   /** 删除工作区 Skill */
   DELETE_SKILL: 'agent:delete-skill',
   /** 切换工作区 Skill 启用/禁用 */

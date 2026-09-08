@@ -635,7 +635,8 @@ export class BrowserController {
       let popup: BrowserTabRecord | null = null
       return {
         action: 'allow',
-        outlivesOpener: false,
+        // Proma 将 window.open 呈现为同级浏览器 Tab；关闭来源页面不能级联关闭它。
+        outlivesOpener: true,
         createWindow: (options) => {
           popup = this.createTab(browserSession, false, false, {
             openedByPopup: true,
@@ -704,7 +705,6 @@ export class BrowserController {
     view.webContents.on('did-navigate-in-page', () => { tab.popupInitialNavigationPending = false; this.invalidateTabDocument(tab); this.updateNavigationState(browserSession, tab) })
     view.webContents.on('destroyed', () => {
       if (!browserSession.tabs.has(tab.tabId)) return
-      this.disposePopupChildren(browserSession, tab.tabId)
       browserSession.tabs.delete(tab.tabId)
       browserSession.lastLayoutRevisionByTab.delete(tab.tabId)
       this.removePresentation(browserSession.sessionId, tab.tabId)
@@ -1038,12 +1038,6 @@ export class BrowserController {
     this.emit(browserSession)
   }
 
-  private disposePopupChildren(browserSession: BrowserSessionRecord, openerTabId: string): void {
-    for (const child of [...browserSession.tabs.values()]) {
-      if (child.openerTabId === openerTabId) this.disposeTab(browserSession, child)
-    }
-  }
-
   private repairTabSelection(browserSession: BrowserSessionRecord, removedTabId: string): void {
     if (browserSession.activeTabId === removedTabId || !browserSession.tabs.has(browserSession.activeTabId)) {
       browserSession.activeTabId = browserSession.tabs.keys().next().value as string
@@ -1055,8 +1049,6 @@ export class BrowserController {
 
   private disposeTab(browserSession: BrowserSessionRecord, tab: BrowserTabRecord): void {
     if (!browserSession.tabs.has(tab.tabId)) return
-    // Child windows use Electron's opener lifetime and must not outlive a tab closed from Proma UI either.
-    this.disposePopupChildren(browserSession, tab.tabId)
     browserSession.tabs.delete(tab.tabId)
     browserSession.lastLayoutRevisionByTab.delete(tab.tabId)
     this.removePresentation(browserSession.sessionId, tab.tabId)
@@ -1188,10 +1180,41 @@ export class BrowserController {
     await withBrowserCdpTimeout(() => tab.view.webContents.loadURL(url), 'Page.navigate', timeoutMs, signal)
   }
 
-  /** 默认 Google 页面在 3 秒内未完成加载时停止旧导航，并在同一标签页加载 Bing。 */
+  private async loadUrlUntilMainFrameReady(tab: BrowserTabRecord, url: string, signal?: AbortSignal, timeoutMs = GOOGLE_DEFAULT_LOAD_TIMEOUT_MS): Promise<void> {
+    throwIfBrowserOperationAborted(signal)
+    const contents = tab.view.webContents
+    await withBrowserCdpTimeout(() => new Promise<void>((resolve, reject) => {
+      let settled = false
+      const cleanup = (): void => {
+        contents.removeListener('did-navigate', onNavigate)
+        contents.removeListener('did-fail-load', onFail)
+      }
+      const finish = (callback: () => void): void => {
+        if (settled) return
+        settled = true
+        cleanup()
+        callback()
+      }
+      const onNavigate = (): void => {
+        // did-navigate 表示主框架已收到可用文档；不等待页面的子资源加载完成。
+        finish(resolve)
+      }
+      const onFail = (event: Electron.Event, errorCode: number, description: string, _validatedURL: string, isMainFrame: boolean): void => {
+        if (!isMainFrame) return
+        finish(() => reject(new Error(`页面导航失败（${errorCode}）：${description}`)))
+      }
+      contents.on('did-navigate', onNavigate)
+      contents.on('did-fail-load', onFail)
+      void contents.loadURL(url).catch((error) => finish(() => reject(error)))
+    }), 'Page.navigate', timeoutMs, signal)
+  }
+
   private async loadUrlWithFallback(tab: BrowserTabRecord, url: string, fallbackUrl: string | undefined, signal?: AbortSignal): Promise<{ loadedUrl: string; usedFallback: boolean }> {
     try {
-      await this.loadUrl(tab, url, signal, fallbackUrl ? GOOGLE_DEFAULT_LOAD_TIMEOUT_MS : undefined)
+      // 对 Google 只需确认主框架已完成导航；首屏可用后不再等待图片、脚本等子资源。
+      // 这样“Google 已经能打开，但资源仍在加载”不会被误判为超时并跳到 Bing。
+      if (fallbackUrl) await this.loadUrlUntilMainFrameReady(tab, url, signal)
+      else await this.loadUrl(tab, url, signal)
       return { loadedUrl: url, usedFallback: false }
     } catch (error) {
       if (!fallbackUrl || !(error instanceof BrowserCdpTimeoutError)) throw error
