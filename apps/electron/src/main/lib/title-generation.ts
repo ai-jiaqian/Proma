@@ -14,7 +14,7 @@ const WHITESPACE = /\s+/g
 /**
  * 从模型返回的原始标题内容中提取文本。
  *
- * OpenAI 兼容端点（如 OpenCode Go）对推理模型可能把 `message.content` 返回为
+ * OpenAI 兼容端点对推理模型可能把 `message.content` 返回为
  * 字符串、内容块数组（`[{ type: 'text', text: '...' }]`）或空值。逐个归一为
  * 纯文本，避免 `.trim()` 在非字符串上抛异常，导致整个标题生成在 catch 里静默丢弃。
  */

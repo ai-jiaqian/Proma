@@ -1,3 +1,4 @@
+import { isGpt6AstraFamily, isGpt6LunaFamily, isGpt6SolFamily } from '../utils/model-family'
 import type { ProviderType } from './channel'
 
 /**
@@ -85,11 +86,16 @@ export const CODEX_FAST_MODE_MODEL_IDS = [
   'gpt-5.6-terra',
   'gpt-5.6-luna',
   'gpt-6-astra',
+  'gpt-6-sol',
+  'gpt-6-luna',
 ] as const
 
 /** 模型 ID 是否可通过 ChatGPT Codex OAuth 使用 Fast Mode。 */
 export function isCodexFastModeSupportedModel(modelId: string | undefined): boolean {
-  return modelId !== undefined && (CODEX_FAST_MODE_MODEL_IDS as readonly string[]).includes(modelId.toLowerCase())
+  return isGpt6AstraFamily(modelId)
+    || isGpt6SolFamily(modelId)
+    || isGpt6LunaFamily(modelId)
+    || (modelId !== undefined && (CODEX_FAST_MODE_MODEL_IDS as readonly string[]).includes(modelId.toLowerCase()))
 }
 
 /**
@@ -630,7 +636,7 @@ export type PromaEvent =
   | { type: 'context_window'; contextWindow: number }
   | { type: 'permission_mode_changed'; mode: PromaPermissionMode }
   | { type: 'title_updated'; title: string }
-  | { type: 'external_run_started'; source: AgentExternalRunSource; sessionId: string; title?: string; workspaceId?: string; modelId?: string; startedAt: number; runGeneration?: number; session?: AgentSessionMeta }
+  | { type: 'external_run_started'; source: AgentExternalRunSource; sessionId: string; title?: string; workspaceId?: string; modelId?: string; startedAt: number; runGeneration?: number; session?: AgentSessionMeta; userMessage?: string; userMessageUuid?: string }
   /** 普通桌面会话已开始执行；startedAt 用于展示，runGeneration 是主进程单调递增的可靠代际。 */
   | { type: 'run_started'; startedAt: number; runGeneration?: number }
   /** 普通桌面会话已结束；供已显式配置的外部通知通道发送摘要。 */

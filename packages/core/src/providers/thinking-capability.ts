@@ -77,6 +77,9 @@ export function detectThinkingCapability(
       ...(typeof effort === 'string' ? { effort } : {}),
     }
   }
+  if (encoding?.kind === 'deepseek-output-effort') {
+    return { mode: 'effort-based-max', disableStrategy: 'explicit-disabled' }
+  }
 
   // DeepSeek v4 系列（按模型 ID 识别，不依赖 providerType）：
   // effort-based-max 模式会在思考关闭时显式发 `{type:'disabled'}`，这是 DeepSeek v4 的硬要求
@@ -98,7 +101,6 @@ export function detectThinkingCapability(
     || providerType === 'kimi-coding'
     || providerType === 'zhipu-coding'
     || providerType === 'zhipu-coding-team'
-    || providerType === 'ark-coding-plan'
     || providerType === 'minimax'
     || providerType === 'qwen-token-plan'
     || providerType === 'xiaomi-token-plan'

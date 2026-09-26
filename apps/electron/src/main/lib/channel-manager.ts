@@ -40,7 +40,6 @@ import {
   parseXaiCredentials,
   serializeXaiCredentials,
   isXaiCredentialExpired,
-  VOLCENGINE_CODING_PLAN_MODELS,
 } from '@proma/shared'
 import { refreshCodexOAuth } from './codex-oauth-service'
 import { refreshGithubCopilotOAuth } from './github-copilot-oauth-service'
@@ -64,12 +63,19 @@ import { writeJsonFileAtomic } from './safe-file'
 import pkg from '../../../package.json' with { type: 'json' }
 
 /** 当前配置版本 */
-const CONFIG_VERSION = 5
+const CONFIG_VERSION = 7
+const RETIRED_VOLCENGINE_PROVIDERS = new Set<ProviderType>(['doubao', 'ark-coding-plan'])
+const RETIRED_OPENCODE_PROVIDER = 'opencode-go-openai'
+const RETIRED_OPENCODE_MESSAGE = 'OpenCode Go 渠道已停止支持，请选择其他供应商或自定义渠道'
+
+function assertSupportedProvider(provider: ProviderType): void {
+  if (provider === RETIRED_OPENCODE_PROVIDER) throw new Error(RETIRED_OPENCODE_MESSAGE)
+}
+
 /** 连接测试 / 模型拉取的统一超时时间 */
 const CHANNEL_TEST_TIMEOUT_MS = 15_000
 // ChatGPT backend 首次经代理 / Cloudflare 建连可能超过普通模型探测的 15 秒。
 const CODEX_PLAN_QUOTA_TIMEOUT_MS = 30_000
-const ARK_CODING_PLAN_TEST_MODEL = 'doubao-seed-2.0-code'
 const DEEPSEEK_PRESET_MODELS: ChannelModel[] = [
   { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', enabled: true },
   { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', enabled: true },
@@ -81,11 +87,10 @@ const KIMI_PRESET_MODELS: ChannelModel[] = [
   { id: 'kimi-k2.6', name: 'Kimi K2.6', enabled: true },
 ]
 const XIAOMI_PRESET_MODELS: ChannelModel[] = [
-  { id: 'mimo-v2.5-pro', name: 'MiMo V2.5 Pro', enabled: true },
-  { id: 'mimo-v2-pro', name: 'MiMo V2 Pro', enabled: true },
-  { id: 'mimo-v2.5', name: 'MiMo V2.5', enabled: true },
-  { id: 'mimo-v2-omni', name: 'MiMo V2 Omni', enabled: true },
-  { id: 'mimo-v2-flash', name: 'MiMo V2 Flash', enabled: true },
+  { id: 'mimo-v2.6-pro', name: 'MiMo V2.6 Pro', enabled: true },
+  { id: 'mimo-v2.6-flash', name: 'MiMo V2.6 Flash', enabled: true },
+  // 官方限流为定制服务，默认不勾选，用户按需启用。
+  { id: 'mimo-v2.6-pro-ultraspeed', name: 'MiMo V2.6 Pro UltraSpeed', enabled: false },
 ]
 const QWEN_TOKEN_PLAN_PRESET_MODELS: ChannelModel[] = [
   { id: 'qwen3.8-max-preview', name: 'Qwen3.8 Max Preview', enabled: true },
@@ -93,19 +98,6 @@ const QWEN_TOKEN_PLAN_PRESET_MODELS: ChannelModel[] = [
   { id: 'qwen3.7-flash', name: 'Qwen3.7 Flash', enabled: true },
   { id: 'qwen3.6-flash', name: 'Qwen3.6 Flash', enabled: true },
 ]
-const ARK_CODING_PLAN_MODELS: ChannelModel[] = [
-  { id: 'doubao-seed-2.0-code', name: 'Doubao Seed 2.0 Code', enabled: true },
-  { id: 'doubao-seed-2.0-pro', name: 'Doubao Seed 2.0 Pro', enabled: true },
-  { id: 'doubao-seed-2.0-lite', name: 'Doubao Seed 2.0 Lite', enabled: true },
-  { id: 'glm-5.3', name: 'GLM-5.3', enabled: true },
-  { id: 'k3', name: 'Kimi K3', enabled: true },
-  { id: 'kimi-k2.7-code', name: 'Kimi K2.7 Code', enabled: true },
-  { id: 'minimax-m3', name: 'MiniMax M3', enabled: true },
-  { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', enabled: true },
-  { id: 'deepseek-flash', name: 'DeepSeek Flash', enabled: true },
-  { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', enabled: true },
-]
-
 /**
  * 一次性模型候选更新。每个更新使用独立 ID，避免新增模型时重新加入用户已删除的旧候选。
  * 更新独立于 config schema version，商业版等更高版本配置也能安全收到 OSS 新模型。
@@ -125,9 +117,6 @@ const PRESET_MODEL_CANDIDATE_UPDATES: readonly {
       deepseek: [
         { id: 'deepseek-flash', name: 'DeepSeek Flash', enabled: false },
       ],
-      'ark-coding-plan': [
-        { id: 'deepseek-flash', name: 'DeepSeek Flash', enabled: false },
-      ],
     },
   },
   {
@@ -135,15 +124,6 @@ const PRESET_MODEL_CANDIDATE_UPDATES: readonly {
     candidates: {
       deepseek: [
         { id: 'deepseek-v4-flash-vision-exp', name: 'DeepSeek V4 Flash Vision Exp', enabled: false },
-      ],
-      'ark-coding-plan': [
-        { id: 'glm-5.3', name: 'GLM-5.3', enabled: false },
-      ],
-      doubao: [
-        { id: 'glm-5.3', name: 'GLM-5.3', enabled: false },
-      ],
-      'opencode-go-openai': [
-        { id: 'glm-5.3', name: 'GLM-5.3', enabled: false },
       ],
       zhipu: [
         { id: 'glm-5.3', name: 'GLM-5.3', enabled: false },
@@ -156,6 +136,21 @@ const PRESET_MODEL_CANDIDATE_UPDATES: readonly {
       'zhipu-coding-team': [
         { id: 'glm-5.3', name: 'GLM-5.3', enabled: false },
         { id: 'glm-5.3-flash', name: 'GLM-5.3-Flash', enabled: false },
+      ],
+    },
+  },
+  {
+    // 已应用 model-candidates-v3 的存量渠道也必须收到 FlashX。
+    id: 'model-candidates-v4',
+    candidates: {
+      zhipu: [
+        { id: 'glm-5.3-flashx', name: 'GLM-5.3-FlashX', enabled: false },
+      ],
+      'zhipu-coding': [
+        { id: 'glm-5.3-flashx', name: 'GLM-5.3-FlashX', enabled: false },
+      ],
+      'zhipu-coding-team': [
+        { id: 'glm-5.3-flashx', name: 'GLM-5.3-FlashX', enabled: false },
       ],
     },
   },
@@ -174,6 +169,32 @@ const PRESET_MODEL_CANDIDATE_UPDATES: readonly {
       // 只修正曾发布过的错误默认名，保留用户自定义名称和 enabled 状态。
       'openai-codex': [
         { id: 'gpt-6-astra', from: 'GPT-6-Astra', to: 'GPT-6 Astra' },
+      ],
+    },
+  },
+  {
+    id: 'openai-codex-gpt-6-sol-luna-v1',
+    candidates: {
+      'openai-codex': [
+        { id: 'gpt-6-sol', name: 'GPT-6 Sol', enabled: true },
+        { id: 'gpt-6-luna', name: 'GPT-6 Luna', enabled: true },
+      ],
+    },
+  },
+  {
+    // 小米 MiMo-V2.6 系列（2026-09-22 发布，1M 上下文）；v2.5 系列于 2026-10-21 下线，
+    // 仅以候选形式补充新模型，不改动存量渠道已启用的旧模型。
+    id: 'xiaomi-mimo-v2-6-v1',
+    candidates: {
+      xiaomi: [
+        { id: 'mimo-v2.6-pro', name: 'MiMo V2.6 Pro', enabled: true },
+        { id: 'mimo-v2.6-flash', name: 'MiMo V2.6 Flash', enabled: true },
+        { id: 'mimo-v2.6-pro-ultraspeed', name: 'MiMo V2.6 Pro UltraSpeed', enabled: false },
+      ],
+      'xiaomi-token-plan': [
+        { id: 'mimo-v2.6-pro', name: 'MiMo V2.6 Pro', enabled: true },
+        { id: 'mimo-v2.6-flash', name: 'MiMo V2.6 Flash', enabled: true },
+        { id: 'mimo-v2.6-pro-ultraspeed', name: 'MiMo V2.6 Pro UltraSpeed', enabled: false },
       ],
     },
   },
@@ -275,15 +296,33 @@ function inferProviderFromBaseUrl(provider: ProviderType, baseUrl: string): Prov
  * v4 → v5：将使用默认 DashScope Anthropic 兼容端点的通义千问渠道切换为 OpenAI 兼容端点。
  * 自定义 Anthropic 端点不自动迁移，避免改变用户明确配置的请求协议。
  *
+ * v5 → v6：删除存量 OpenCode Go 渠道；即使配置由更高版本写入，也每次读取时清理。
+ *
+ * v6 → v7：删除火山方舟 Token Plan 与 Agent Plan 存量渠道；火山引擎 API 保留。
+ *
  * @returns 迁移后的配置；`changed` 标记是否发生实际变更（决定是否需要回写文件）
  */
 function migrateConfig(config: ChannelsConfig): { config: ChannelsConfig; changed: boolean } {
   const version = config.version ?? 1
+  const retainedChannels = config.channels.filter((channel) => {
+    if (channel.provider === RETIRED_OPENCODE_PROVIDER) {
+      console.warn(`[渠道管理] 已移除不再支持的 OpenCode Go 渠道: ${channel.name} (${channel.id})`)
+      return false
+    }
+    if (RETIRED_VOLCENGINE_PROVIDERS.has(channel.provider)) {
+      console.warn(`[渠道管理] 已移除下线的火山方舟套餐渠道: ${channel.name} (${channel.id}, ${channel.provider})`)
+      return false
+    }
+    return true
+  })
+  const removedLegacyChannel = retainedChannels.length !== config.channels.length
   if (version >= CONFIG_VERSION) {
-    return { config, changed: false }
+    return removedLegacyChannel
+      ? { config: { ...config, channels: retainedChannels }, changed: true }
+      : { config, changed: false }
   }
 
-  const channels = config.channels.map((channel) => {
+  const channels = retainedChannels.map((channel) => {
     let migratedChannel = channel
     if (version < 2 && (channel.provider === 'custom' || channel.provider === 'anthropic-compatible')) {
       const migratedUrl = migrateCompatibleChannelBaseUrl(channel.baseUrl, channel.provider)
@@ -293,12 +332,6 @@ function migrateConfig(config: ChannelsConfig): { config: ChannelsConfig; change
         )
         migratedChannel = { ...migratedChannel, baseUrl: migratedUrl }
       }
-    }
-    if (version < 3 && migratedChannel.provider === 'ark-coding-plan' && migratedChannel.name === '火山方舟 Coding Plan') {
-      migratedChannel = { ...migratedChannel, name: '火山方舟 Agent Plan' }
-    }
-    if (version < 3 && migratedChannel.provider === 'doubao' && migratedChannel.name === '豆包') {
-      migratedChannel = { ...migratedChannel, name: '火山方舟 Coding Plan' }
     }
     if (version < 4 && migratedChannel.provider === 'doubao-api' && migratedChannel.name === '豆包 API') {
       migratedChannel = { ...migratedChannel, name: '火山引擎 API' }
@@ -318,7 +351,7 @@ function migrateConfig(config: ChannelsConfig): { config: ChannelsConfig; change
     return migratedChannel
   })
 
-  return { config: { ...config, version: CONFIG_VERSION, channels }, changed: true }
+  return { config: { ...config, version: Math.max(version, CONFIG_VERSION), channels }, changed: true }
 }
 
 /**
@@ -337,8 +370,11 @@ function applyPresetModelCandidateUpdates(config: ChannelsConfig): { config: Cha
       const nameCorrections = update.nameCorrections?.[channel.provider] ?? []
       if (candidates.length === 0 && nameCorrections.length === 0) return channel
 
-      const existingModelIds = new Set(channel.models.map((model) => model.id))
-      const missingCandidates = candidates.filter((model) => !existingModelIds.has(model.id))
+      // 模型 ID 在 Pi 运行时按大小写不敏感处理；迁移也保持相同语义，避免旧配置的
+      // 大小写或多余空白变体被重复添加为独立候选。
+      const normalizeModelId = (modelId: string) => modelId.trim().toLowerCase()
+      const existingModelIds = new Set(channel.models.map((model) => normalizeModelId(model.id)))
+      const missingCandidates = candidates.filter((model) => !existingModelIds.has(normalizeModelId(model.id)))
       let models = missingCandidates.length > 0
         ? [...channel.models, ...cloneModels(missingCandidates)]
         : channel.models
@@ -519,6 +555,7 @@ export function getChannelById(id: string): Channel | undefined {
  * @returns 创建后的渠道（apiKey 为加密态）
  */
 export function createChannel(input: ChannelCreateInput): Channel {
+  assertSupportedProvider(input.provider)
   const config = readConfig()
   const now = Date.now()
 
@@ -558,6 +595,7 @@ export function updateChannel(id: string, input: ChannelUpdateInput): Channel {
 
   const existing = config.channels[index]!
 
+  assertSupportedProvider(input.provider ?? existing.provider)
   const updated: Channel = {
     ...existing,
     name: input.name ?? existing.name,
@@ -812,7 +850,6 @@ export async function testChannel(channelId: string): Promise<ChannelTestResult>
       case 'kimi-coding':
       case 'zhipu-coding':
       case 'zhipu-coding-team':
-      case 'ark-coding-plan':
       case 'minimax':
       case 'xiaomi':
       case 'xiaomi-token-plan':
@@ -860,18 +897,13 @@ export async function testChannel(channelId: string): Promise<ChannelTestResult>
             proxyUrl,
           )
         }
-        if (provider === 'ark-coding-plan') {
-          return await testArkCodingPlan(channel.baseUrl, apiKey, proxyUrl)
-        }
         if (provider === 'zhipu-coding-team') {
           return await testZhipuCodingTeam(apiKey, channel.baseUrl, proxyUrl)
         }
         return await testAnthropicCompatible(channel.baseUrl, apiKey, proxyUrl, provider)
       case 'openai':
       case 'openai-responses':
-      case 'opencode-go-openai':
       case 'zhipu':
-      case 'doubao':
       case 'doubao-api':
       case 'qwen':
       case 'custom':
@@ -1047,35 +1079,6 @@ async function testQwenTokenPlanMessages(
     },
     body: JSON.stringify({
       model: modelId,
-      max_tokens: 8,
-      messages: [{ role: 'user', content: 'ping' }],
-    }),
-  }))
-
-  return normalizeHttpResponse(response)
-}
-
-/**
- * 火山方舟 Agent Plan 当前没有可用的模型列表端点，连接测试改用极小的 messages 请求。
- */
-async function testArkCodingPlan(
-  baseUrl: string,
-  apiKey: string,
-  proxyUrl?: string,
-): Promise<ChannelTestResult> {
-  const url = resolveAnthropicMessagesUrl(baseUrl, 'ark-coding-plan')
-  const fetchFn = getFetchFn(proxyUrl)
-
-  const response = await fetchFn(url, withTimeout({
-    method: 'POST',
-    headers: {
-      'anthropic-version': '2023-06-01',
-      'content-type': 'application/json',
-      'x-api-key': apiKey,
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: ARK_CODING_PLAN_TEST_MODEL,
       max_tokens: 8,
       messages: [{ role: 'user', content: 'ping' }],
     }),
@@ -1781,6 +1784,7 @@ export async function getChannelPlanQuota(channelId: string): Promise<ChannelPla
  * 适用于创建/编辑渠道时用户在保存前先验证连接。
  */
 export async function testChannelDirect(input: ChannelDirectTestInput): Promise<ChannelTestResult> {
+  if (input.provider === RETIRED_OPENCODE_PROVIDER) return { success: false, message: RETIRED_OPENCODE_MESSAGE }
   const proxyUrl = await getEffectiveProxyUrl()
   const provider = inferProviderFromBaseUrl(input.provider, input.baseUrl)
 
@@ -1793,7 +1797,6 @@ export async function testChannelDirect(input: ChannelDirectTestInput): Promise<
       case 'kimi-coding':
       case 'zhipu-coding':
       case 'zhipu-coding-team':
-      case 'ark-coding-plan':
       case 'minimax':
       case 'xiaomi':
       case 'xiaomi-token-plan':
@@ -1841,18 +1844,13 @@ export async function testChannelDirect(input: ChannelDirectTestInput): Promise<
             proxyUrl,
           )
         }
-        if (provider === 'ark-coding-plan') {
-          return await testArkCodingPlan(input.baseUrl, input.apiKey, proxyUrl)
-        }
         if (provider === 'zhipu-coding-team') {
           return await testZhipuCodingTeam(input.apiKey, input.baseUrl, proxyUrl)
         }
         return await testAnthropicCompatible(input.baseUrl, input.apiKey, proxyUrl, provider)
       case 'openai':
       case 'openai-responses':
-      case 'opencode-go-openai':
       case 'zhipu':
-      case 'doubao':
       case 'doubao-api':
       case 'qwen':
       case 'custom':
@@ -1876,6 +1874,7 @@ export async function testChannelDirect(input: ChannelDirectTestInput): Promise<
  * 针对不同供应商使用不同的 API 端点和响应解析。
  */
 export async function fetchModels(input: FetchModelsInput): Promise<FetchModelsResult> {
+  if (input.provider === RETIRED_OPENCODE_PROVIDER) return { success: false, message: RETIRED_OPENCODE_MESSAGE, models: [] }
   const proxyUrl = await getEffectiveProxyUrl()
   const provider = inferProviderFromBaseUrl(input.provider, input.baseUrl)
 
@@ -1888,7 +1887,6 @@ export async function fetchModels(input: FetchModelsInput): Promise<FetchModelsR
       case 'kimi-coding':
       case 'zhipu-coding':
       case 'zhipu-coding-team':
-      case 'ark-coding-plan':
       case 'minimax':
       case 'xiaomi':
       case 'xiaomi-token-plan':
@@ -1898,8 +1896,9 @@ export async function fetchModels(input: FetchModelsInput): Promise<FetchModelsR
       case 'github-copilot':
       case 'xai':
         if (provider === 'openai-codex') {
-          // ChatGPT (Codex) 走 Pi SDK 内置模型目录，不依赖 baseUrl/apiKey。
-          const codexModels = await listCodexModels()
+          const credentials = parseCodexCredentials(input.apiKey)
+          if (!credentials) throw new Error('ChatGPT 登录凭据无效或缺失，请重新登录')
+          const codexModels = await listCodexModels(credentials)
           return {
             success: true,
             message: `已加载 ${codexModels.length} 个 ChatGPT (Codex) 模型`,
@@ -1939,29 +1938,13 @@ export async function fetchModels(input: FetchModelsInput): Promise<FetchModelsR
         if (provider === 'qwen-token-plan') {
           return createPresetModelsResult('通义千问 Token Plan', QWEN_TOKEN_PLAN_PRESET_MODELS)
         }
-        if (provider === 'ark-coding-plan') {
-          return {
-            success: true,
-            message: `火山方舟 Agent Plan 未开放模型列表端点，已加载 ${ARK_CODING_PLAN_MODELS.length} 个预设模型`,
-            models: ARK_CODING_PLAN_MODELS,
-          }
-        }
         return await fetchAnthropicCompatibleModels(input.baseUrl, input.apiKey, proxyUrl, provider)
       case 'openai':
       case 'openai-responses':
-      case 'opencode-go-openai':
       case 'zhipu':
-      case 'doubao':
       case 'doubao-api':
       case 'qwen':
       case 'custom':
-        if (provider === 'doubao') {
-          return createPresetModelsResult(
-            '火山方舟 Coding Plan',
-            [...VOLCENGINE_CODING_PLAN_MODELS],
-            '使用套餐支持清单，不采用通用 /models 目录',
-          )
-        }
         return await fetchOpenAICompatibleModels(input.baseUrl, input.apiKey, proxyUrl, provider)
       case 'google':
         return await fetchGoogleModels(input.baseUrl, input.apiKey, proxyUrl)
