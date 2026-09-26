@@ -6,7 +6,10 @@ import type { ProviderType } from '@proma/shared'
  *
  * custom 是任意 OpenAI 兼容端点的通用入口，保守地使用所有兼容服务都支持的
  * system 角色。原生 OpenAI 渠道仍可使用 developer。
+ *
+ * 注：已退役的火山套餐渠道 `doubao` 已不在 ProviderType 中（上游 #2089），
+ * 其存量渠道在 channel-manager 迁移时即被删除，无需在此比较。
  */
 export function supportsPiDeveloperRole(provider: ProviderType): boolean {
-  return provider !== 'doubao' && provider !== 'doubao-api' && provider !== 'qwen' && provider !== 'custom'
+  return provider !== 'doubao-api' && provider !== 'qwen' && provider !== 'custom'
 }

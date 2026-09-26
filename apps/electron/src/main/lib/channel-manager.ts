@@ -64,7 +64,8 @@ import pkg from '../../../package.json' with { type: 'json' }
 
 /** 当前配置版本 */
 const CONFIG_VERSION = 7
-const RETIRED_VOLCENGINE_PROVIDERS = new Set<ProviderType>(['doubao', 'ark-coding-plan'])
+/** 已退役火山套餐渠道的字符串匹配集合；这些值已不在 ProviderType 中（上游 #2089），按 string 匹配以清理存量配置 */
+const RETIRED_VOLCENGINE_PROVIDERS = new Set<string>(['doubao', 'ark-coding-plan'])
 const RETIRED_OPENCODE_PROVIDER = 'opencode-go-openai'
 const RETIRED_OPENCODE_MESSAGE = 'OpenCode Go 渠道已停止支持，请选择其他供应商或自定义渠道'
 
